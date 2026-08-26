@@ -628,3 +628,23 @@ HistorySync.exe backfill --start "2026-08-20 00:00:00" --end "2026-08-21 00:00:0
 Phase 1 验证稳定以后，我们再接网络。
 
 这个顺序风险最低，而且每一个阶段都可以独立验证。
+
+---
+
+## v2 实施状态（2026-08-26）
+
+本文件前面的内容是早期规划记录。当前实现以仓库根目录 `README.md`、
+`docs/v2-architecture.md` 和 `docs/dcs-acceptance.md` 为准。
+
+当前已经落地：
+
+1. DCS 端已抽出 `HistorianClient`、`HistorySample` 和范围读取逻辑，保留 DeltaV 数据截断后的自动二分读取。
+2. `HistorySync` 正常路径直接从内存 Batch 发送 HTTP，不再先生成 Tag CSV 再重新读取组合 CSV。
+3. 已加入 `LastCollectedEnd`、`LastAcceptedEnd`、`LastCommittedEnd` 状态，以及自动追赶、重叠窗口和动态切片。
+4. spool 已调整为失败时使用的 Outbox，并按时间顺序补发 pending Batch。
+5. 已支持 Console、Windows Service、`status`、`init` 和 `backfill`，不包含强制结束进程或重启 DCS 电脑的逻辑。
+6. Receiver 已支持 PostgreSQL 同步提交模式：只有数据库事务 COMMIT 成功才返回 `committed=true`。
+7. PostgreSQL 已增加 `history_samples` 完整字段模型，支持数值和文本值；旧 `history_raw` 保留为 v1 历史数据。
+
+当前版本位于 Git 分支 `refactor/v2`，稳定旧版本标记为 `v1-legacy`。现场升级前，必须在 DCS 电脑运行
+`DeltaVHistoryCLI_v1.1\\test-dcs-compatibility.bat`，并按 `docs\\dcs-acceptance.md` 完成真实 Historian 数据对比、断网补发和数据库恢复验证。
