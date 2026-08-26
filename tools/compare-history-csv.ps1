@@ -10,7 +10,7 @@ function Read-DataLines([string]$Path) {
         throw "CSV file not found: $Path"
     }
 
-    $rows = New-Object System.Collections.Generic.List[string]
+    $rows = New-Object System.Collections.ArrayList
     foreach ($line in (Get-Content -LiteralPath $Path)) {
         $normalized = $line -replace '^\uFEFF', ''
         if ($normalized.StartsWith('#')) {
