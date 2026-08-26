@@ -50,6 +50,7 @@ DeltaV Historian
 3. 执行 `test-dcs-compatibility.bat` 和
    `HistorySync.exe validate --tags tags.txt`。
 4. 用同一 Tag 和时间范围比较 v1/v2 的行数、时间戳、值、类型和 Flags。
+   详细验收证据见 [docs/dcs-acceptance.md](docs/dcs-acceptance.md)。
 5. 先运行 `HistorySync.exe --console` 观察，再以管理员运行
    `install-service.bat`。
 
