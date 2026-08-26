@@ -33,6 +33,8 @@ type batchImporter struct {
 	logger            *log.Logger
 }
 
+var errBatchConflict = errors.New("batch_id already exists with different content")
+
 type importRow struct {
 	SampleKey     string
 	Tag           string
@@ -268,7 +270,7 @@ func (i *batchImporter) importBatch(ctx context.Context, batch importBatch) erro
 		if strings.EqualFold(strings.TrimSpace(existingHash), batch.SHA256) && existingRows == batch.Rows {
 			return nil
 		}
-		return errors.New("imported batch_id exists with different content")
+		return errBatchConflict
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return err

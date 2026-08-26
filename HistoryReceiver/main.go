@@ -313,6 +313,10 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 		s.commitMu.Unlock()
 		if importErr != nil {
 			s.logger.Printf("synchronous import failed batch=%s error=%v", headers.BatchID, importErr)
+			if errors.Is(importErr, errBatchConflict) {
+				writeError(w, http.StatusConflict, importErr.Error())
+				return
+			}
 			writeError(w, http.StatusServiceUnavailable, "PostgreSQL commit failed")
 			return
 		}
