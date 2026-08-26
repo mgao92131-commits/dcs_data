@@ -72,6 +72,7 @@ type batchHeaders struct {
 type ackResponse struct {
 	OK           bool   `json:"ok"`
 	Committed    bool   `json:"committed"`
+	CommitLevel  string `json:"commit_level"`
 	BatchID      string `json:"batch_id"`
 	SHA256       string `json:"sha256"`
 	ReceivedRows int    `json:"received_rows"`
@@ -337,7 +338,7 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 			"committed PostgreSQL batch=%s collector=%s rows=%d bytes=%d elapsed=%s",
 			batch.BatchID, headers.CollectorID, rows, bodyBytes,
 			time.Since(started).Round(time.Millisecond))
-		writeJSON(w, http.StatusOK, makeAck(headers))
+		writeJSON(w, http.StatusOK, makeAck(headers, "database"))
 		return
 	}
 
@@ -368,7 +369,7 @@ func (s *receiverServer) commit(tempDir string, headers batchHeaders) (ackRespon
 	if err := os.Rename(tempDir, finalDir); err != nil {
 		return ackResponse{}, fmt.Errorf("cannot commit batch: %w", err)
 	}
-	return makeAck(headers), nil
+	return makeAck(headers, "inbox"), nil
 }
 
 func (s *receiverServer) findExisting(headers batchHeaders) (ackResponse, bool, error) {
@@ -399,13 +400,21 @@ func (s *receiverServer) findExistingUnlocked(headers batchHeaders) (ackResponse
 		values["Batch.Rows"] != strconv.Itoa(headers.Rows) {
 		return ackResponse{}, true, errors.New("batch_id already exists with different content")
 	}
-	return makeAck(headers), true, nil
+	return makeAck(headers, s.commitLevel()), true, nil
 }
 
-func makeAck(headers batchHeaders) ackResponse {
+func (s *receiverServer) commitLevel() string {
+	if s.config.SynchronousCommit {
+		return "database"
+	}
+	return "inbox"
+}
+
+func makeAck(headers batchHeaders, commitLevel string) ackResponse {
 	return ackResponse{
 		OK:           true,
 		Committed:    true,
+		CommitLevel:  commitLevel,
 		BatchID:      headers.BatchID,
 		SHA256:       strings.ToLower(headers.SHA256),
 		ReceivedRows: headers.Rows,

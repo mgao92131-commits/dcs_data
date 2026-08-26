@@ -40,7 +40,7 @@ namespace DeltaVHistoryCLI
             {
                 try
                 {
-                    int result = SyncProgram.Execute(new string[] { "sync" });
+                    int result = SyncProgram.ExecuteCycle(new string[] { "sync" });
                     if (result != 0 && result != 5 && result != 40)
                         EventLog.WriteEntry("HistorySync returned " + result.ToString());
                 }
@@ -89,7 +89,7 @@ namespace DeltaVHistoryCLI
             {
                 while (!stop.WaitOne(0, false))
                 {
-                    int result = SyncProgram.Execute(new string[] { "sync" });
+                    int result = SyncProgram.ExecuteCycle(new string[] { "sync" });
                     Console.WriteLine("Sync exit code: " + result.ToString());
                     if (stop.WaitOne(ReadIntervalMilliseconds(), false))
                         break;

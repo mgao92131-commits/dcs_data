@@ -39,8 +39,9 @@ DeltaV Historian
 4. 在 `HistoryReceiver` 目录执行 `build.bat` 并启动
    `HistoryReceiver.exe --config receiver.ini`。
 
-`committed=true` 只在 `imported_batches` 与 `history_samples` 的同一数据库事务
-提交后返回。PostgreSQL 不可用时 Receiver 返回 HTTP 503。
+`committed=true` 且 `commit_level=database` 只在 `imported_batches` 与
+`history_samples` 的同一数据库事务提交后返回。PostgreSQL 不可用时 Receiver
+返回 HTTP 503。
 
 ## DCS Collector 部署
 

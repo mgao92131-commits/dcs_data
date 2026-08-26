@@ -67,8 +67,13 @@ HistorySync.exe status
 ```
 
 Record the BatchId, ACK, `history_samples` row count, and
-`LastCommittedEnd`. The ACK is valid only when the PostgreSQL transaction has
-committed.
+`LastCommittedEnd`. The ACK must include `commit_level=database`; it is valid
+for `LastCommittedEnd` only when the PostgreSQL transaction has committed.
+
+Before unattended operation, record the service identity and validate that the
+same identity can connect to the DeltaV APP Historian. `install-service.bat`
+uses `LocalSystem` explicitly; if the site requires a dedicated account,
+configure it with `sc.exe config` and repeat the service-mode read test.
 
 ## 4. Failure and recovery
 

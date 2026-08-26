@@ -46,6 +46,7 @@ namespace DeltaVHistoryCLI
                 HistorySample row = rows[i];
                 string key = row.Timestamp.Ticks.ToString(CultureInfo.InvariantCulture) + "|" +
                     row.Value + "|" + row.DataType + "|" + row.Flags;
+                key += "|" + row.SequenceNo + "|" + row.ArchiveStatus;
                 if (!seen.ContainsKey(key))
                 {
                     seen.Add(key, true);
@@ -440,17 +441,23 @@ namespace DeltaVHistoryCLI
             return method.Invoke(target, args);
         }
 
-        private void TryInvoke(object target, string methodName, object[] args)
+        private bool TryInvoke(object target, string methodName, object[] args)
         {
             try
             {
                 MethodInfo method = FindCompatibleMethod(target.GetType(), methodName, args.Length);
-                if (method != null)
-                    method.Invoke(target, args);
+                if (method == null)
+                {
+                    WriteLog("Cleanup " + methodName + " was not found on " + target.GetType().FullName + ".");
+                    return false;
+                }
+                method.Invoke(target, args);
+                return true;
             }
             catch (Exception ex)
             {
                 WriteLog("Cleanup " + methodName + " failed: " + ex.Message);
+                return false;
             }
         }
 

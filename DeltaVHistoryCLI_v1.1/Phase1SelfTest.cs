@@ -51,16 +51,22 @@ namespace DeltaVHistoryCLI
             HistorySample later = MakeSample("TAG/A", firstTime.AddSeconds(1), "2");
             HistorySample first = MakeSample("TAG/A", firstTime, "1");
             HistorySample duplicate = MakeSample("TAG/A", firstTime, "1");
+            HistorySample differentSequence = MakeSample("TAG/A", firstTime, "1");
+            differentSequence.SequenceNo = "2";
+            differentSequence.ArchiveStatus = "Revised";
             System.Collections.Generic.List<HistorySample> rows =
                 new System.Collections.Generic.List<HistorySample>();
             rows.Add(later);
             rows.Add(first);
             rows.Add(duplicate);
+            rows.Add(differentSequence);
 
             rows = HistorySampleSet.Normalize(rows);
-            Assert(rows.Count == 2, "Historian Core deduplication");
+            Assert(rows.Count == 3, "Historian Core deduplication preserves identity fields");
             Assert(rows[0].Timestamp == firstTime, "Historian Core timestamp ordering");
-            Assert(rows[1].Value == "2", "Historian Core sample preservation");
+            Assert(rows[2].Value == "2", "Historian Core sample preservation");
+            Assert(rows[1].SequenceNo == "2" && rows[1].ArchiveStatus == "Revised",
+                "Historian Core identity fields are preserved");
         }
 
         private static HistorySample MakeSample(string tag, DateTime timestamp, string value)

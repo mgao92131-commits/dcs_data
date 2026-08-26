@@ -30,7 +30,8 @@ func TestBatchCommitAndIdempotentRetry(t *testing.T) {
 		if err := json.Unmarshal(response.Body.Bytes(), &ack); err != nil {
 			t.Fatal(err)
 		}
-		if !ack.OK || !ack.Committed || ack.BatchID != batchID || ack.ReceivedRows != 2 {
+		if !ack.OK || !ack.Committed || ack.CommitLevel != "inbox" ||
+			ack.BatchID != batchID || ack.ReceivedRows != 2 {
 			t.Fatalf("unexpected ACK: %+v", ack)
 		}
 	}

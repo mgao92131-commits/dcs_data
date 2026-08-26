@@ -12,7 +12,7 @@ HTTP body
  -> history_samples UPSERT
  -> imported_batches INSERT
  -> COMMIT
- -> committed=true ACK
+ -> committed=true, commit_level=database ACK
 ```
 
 配置 `SynchronousCommit=true` 时不会先写 inbox 再提前 ACK。数据库不可用或
@@ -28,6 +28,13 @@ HTTP body
 go test ./...
 go vet ./...
 build.bat
+```
+
+真实 PostgreSQL COMMIT/ACK 集成测试不会默认连接生产库。准备可清理的测试
+数据库后设置 `DCS_HISTORY_TEST_DATABASE_URL`，再运行：
+
+```bat
+test-phase3-integration.bat
 ```
 
 ## 数据库
@@ -62,5 +69,6 @@ SequenceNo unavailable (temporary fallback):
 GET http://RECEIVER_IP:8080/healthz
 ```
 
-响应包括 `database_ok` 和 `inbox_batches`。Receiver archive 默认保留 30 天，
+数据库同步 ACK 必须包含 `commit_level=database`；未启用同步提交时为
+`commit_level=inbox`。响应包括 `database_ok` 和 `inbox_batches`。Receiver archive 默认保留 30 天，
 日志默认保留 30 天；rejected 批次只报警，不自动删除。

@@ -31,6 +31,7 @@ namespace DeltaVHistoryCLI
     {
         public string BatchId;
         public string Mode;
+        public string CommitLevel;
         public DateTime RangeStart;
         public DateTime RangeEnd;
     }
@@ -50,6 +51,7 @@ namespace DeltaVHistoryCLI
         private string _apiKey;
         private int _timeoutMilliseconds;
         private int _maxBatches;
+        private string _ackMode;
         private string _spoolDirectory;
         private SyncLogger _log;
 
@@ -62,6 +64,7 @@ namespace DeltaVHistoryCLI
             _apiKey = config.Get("Receiver", "ApiKey", "");
             _timeoutMilliseconds = config.GetInt("Receiver", "TimeoutSeconds", 15) * 1000;
             _maxBatches = config.GetInt("Receiver", "MaxBatchesPerRun", 20);
+            _ackMode = config.Get("Receiver", "AckMode", "inbox").ToLowerInvariant();
             _spoolDirectory = spoolDirectory;
             _log = log;
 
@@ -69,6 +72,8 @@ namespace DeltaVHistoryCLI
                 throw new Exception("[Receiver] Url is required when Sender is enabled.");
             if (_apiKey.Length == 0)
                 throw new Exception("[Receiver] ApiKey is required when Sender is enabled.");
+            if (_ackMode != "inbox" && _ackMode != "database")
+                throw new Exception("[Receiver] AckMode must be inbox or database.");
             if (_timeoutMilliseconds <= 0 || _maxBatches <= 0)
                 throw new Exception("Receiver timeout and MaxBatchesPerRun must be positive.");
         }
@@ -338,11 +343,12 @@ namespace DeltaVHistoryCLI
             if (status != HttpStatusCode.OK)
                 throw new Exception("Unexpected Receiver HTTP status: " + ((int)status).ToString());
 
-            ValidateAck(responseText, batchId, actualHash, expectedRows);
+            string commitLevel = ValidateAck(responseText, batchId, actualHash, expectedRows);
             _log.Write("ACK batch=" + batchId + " rows=" + expectedRows.ToString());
             BatchReceipt receipt = new BatchReceipt();
             receipt.BatchId = batchId;
             receipt.Mode = mode;
+            receipt.CommitLevel = commitLevel;
             receipt.RangeStart = ParseTime(start);
             receipt.RangeEnd = ParseTime(end);
             return receipt;
@@ -366,7 +372,7 @@ namespace DeltaVHistoryCLI
             return parsed;
         }
 
-        private static void ValidateAck(
+        private string ValidateAck(
             string json,
             string batchId,
             string hash,
@@ -374,12 +380,18 @@ namespace DeltaVHistoryCLI
         {
             if (!JsonBool(json, "ok") || !JsonBool(json, "committed"))
                 throw new Exception("Receiver ACK is not committed: " + json);
+            string commitLevel = JsonString(json, "commit_level").ToLowerInvariant();
+            if (_ackMode == "database" && commitLevel != "database")
+                throw new Exception("Receiver ACK does not prove PostgreSQL commit: " + json);
+            if (_ackMode == "inbox" && commitLevel != "inbox" && commitLevel != "database")
+                throw new Exception("Receiver ACK has an unknown commit_level: " + json);
             if (!String.Equals(JsonString(json, "batch_id"), batchId, StringComparison.Ordinal))
                 throw new Exception("Receiver ACK batch_id mismatch.");
             if (!String.Equals(JsonString(json, "sha256"), hash, StringComparison.OrdinalIgnoreCase))
                 throw new Exception("Receiver ACK SHA-256 mismatch.");
             if (JsonInt(json, "received_rows") != rows)
                 throw new Exception("Receiver ACK row count mismatch.");
+            return commitLevel;
         }
 
         private static bool JsonBool(string json, string name)

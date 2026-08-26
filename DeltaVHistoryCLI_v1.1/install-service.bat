@@ -19,7 +19,10 @@ if not errorlevel 1 (
     exit /b 1
 )
 
-sc.exe create DeltaVHistorySync binPath= "\"%CD%\HistorySync.exe\" --service" start= auto DisplayName= "DeltaV History Sync"
+rem Keep the account explicit. Validate Historian access for this account before promotion.
+rem Change it with sc.exe config DeltaVHistorySync obj= DOMAIN\User password= ...
+rem if the site requires a dedicated DeltaV service account.
+sc.exe create DeltaVHistorySync binPath= "\"%CD%\HistorySync.exe\" --service" start= auto obj= LocalSystem DisplayName= "DeltaV History Sync"
 if errorlevel 1 exit /b 1
 
 sc.exe description DeltaVHistorySync "Reads DeltaV Historian data and synchronizes committed batches to PostgreSQL."

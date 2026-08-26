@@ -144,17 +144,99 @@ namespace DeltaVHistoryCLI
     {
         private const string Version = "2.0-refactor";
         private const string MutexName = "Global\\DeltaVHistorySync";
+        private const string HostMutexName = "Global\\DeltaVHistorySyncHost";
+
+        private delegate int HostRunner();
 
         static int Main(string[] args)
         {
             if (args.Length == 1 && String.Equals(args[0], "--service", StringComparison.OrdinalIgnoreCase))
-                return HistorySyncService.RunService();
+                return RunHost(new HostRunner(HistorySyncService.RunService));
             if (args.Length == 1 && String.Equals(args[0], "--console", StringComparison.OrdinalIgnoreCase))
-                return HistorySyncService.RunConsole();
+                return RunHost(new HostRunner(HistorySyncService.RunConsole));
             return Execute(args);
         }
 
         internal static int Execute(string[] args)
+        {
+            return ExecuteWithHostLock(args, true);
+        }
+
+        internal static int ExecuteCycle(string[] args)
+        {
+            return ExecuteWithHostLock(args, false);
+        }
+
+        private static int ExecuteWithHostLock(string[] args, bool acquireHostLock)
+        {
+            if (!acquireHostLock)
+                return ExecuteWithProcessLock(args);
+
+            bool created;
+            using (Mutex hostMutex = new Mutex(false, HostMutexName, out created))
+            {
+                bool acquired = false;
+                try
+                {
+                    acquired = hostMutex.WaitOne(0, false);
+                }
+                catch (AbandonedMutexException)
+                {
+                    acquired = true;
+                }
+
+                if (!acquired)
+                {
+                    Console.WriteLine("Another HistorySync host is already running.");
+                    return 30;
+                }
+
+                try
+                {
+                    return ExecuteWithProcessLock(args);
+                }
+                finally
+                {
+                    try { hostMutex.ReleaseMutex(); }
+                    catch { }
+                }
+            }
+        }
+
+        private static int RunHost(HostRunner runner)
+        {
+            bool created;
+            using (Mutex hostMutex = new Mutex(false, HostMutexName, out created))
+            {
+                bool acquired = false;
+                try
+                {
+                    acquired = hostMutex.WaitOne(0, false);
+                }
+                catch (AbandonedMutexException)
+                {
+                    acquired = true;
+                }
+
+                if (!acquired)
+                {
+                    Console.WriteLine("Another HistorySync host is already running.");
+                    return 30;
+                }
+
+                try
+                {
+                    return runner();
+                }
+                finally
+                {
+                    try { hostMutex.ReleaseMutex(); }
+                    catch { }
+                }
+            }
+        }
+
+        private static int ExecuteWithProcessLock(string[] args)
         {
             string baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
             Directory.SetCurrentDirectory(baseDirectory);
@@ -285,6 +367,21 @@ namespace DeltaVHistoryCLI
                     {
                         log.Write("Collection paused because Receiver authentication failed.");
                         return 42;
+                    }
+                }
+
+                if (command != "send")
+                {
+                    try
+                    {
+                        SpoolMaintenance.EnsureFreeSpace(
+                            options.SpoolDirectory,
+                            config.GetInt("Maintenance", "MinFreeSpaceMB", 2048));
+                    }
+                    catch (IOException ex)
+                    {
+                        log.Write("Collection paused: " + ex.Message);
+                        return 43;
                     }
                 }
 
@@ -693,13 +790,14 @@ namespace DeltaVHistoryCLI
                 {
                     try
                     {
-                        sender.Send(batch, data);
+                        BatchReceipt receipt = sender.Send(batch, data);
                         AdvanceAfterCollection(
                             options,
                             state,
                             stateStore,
                             end,
-                            true);
+                            true,
+                            String.Equals(receipt.CommitLevel, "database", StringComparison.OrdinalIgnoreCase));
                         log.Write("Direct ACK batch=" + batchId + " rows=" + batch.Samples.Count.ToString());
                         return invalidTags == 0 ? 0 : 5;
                     }
@@ -713,7 +811,7 @@ namespace DeltaVHistoryCLI
                                 batch,
                                 data,
                                 "http" + ex.StatusCode.ToString(CultureInfo.InvariantCulture));
-                            AdvanceAfterCollection(options, state, stateStore, end, false);
+                            AdvanceAfterCollection(options, state, stateStore, end, false, false);
                             log.Write("Receiver permanently rejected batch=" + batchId + " error=" + ex.Message);
                             return 41;
                         }
@@ -721,7 +819,7 @@ namespace DeltaVHistoryCLI
                             options.MaxPendingBatches,
                             options.MaxPendingBytes);
                         rejectedStore.SavePending(batch, data);
-                        AdvanceAfterCollection(options, state, stateStore, end, false);
+                        AdvanceAfterCollection(options, state, stateStore, end, false, false);
                         log.Write("Direct send failed; saved to outbox batch=" + batchId + " error=" + ex.Message);
                         return ex.AuthenticationFailure ? 42 : 0;
                     }
@@ -742,6 +840,7 @@ namespace DeltaVHistoryCLI
                     state,
                     stateStore,
                     end,
+                    false,
                     false);
                 log.Write("Pending batch=" + batchId + " rows=" + batch.Samples.Count.ToString() + " sha256=" + batch.Sha256);
                 return invalidTags == 0 ? 0 : 5;
@@ -1044,7 +1143,7 @@ namespace DeltaVHistoryCLI
                 try
                 {
                     state.LastAcceptedEnd = receipt.RangeEnd;
-                    if (options.AckMode == "database")
+                    if (String.Equals(receipt.CommitLevel, "database", StringComparison.OrdinalIgnoreCase))
                         state.LastCommittedEnd = receipt.RangeEnd;
                     stateStore.Save(state);
                     log.Write(
@@ -1066,7 +1165,8 @@ namespace DeltaVHistoryCLI
             SyncState state,
             SyncStateStore stateStore,
             DateTime end,
-            bool acknowledged)
+            bool acknowledged,
+            bool databaseCommitted)
         {
             if (state == null || stateStore == null || options.Command != "sync")
                 return;
@@ -1077,7 +1177,7 @@ namespace DeltaVHistoryCLI
                     state.LastCollectedEnd = end;
                 if (acknowledged && end > state.LastAcceptedEnd)
                     state.LastAcceptedEnd = end;
-                if (acknowledged && options.AckMode == "database" && end > state.LastCommittedEnd)
+                if (acknowledged && databaseCommitted && end > state.LastCommittedEnd)
                     state.LastCommittedEnd = end;
                 stateStore.Save(state);
             }

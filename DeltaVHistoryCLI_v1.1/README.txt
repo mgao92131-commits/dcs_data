@@ -215,6 +215,7 @@ following:
 
   ok=true
   committed=true
+  commit_level=database
   matching batch_id
   matching sha256
   matching received_rows

@@ -25,7 +25,6 @@ namespace DeltaVHistoryCLI
                 logsDirectory,
                 "*.log",
                 DateTime.Now.AddDays(-logDays));
-            EnsureFreeSpace(spoolDirectory, minimumFreeMB);
             int failedCount = Directory.GetDirectories(
                 Path.Combine(spoolDirectory, "failed")).Length;
             int quarantineCount = Directory.GetDirectories(
@@ -40,7 +39,7 @@ namespace DeltaVHistoryCLI
                 log.Write("WARNING: quarantined spool batches require attention count=" + quarantineCount.ToString());
         }
 
-        private static void EnsureFreeSpace(string path, int minimumFreeMB)
+        public static void EnsureFreeSpace(string path, int minimumFreeMB)
         {
             string root = Path.GetPathRoot(Path.GetFullPath(path));
             DriveInfo drive = new DriveInfo(root);

@@ -172,7 +172,9 @@ namespace DeltaVHistoryCLI
                 path,
                 FileMode.CreateNew,
                 FileAccess.Write,
-                FileShare.None))
+                FileShare.None,
+                4096,
+                FileOptions.WriteThrough))
             {
                 stream.Write(data, 0, data.Length);
                 stream.Flush();
@@ -181,7 +183,14 @@ namespace DeltaVHistoryCLI
 
         private static void WriteMetadata(string path, HistoryBatch batch, int bytes)
         {
-            using (StreamWriter writer = new StreamWriter(path, false, new UTF8Encoding(true)))
+            using (FileStream stream = new FileStream(
+                path,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                4096,
+                FileOptions.WriteThrough))
+            using (StreamWriter writer = new StreamWriter(stream, new UTF8Encoding(true)))
             {
                 writer.WriteLine("[Batch]");
                 writer.WriteLine("BatchId=" + batch.BatchId);
@@ -197,6 +206,7 @@ namespace DeltaVHistoryCLI
                 writer.WriteLine("Bytes=" + bytes.ToString(CultureInfo.InvariantCulture));
                 writer.WriteLine("ReaderStatus=success");
                 writer.Flush();
+                stream.Flush();
             }
         }
 

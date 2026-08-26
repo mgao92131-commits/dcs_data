@@ -51,14 +51,13 @@ DeltaV Historian -> Historian Core -> RangeSyncEngine -> in-memory batch
 7. A global named mutex prevents a console host and Windows Service from
    running the same collector simultaneously across Windows sessions.
 
-## v1 ACK compatibility warning
+## ACK commit proof
 
-The v1 Receiver returns `committed=true` after atomically saving a batch to its
-inbox. It does not mean PostgreSQL has committed that batch. Until the Receiver
-is upgraded to commit synchronously, v2 must treat this response as
-`accepted_durably`, not as database commit confirmation. The implementation
-must not give `LastCommittedEnd` stronger semantics than the active protocol
-can prove.
+The Receiver ACK includes `commit_level`. The DCS collector accepts
+`commit_level=database` as proof for `LastCommittedEnd`; an ACK with
+`commit_level=inbox` can advance only `LastAcceptedEnd`. A legacy ACK without
+`commit_level` is rejected, so a mismatched Receiver/DCS configuration cannot
+silently weaken checkpoint semantics.
 
 ## Refactoring phases
 
