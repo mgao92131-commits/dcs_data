@@ -1,21 +1,26 @@
 # Production secrets and machine-specific configuration
-DeltaVHistoryCLI_v1.1/config.ini
-HistoryReceiver/receiver.ini
+config.ini
+receiver.ini
+state.ini
 .env
 .env.*
 
 # Runtime data
-DeltaVHistoryCLI_v1.1/spool/
-DeltaVHistoryCLI_v1.1/logs/
-HistoryReceiver/inbox/
-HistoryReceiver/archive/
-HistoryReceiver/staging/
-HistoryReceiver/rejected/
-HistoryReceiver/logs/
-HistoryReceiver/backup/
+spool/
+logs/
+inbox/
+archive/
+staging/
+rejected/
+backup/
 *.log
 
-# Build output and vendor binaries
+# Build output
+artifacts/
+bin/
+obj/
+
+# Vendor binaries
 *.exe
 *.dll
 *.tlb
