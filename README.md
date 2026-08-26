@@ -16,7 +16,7 @@ DeltaV Historian
   -> atomic state.ini checkpoint
 ```
 
-发送失败时才写入 `spool\pending`。pending 严格按 BatchId 时间顺序发送，
+发送失败时才写入 `spool\pending`。pending 有效批次严格按 `RangeStart` 顺序发送，
 旧批次未确认时新批次不能绕过它。永久坏数据进入 `failed`，本地损坏数据进入
 `quarantine`；continuous 同步会暂停，直到缺口被人工处理。
 
@@ -50,7 +50,8 @@ DeltaV Historian
 3. 执行 `test-dcs-compatibility.bat` 和
    `HistorySync.exe validate --tags tags.txt`。
 4. 用同一 Tag 和时间范围比较 v1/v2 的行数、时间戳、值、类型和 Flags。
-   详细验收证据见 [docs/dcs-acceptance.md](docs/dcs-acceptance.md)。
+   可以直接运行 `tools\compare-history-csv.ps1` 做逐行比较；详细验收证据见
+   [docs/dcs-acceptance.md](docs/dcs-acceptance.md)。
 5. 先运行 `HistorySync.exe --console` 观察，再以管理员运行
    `install-service.bat`。
 

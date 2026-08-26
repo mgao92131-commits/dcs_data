@@ -38,6 +38,19 @@ The comparison must include a range that causes `dataTruncated=True`, proving
 that automatic recursive splitting does not lose samples or duplicate a split
 boundary.
 
+For the legacy four-column CSV format, the repository includes a PowerShell 2
+compatible exact-row comparison helper:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  tools\compare-history-csv.ps1 `
+  -LegacyCsv D:\acceptance\v1\TAG_A.csv `
+  -V2Csv D:\acceptance\v2\TAG_A.csv
+```
+
+It ignores only the export comments and header, then compares every timestamp,
+value, data type, and flags field byte-for-byte.
+
 ## 3. End-to-end commit
 
 With `HistoryReceiver` configured as `SynchronousCommit=true` and the DCS
