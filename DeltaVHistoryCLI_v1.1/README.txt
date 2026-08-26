@@ -207,11 +207,11 @@ Pending batches can also be sent without reading DeltaV:
 
 The Sender uploads data.csv with authenticated batch headers. Before upload it
 recomputes SHA-256 and compares it with meta.ini. A local integrity failure is
-moved to spool\failed. Network errors, timeouts, HTTP errors, or invalid ACKs
-leave the batch in spool\pending for a later retry.
+moved to spool\quarantine. Network errors and timeouts leave the batch in
+spool\pending for a later retry.
 
-A batch is moved to spool\archive only when the Receiver response confirms all
-of the following:
+A pending batch is deleted only when the Receiver response confirms all of the
+following:
 
   ok=true
   committed=true
@@ -226,7 +226,13 @@ Receiver configuration:
   Url=http://192.168.50.20:8080/api/history/batch
   TimeoutSeconds=15
   MaxBatchesPerRun=20
+  AckMode=database
   ApiKey=replace-with-the-same-strong-secret-as-receiver.ini
+
+HTTP 400/409/413 responses are permanent batch failures and go to spool\failed.
+HTTP 401/403 pauses collection. Other HTTP errors leave pending for retry.
+Continuous collection pauses when a continuous failed/quarantined batch is
+present, so the checkpoint cannot jump over a data gap.
 HistorySync v2 - Current Operation
 ==================================
 
