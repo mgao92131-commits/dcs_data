@@ -9,7 +9,7 @@ if errorlevel 1 (
 )
 
 if not exist "%CD%\HistorySync.exe" (
-    echo ERROR: HistorySync.exe was not found. Run build.bat first.
+    echo ERROR: HistorySync.exe was not found. Copy the DCS release package first.
     exit /b 1
 )
 

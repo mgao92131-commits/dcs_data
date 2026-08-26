@@ -27,7 +27,7 @@ HTTP body
 ```bat
 go test ./...
 go vet ./...
-build.bat
+scripts\build-receiver.bat
 ```
 
 真实 PostgreSQL COMMIT/ACK 集成测试不会默认连接生产库。准备可清理的测试

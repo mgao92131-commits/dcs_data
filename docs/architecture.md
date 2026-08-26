@@ -21,7 +21,7 @@ phase.
 A real Historian comparison must also be run on a DCS workstation before a
 new collector build is promoted: for the same tag and range, v1 and v2 must
 produce identical timestamps, values, data types, flags, and row counts.
-Run `DeltaVHistoryCLI_v1.1\test-dcs-compatibility.bat` there; unlike the local
+Run `scripts\test-dcs-compatibility.bat` there; unlike the local
 regression suite, this gate never falls back to a newer framework compiler.
 
 ## Target data flow

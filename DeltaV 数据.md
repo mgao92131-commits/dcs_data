@@ -1,4 +1,4 @@
-> 当前状态：v2 的代码实现已完成并推送到 `refactor/v2`。本文主体保留为规划和设计历史；实际部署、配置和验收以仓库根目录 `README.md`、`docs/v2-architecture.md` 和 `docs/dcs-acceptance.md` 为准。现在剩余的唯一硬门槛是：在真实 Win7 32 位 DeltaV DCS 电脑上通过 .NET 2.0/3.5 x86 编译，并完成 v1/v2 Historian 数据对比。
+> 当前状态：v2 的代码实现已完成；工程结构重构在 `refactor/v2-layout` 分支进行。本文主体保留为规划和设计历史；实际部署、配置和验收以仓库根目录 `README.md`、`docs/architecture.md` 和 `docs/dcs-acceptance.md` 为准。现在剩余的唯一硬门槛是：在真实 Win7 32 位 DeltaV DCS 电脑上通过 .NET 2.0/3.5 x86 编译，并完成 v1/v2 Historian 数据对比。
 
 可以。这个项目现在已经从“能不能读 DeltaV 历史数据”进入到“做一套稳定的数据同步系统”的阶段了。下面我按实际落地来规划，不追求一开始就做得很复杂，而是分阶段把风险逐个消掉。
 
@@ -636,7 +636,7 @@ Phase 1 验证稳定以后，我们再接网络。
 ## v2 实施状态（2026-08-26）
 
 本文件前面的内容是早期规划记录。当前实现以仓库根目录 `README.md`、
-`docs/v2-architecture.md` 和 `docs/dcs-acceptance.md` 为准。
+`docs/architecture.md` 和 `docs/dcs-acceptance.md` 为准。
 
 当前已经落地：
 
@@ -649,4 +649,4 @@ Phase 1 验证稳定以后，我们再接网络。
 7. PostgreSQL 已增加 `history_samples` 完整字段模型，支持数值和文本值；旧 `history_raw` 保留为 v1 历史数据。
 
 当前版本位于 Git 分支 `refactor/v2`，稳定旧版本标记为 `v1-legacy`。现场升级前，必须在 DCS 电脑运行
-`DeltaVHistoryCLI_v1.1\\test-dcs-compatibility.bat`，并按 `docs\\dcs-acceptance.md` 完成真实 Historian 数据对比、断网补发和数据库恢复验证。
+`scripts\\test-dcs-compatibility.bat`，并按 `docs\\dcs-acceptance.md` 完成真实 Historian 数据对比、断网补发和数据库恢复验证。
