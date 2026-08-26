@@ -11,7 +11,7 @@ function Read-DataLines([string]$Path) {
     }
 
     $rows = New-Object System.Collections.ArrayList
-    foreach ($line in (Get-Content -LiteralPath $Path)) {
+    foreach ($line in (Get-Content -LiteralPath $Path -Encoding UTF8)) {
         $normalized = $line -replace '^\uFEFF', ''
         if ($normalized.StartsWith('#')) {
             continue
