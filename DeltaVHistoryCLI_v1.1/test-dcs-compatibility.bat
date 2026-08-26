@@ -12,12 +12,27 @@ if not defined CSC (
 )
 
 "%CSC%" /nologo /target:exe /platform:x86 /reference:System.ServiceProcess.dll /main:DeltaVHistoryCLI.Phase1SelfTest /out:Phase1SelfTest.compat.exe HistorianCore.cs HistoryBatch.cs SyncState.cs HistoryReader.cs HistorySync.cs HistorySyncService.cs BatchSender.cs SpoolMaintenance.cs Phase1SelfTest.cs
-if errorlevel 1 exit /b 1
+if errorlevel 1 goto failed
 
 Phase1SelfTest.compat.exe
-set RESULT=%ERRORLEVEL%
-del /q Phase1SelfTest.compat.exe 2>nul
-if not "%RESULT%"=="0" exit /b %RESULT%
+if errorlevel 1 goto failed
+
+"%CSC%" /nologo /target:exe /platform:x86 /main:DeltaVHistoryCLI.Program /out:HistoryReader.compat.exe HistorianCore.cs HistoryReader.cs
+if errorlevel 1 goto failed
+HistoryReader.compat.exe --version
+if errorlevel 1 goto failed
+
+"%CSC%" /nologo /target:exe /platform:x86 /reference:System.ServiceProcess.dll /main:DeltaVHistoryCLI.SyncProgram /out:HistorySync.compat.exe HistorianCore.cs HistoryBatch.cs SyncState.cs HistoryReader.cs HistorySync.cs HistorySyncService.cs BatchSender.cs SpoolMaintenance.cs
+if errorlevel 1 goto failed
+HistorySync.compat.exe --version
+if errorlevel 1 goto failed
+
+del /q Phase1SelfTest.compat.exe HistoryReader.compat.exe HistorySync.compat.exe 2>nul
 
 echo DCS .NET 2.0/3.5 X86 COMPATIBILITY TEST PASSED
 exit /b 0
+
+:failed
+del /q Phase1SelfTest.compat.exe HistoryReader.compat.exe HistorySync.compat.exe 2>nul
+echo DCS .NET 2.0/3.5 X86 COMPATIBILITY TEST FAILED
+exit /b 1
