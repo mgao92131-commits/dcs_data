@@ -45,7 +45,7 @@ func TestReadImportRowsAcceptsTextValue(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "data.csv")
 	content := "Tag,Timestamp,Value,DataType,Flags,SequenceNo,ArchiveStatus\n" +
-		"\"MODE/A\",\"2026-08-26 09:00:00.0000000\",\"RUN\",\"String\",\"\",\"7\",\"Current\"\n"
+		"\"MODE/A\",\"2026-08-26 09:00:00.0000000\",\" RUN \",\"String\",\"\",\"7\",\"Current\"\n"
 	if err := os.WriteFile(path, []byte(content), 0640); err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestReadImportRowsAcceptsTextValue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].ValueText != "RUN" || rows[0].ValueDouble != nil {
+	if len(rows) != 1 || rows[0].ValueText != " RUN " || rows[0].ValueDouble != nil {
 		t.Fatalf("unexpected text row: %+v", rows)
 	}
 	if rows[0].DataType != "String" || rows[0].SequenceNo != "7" || rows[0].ArchiveStatus != "Current" {

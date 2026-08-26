@@ -252,7 +252,7 @@ func (i *batchImporter) readImportRows(path, collectorID string) ([]importRow, e
 		}
 		tag := strings.TrimSpace(record[0])
 		timestamp := strings.TrimSpace(record[1])
-		valueText := strings.TrimSpace(record[2])
+		valueText := record[2]
 		if tag == "" {
 			return nil, fmt.Errorf("%w: CSV line %d: Tag is empty", errInvalidBatch, line)
 		}
@@ -261,7 +261,7 @@ func (i *batchImporter) readImportRows(path, collectorID string) ([]importRow, e
 			return nil, fmt.Errorf("%w: CSV line %d: invalid Timestamp %q", errInvalidBatch, line, timestamp)
 		}
 		var valueDouble *float64
-		if value, parseErr := strconv.ParseFloat(valueText, 64); parseErr == nil {
+		if value, parseErr := strconv.ParseFloat(strings.TrimSpace(valueText), 64); parseErr == nil {
 			valueDouble = &value
 		}
 		rows = append(rows, importRow{

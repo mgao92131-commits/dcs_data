@@ -36,7 +36,7 @@ build.bat
 psql -d deltav_history -f sql\create_tables.sql
 ```
 
-`history_samples` 保存 Collector、Tag、时间、文本值、可选数值、数据类型、
+`history_samples` 保存 Collector、Tag、时间、原始文本值、可选数值、数据类型、
 Flags、SequenceNo、ArchiveStatus、BatchId 和接收时间。字符串状态值不会再因
 `ParseFloat` 失败而丢弃。
 
