@@ -17,6 +17,7 @@ HTTP body
 
 配置 `SynchronousCommit=true` 时不会先写 inbox 再提前 ACK。数据库不可用或
 事务失败返回 HTTP 503，DCS Collector 会把批次保存到 pending outbox。
+语义校验失败的批次返回 HTTP 400 并移动到 rejected，不会被无限重试。
 
 同一 BatchId、SHA-256 和行数可以安全重试；数据库中的 `imported_batches`
 保证幂等。相同 BatchId 对应不同内容会失败。

@@ -313,6 +313,12 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 		s.commitMu.Unlock()
 		if importErr != nil {
 			s.logger.Printf("synchronous import failed batch=%s error=%v", headers.BatchID, importErr)
+			if errors.Is(importErr, errInvalidBatch) {
+				s.reject(tempDir, headers.BatchID, "invalid")
+				keepTemp = true
+				writeError(w, http.StatusBadRequest, "invalid batch payload")
+				return
+			}
 			if errors.Is(importErr, errBatchConflict) {
 				writeError(w, http.StatusConflict, importErr.Error())
 				return

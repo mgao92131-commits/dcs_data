@@ -25,6 +25,7 @@ type batchImporter struct {
 	pool              *pgxpool.Pool
 	inbox             string
 	archive           string
+	rejected          string
 	interval          time.Duration
 	importTimeout     time.Duration
 	importBatchSize   int
@@ -34,6 +35,7 @@ type batchImporter struct {
 }
 
 var errBatchConflict = errors.New("batch_id already exists with different content")
+var errInvalidBatch = errors.New("invalid batch")
 
 type importRow struct {
 	SampleKey     string
@@ -67,6 +69,7 @@ func newBatchImporter(config receiverConfig, pool *pgxpool.Pool, logger *log.Log
 		pool:              pool,
 		inbox:             config.Inbox,
 		archive:           config.Archive,
+		rejected:          config.Rejected,
 		interval:          config.ImportInterval,
 		importTimeout:     config.ImportTimeout,
 		importBatchSize:   config.ImportBatchSize,
@@ -122,6 +125,15 @@ func (i *batchImporter) importOnce(ctx context.Context) (int, int, error) {
 	for _, name := range directories {
 		batchDir := filepath.Join(i.inbox, name)
 		batch, err := i.loadBatch(batchDir)
+		if err != nil && errors.Is(err, errInvalidBatch) {
+			failed++
+			if moveErr := i.moveToRejected(batchDir, name, "invalid"); moveErr != nil {
+				i.logger.Printf("invalid batch quarantine failed batch=%s error=%v quarantine_error=%v", name, err, moveErr)
+			} else {
+				i.logger.Printf("quarantined invalid batch=%s error=%v", name, err)
+			}
+			continue
+		}
 		if err == nil {
 			batchCtx, cancel := context.WithTimeout(ctx, i.importTimeout)
 			err = i.importBatch(batchCtx, batch)
@@ -132,6 +144,14 @@ func (i *batchImporter) importOnce(ctx context.Context) (int, int, error) {
 		}
 		if err != nil {
 			failed++
+			if errors.Is(err, errBatchConflict) {
+				if moveErr := i.moveToRejected(batchDir, name, "conflict"); moveErr != nil {
+					i.logger.Printf("conflicting batch quarantine failed batch=%s error=%v quarantine_error=%v", name, err, moveErr)
+				} else {
+					i.logger.Printf("quarantined conflicting batch=%s error=%v", name, err)
+				}
+				continue
+			}
 			i.logger.Printf("import failed batch=%s error=%v", name, err)
 			continue
 		}
@@ -169,23 +189,23 @@ func (i *batchImporter) loadBatch(directory string) (importBatch, error) {
 	directoryName := filepath.Base(directory)
 	validDirectory := batchID == directoryName || strings.HasPrefix(directoryName, batchID+".tmp.")
 	if batchID == "" || !safeID.MatchString(batchID) || !validDirectory {
-		return importBatch{}, errors.New("invalid BatchId in meta.ini")
+		return importBatch{}, fmt.Errorf("%w: invalid BatchId in meta.ini", errInvalidBatch)
 	}
 	if collectorID == "" || !safeID.MatchString(collectorID) {
-		return importBatch{}, errors.New("invalid CollectorId in meta.ini")
+		return importBatch{}, fmt.Errorf("%w: invalid CollectorId in meta.ini", errInvalidBatch)
 	}
 	if err != nil || expectedRows < 0 {
-		return importBatch{}, errors.New("invalid Rows in meta.ini")
+		return importBatch{}, fmt.Errorf("%w: invalid Rows in meta.ini", errInvalidBatch)
 	}
 	if decoded, err := hex.DecodeString(expectedHash); err != nil || len(decoded) != sha256.Size {
-		return importBatch{}, errors.New("invalid Sha256 in meta.ini")
+		return importBatch{}, fmt.Errorf("%w: invalid Sha256 in meta.ini", errInvalidBatch)
 	}
 	actualHash, err := hashFile(dataPath)
 	if err != nil {
 		return importBatch{}, err
 	}
 	if !strings.EqualFold(expectedHash, actualHash) {
-		return importBatch{}, errors.New("data.csv SHA-256 does not match meta.ini")
+		return importBatch{}, fmt.Errorf("%w: data.csv SHA-256 does not match meta.ini", errInvalidBatch)
 	}
 
 	rows, err := i.readImportRows(dataPath, collectorID)
@@ -193,7 +213,7 @@ func (i *batchImporter) loadBatch(directory string) (importBatch, error) {
 		return importBatch{}, err
 	}
 	if len(rows) != expectedRows {
-		return importBatch{}, fmt.Errorf("row count mismatch: expected %d, got %d", expectedRows, len(rows))
+		return importBatch{}, fmt.Errorf("%w: row count mismatch: expected %d, got %d", errInvalidBatch, expectedRows, len(rows))
 	}
 	return importBatch{BatchID: batchID, CollectorID: collectorID, SHA256: expectedHash, Rows: expectedRows, Data: rows}, nil
 }
@@ -209,13 +229,13 @@ func (i *batchImporter) readImportRows(path, collectorID string) ([]importRow, e
 	reader.FieldsPerRecord = 7
 	header, err := reader.Read()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: cannot read CSV header: %v", errInvalidBatch, err)
 	}
 	header[0] = strings.TrimPrefix(header[0], "\ufeff")
 	expected := []string{"Tag", "Timestamp", "Value", "DataType", "Flags", "SequenceNo", "ArchiveStatus"}
 	for index := range expected {
 		if header[index] != expected[index] {
-			return nil, errors.New("unexpected CSV header")
+			return nil, fmt.Errorf("%w: unexpected CSV header", errInvalidBatch)
 		}
 	}
 
@@ -228,17 +248,17 @@ func (i *batchImporter) readImportRows(path, collectorID string) ([]importRow, e
 		}
 		line++
 		if err != nil {
-			return nil, fmt.Errorf("CSV line %d: %w", line, err)
+			return nil, fmt.Errorf("%w: CSV line %d: %v", errInvalidBatch, line, err)
 		}
 		tag := strings.TrimSpace(record[0])
 		timestamp := strings.TrimSpace(record[1])
 		valueText := strings.TrimSpace(record[2])
 		if tag == "" {
-			return nil, fmt.Errorf("CSV line %d: Tag is empty", line)
+			return nil, fmt.Errorf("%w: CSV line %d: Tag is empty", errInvalidBatch, line)
 		}
 		parsedTime, err := time.ParseInLocation("2006-01-02 15:04:05", timestamp, i.timezone)
 		if err != nil {
-			return nil, fmt.Errorf("CSV line %d: invalid Timestamp %q", line, timestamp)
+			return nil, fmt.Errorf("%w: CSV line %d: invalid Timestamp %q", errInvalidBatch, line, timestamp)
 		}
 		var valueDouble *float64
 		if value, parseErr := strconv.ParseFloat(valueText, 64); parseErr == nil {
@@ -335,6 +355,13 @@ func (i *batchImporter) moveToArchive(source, batchID string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	return os.Rename(source, destination)
+}
+
+func (i *batchImporter) moveToRejected(source, batchID, reason string) error {
+	destination := filepath.Join(
+		i.rejected,
+		batchID+"_"+reason+"_"+strconv.FormatInt(time.Now().UnixNano(), 10))
 	return os.Rename(source, destination)
 }
 

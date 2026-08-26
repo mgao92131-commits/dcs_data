@@ -21,6 +21,7 @@ namespace DeltaVHistoryCLI
                 TestHistorySampleNormalization();
                 TestMemoryBatchAndSpool(root);
                 TestAtomicSyncState(root);
+                TestOutboxCheckpointRecovery(root);
                 TestCsvCombination(root);
                 TestStagingRecovery(root);
                 Console.WriteLine("PHASE 1 SELF-TEST PASSED");
@@ -138,6 +139,43 @@ namespace DeltaVHistoryCLI
             IniConfig config = IniConfig.Load(path);
             Assert(config.Get("Historian", "Server", "") == "APP", "INI string value");
             Assert(config.GetInt("Sync", "MaxSamples", 0) == 10000, "INI integer value");
+        }
+
+        private static void TestOutboxCheckpointRecovery(string root)
+        {
+            string spool = Path.Combine(root, "recovery-spool");
+            string pending = Path.Combine(spool, "pending", "recovery_batch");
+            Directory.CreateDirectory(pending);
+            using (StreamWriter writer = new StreamWriter(
+                Path.Combine(pending, "meta.ini"), false, Encoding.UTF8))
+            {
+                writer.WriteLine("[Batch]");
+                writer.WriteLine("Mode=sync");
+                writer.WriteLine("Start=2026-08-26 08:59:00.0000000");
+                writer.WriteLine("End=2026-08-26 09:05:00.0000000");
+            }
+
+            string statePath = Path.Combine(root, "recovery-state", "state.ini");
+            DateTime baseline = new DateTime(2026, 8, 26, 9, 0, 0);
+            SyncStateStore store = new SyncStateStore(statePath);
+            SyncState state = store.LoadOrCreate(baseline);
+            using (SyncLogger logger = new SyncLogger(Path.Combine(root, "recovery-logs")))
+            {
+                MethodInfo reconcile = typeof(SyncProgram).GetMethod(
+                    "ReconcileCollectedFromOutbox",
+                    BindingFlags.NonPublic | BindingFlags.Static);
+                if (reconcile == null)
+                    throw new Exception("ReconcileCollectedFromOutbox was not found.");
+                reconcile.Invoke(null, new object[] { spool, state, store, logger });
+            }
+
+            SyncState recovered = store.LoadOrCreate(baseline);
+            Assert(
+                recovered.LastCollectedEnd == new DateTime(2026, 8, 26, 9, 5, 0),
+                "outbox checkpoint recovery");
+            Assert(
+                recovered.LastAcceptedEnd == baseline && recovered.LastCommittedEnd == baseline,
+                "outbox recovery does not imply remote commit");
         }
 
         private static void TestCsvCombination(string root)

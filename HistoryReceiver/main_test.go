@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 )
 
 func TestBatchCommitAndIdempotentRetry(t *testing.T) {
@@ -80,6 +81,28 @@ func TestBatchIDCannotBeReusedWithDifferentContent(t *testing.T) {
 	second := sendTestBatch(t, server, batchID, other, hashBytes(other), 1, "test-secret")
 	if second.Code != http.StatusConflict {
 		t.Fatalf("expected conflict, got %d body=%s", second.Code, second.Body.String())
+	}
+}
+
+func TestSynchronousInvalidPayloadReturnsBadRequest(t *testing.T) {
+	server, root := newTestReceiver(t)
+	server.config.SynchronousCommit = true
+	server.importer = &batchImporter{
+		inbox:    server.config.Inbox,
+		archive:  server.config.Archive,
+		rejected: server.config.Rejected,
+		timezone: time.FixedZone("Asia/Shanghai", 8*60*60),
+	}
+	body := []byte("Tag,Timestamp,Value,DataType,Flags,SequenceNo,ArchiveStatus\n" +
+		"\"TAG/A\",\"not-a-time\",\"1.25\",\"Float\",\"\",\"\",\"\"\n")
+	response := sendTestBatch(t, server, "invalid_sync_payload", body, hashBytes(body), 1, "test-secret")
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request, got %d body=%s", response.Code, response.Body.String())
+	}
+	if entries, err := os.ReadDir(filepath.Join(root, "rejected")); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 1 {
+		t.Fatalf("expected one rejected payload, got %d", len(entries))
 	}
 }
 

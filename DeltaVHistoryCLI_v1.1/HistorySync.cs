@@ -143,6 +143,7 @@ namespace DeltaVHistoryCLI
     class SyncProgram
     {
         private const string Version = "2.0-refactor";
+        private const string MutexName = "Global\\DeltaVHistorySync";
 
         static int Main(string[] args)
         {
@@ -159,7 +160,7 @@ namespace DeltaVHistoryCLI
             Directory.SetCurrentDirectory(baseDirectory);
 
             bool created;
-            using (Mutex mutex = new Mutex(false, "DeltaVHistorySync_Phase1", out created))
+            using (Mutex mutex = new Mutex(false, MutexName, out created))
             {
                 bool acquired = false;
                 try
@@ -238,6 +239,11 @@ namespace DeltaVHistoryCLI
                 {
                     stateStore = new SyncStateStore(options.StatePath);
                     state = stateStore.LoadOrCreate(BuildInitialState(options));
+                    ReconcileCollectedFromOutbox(
+                        options.SpoolDirectory,
+                        state,
+                        stateStore,
+                        log);
                     options.Start = state.LastCollectedEnd.AddSeconds(-options.OverlapSeconds);
                     log.Write(
                         "Checkpoint collected=" + FormatTime(state.LastCollectedEnd) +
@@ -910,33 +916,99 @@ namespace DeltaVHistoryCLI
             SyncState state = new SyncState();
             DateTime baseline = options.Start;
             DateTime collected = baseline;
-            string pendingRoot = Path.Combine(options.SpoolDirectory, "pending");
-            string[] directories = Directory.Exists(pendingRoot)
-                ? Directory.GetDirectories(pendingRoot)
-                : new string[0];
-            int i;
-            for (i = 0; i < directories.Length; i++)
+            string[] areas = new string[] { "pending", "failed" };
+            int areaIndex;
+            for (areaIndex = 0; areaIndex < areas.Length; areaIndex++)
             {
-                string metaPath = Path.Combine(directories[i], "meta.ini");
-                if (!File.Exists(metaPath))
-                    continue;
-                IniConfig meta = IniConfig.Load(metaPath);
-                if (!String.Equals(
-                    meta.Get("Batch", "Mode", ""),
-                    "sync",
-                    StringComparison.OrdinalIgnoreCase))
-                    continue;
-                DateTime start = ParseCheckpointTime(meta.Get("Batch", "Start", ""));
-                DateTime end = ParseCheckpointTime(meta.Get("Batch", "End", ""));
-                if (start < baseline)
-                    baseline = start;
-                if (end > collected)
-                    collected = end;
+                string root = Path.Combine(options.SpoolDirectory, areas[areaIndex]);
+                string[] directories = Directory.Exists(root)
+                    ? Directory.GetDirectories(root)
+                    : new string[0];
+                int i;
+                for (i = 0; i < directories.Length; i++)
+                {
+                    string metaPath = Path.Combine(directories[i], "meta.ini");
+                    if (!File.Exists(metaPath))
+                        continue;
+                    IniConfig meta = IniConfig.Load(metaPath);
+                    if (!String.Equals(
+                        meta.Get("Batch", "Mode", ""),
+                        "sync",
+                        StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    DateTime start = ParseCheckpointTime(meta.Get("Batch", "Start", ""));
+                    DateTime end = ParseCheckpointTime(meta.Get("Batch", "End", ""));
+                    if (start < baseline)
+                        baseline = start;
+                    if (end > collected)
+                        collected = end;
+                }
             }
             state.LastCollectedEnd = collected;
             state.LastAcceptedEnd = baseline;
             state.LastCommittedEnd = baseline;
             return state;
+        }
+
+        private static void ReconcileCollectedFromOutbox(
+            string spoolDirectory,
+            SyncState state,
+            SyncStateStore stateStore,
+            SyncLogger log)
+        {
+            DateTime recovered = state.LastCollectedEnd;
+            string[] areas = new string[] { "pending", "failed" };
+            int areaIndex;
+            for (areaIndex = 0; areaIndex < areas.Length; areaIndex++)
+            {
+                string root = Path.Combine(spoolDirectory, areas[areaIndex]);
+                if (!Directory.Exists(root))
+                    continue;
+                string[] directories = Directory.GetDirectories(root);
+                int i;
+                for (i = 0; i < directories.Length; i++)
+                {
+                    string metaPath = Path.Combine(directories[i], "meta.ini");
+                    if (!File.Exists(metaPath))
+                        continue;
+                    try
+                    {
+                        IniConfig meta = IniConfig.Load(metaPath);
+                        if (!String.Equals(
+                            meta.Get("Batch", "Mode", ""),
+                            "sync",
+                            StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        DateTime end = ParseCheckpointTime(meta.Get("Batch", "End", ""));
+                        if (end > recovered)
+                            recovered = end;
+                    }
+                    catch (Exception ex)
+                    {
+                        log.Write(
+                            "Cannot reconcile outbox checkpoint directory=" +
+                            directories[i] + " error=" + ex.Message);
+                    }
+                }
+            }
+
+            if (recovered <= state.LastCollectedEnd)
+                return;
+
+            SyncState before = state.Copy();
+            try
+            {
+                state.LastCollectedEnd = recovered;
+                stateStore.Save(state);
+                log.Write("Recovered LastCollectedEnd from durable outbox=" + FormatTime(recovered));
+            }
+            catch
+            {
+                state.LastCollectedEnd = before.LastCollectedEnd;
+                state.LastAcceptedEnd = before.LastAcceptedEnd;
+                state.LastCommittedEnd = before.LastCommittedEnd;
+                throw;
+            }
         }
 
         private static BatchAcknowledged CreateAcknowledgedHandler(

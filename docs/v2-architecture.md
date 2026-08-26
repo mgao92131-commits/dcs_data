@@ -47,6 +47,8 @@ DeltaV Historian -> Historian Core -> RangeSyncEngine -> in-memory batch
 4. Initial-load and backfill jobs never modify continuous-sync checkpoints.
 5. State updates use write, flush, and atomic rename.
 6. A checkpoint never advances when batch persistence fails.
+7. A global named mutex prevents a console host and Windows Service from
+   running the same collector simultaneously across Windows sessions.
 
 ## v1 ACK compatibility warning
 
@@ -75,6 +77,7 @@ can prove.
 
 Phases 1 through 11 are implemented on `refactor/v2`. Local regression,
 Receiver unit/vet checks, PostgreSQL schema migration, synchronous COMMIT/ACK,
-text-value import, and duplicate retry have been verified. The remaining
+text-value import, duplicate retry, permanent invalid-batch rejection, and
+durable outbox checkpoint recovery have been verified. The remaining
 promotion gate is hardware-specific: compile with .NET 2.0/3.5 on the DCS
 workstation and compare real Historian output against `v1-legacy`.
