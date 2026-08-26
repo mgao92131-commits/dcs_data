@@ -22,6 +22,7 @@ namespace DeltaVHistoryCLI
                 TestMemoryBatchAndSpool(root);
                 TestAtomicSyncState(root);
                 TestOutboxCheckpointRecovery(root);
+                TestInitialStateSkipsCorruptOutbox(root);
                 TestPendingRangeOrder(root);
                 TestCsvCombination(root);
                 TestStagingRecovery(root);
@@ -211,6 +212,36 @@ namespace DeltaVHistoryCLI
             Assert(
                 Path.GetFileName((string)directory.GetValue(batches[2])) == "z_later",
                 "pending later range follows earlier range");
+        }
+
+        private static void TestInitialStateSkipsCorruptOutbox(string root)
+        {
+            string spool = Path.Combine(root, "corrupt-initial-spool");
+            string pending = Path.Combine(spool, "pending", "corrupt_batch");
+            Directory.CreateDirectory(pending);
+            using (StreamWriter writer = new StreamWriter(
+                Path.Combine(pending, "meta.ini"), false, Encoding.UTF8))
+            {
+                writer.WriteLine("[Batch]");
+                writer.WriteLine("Mode=sync");
+                writer.WriteLine("Start=not-a-time");
+                writer.WriteLine("End=not-a-time");
+            }
+
+            SyncOptions options = new SyncOptions();
+            options.SpoolDirectory = spool;
+            options.Start = new DateTime(2026, 8, 26, 9, 0, 0);
+            MethodInfo build = typeof(SyncProgram).GetMethod(
+                "BuildInitialState",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            if (build == null)
+                throw new Exception("BuildInitialState was not found.");
+            SyncState state = (SyncState)build.Invoke(null, new object[] { options });
+            Assert(
+                state.LastCollectedEnd == options.Start &&
+                    state.LastAcceptedEnd == options.Start &&
+                    state.LastCommittedEnd == options.Start,
+                "corrupt outbox does not abort initial state creation");
         }
 
         private static void WritePendingMeta(string path, string start)

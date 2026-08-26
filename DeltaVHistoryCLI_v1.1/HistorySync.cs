@@ -930,18 +930,25 @@ namespace DeltaVHistoryCLI
                     string metaPath = Path.Combine(directories[i], "meta.ini");
                     if (!File.Exists(metaPath))
                         continue;
-                    IniConfig meta = IniConfig.Load(metaPath);
-                    if (!String.Equals(
-                        meta.Get("Batch", "Mode", ""),
-                        "sync",
-                        StringComparison.OrdinalIgnoreCase))
-                        continue;
-                    DateTime start = ParseCheckpointTime(meta.Get("Batch", "Start", ""));
-                    DateTime end = ParseCheckpointTime(meta.Get("Batch", "End", ""));
-                    if (start < baseline)
-                        baseline = start;
-                    if (end > collected)
-                        collected = end;
+                    try
+                    {
+                        IniConfig meta = IniConfig.Load(metaPath);
+                        if (!String.Equals(
+                            meta.Get("Batch", "Mode", ""),
+                            "sync",
+                            StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        DateTime start = ParseCheckpointTime(meta.Get("Batch", "Start", ""));
+                        DateTime end = ParseCheckpointTime(meta.Get("Batch", "End", ""));
+                        if (start < baseline)
+                            baseline = start;
+                        if (end > collected)
+                            collected = end;
+                    }
+                    catch
+                    {
+                        // Sender will quarantine malformed durable batches after startup.
+                    }
                 }
             }
             state.LastCollectedEnd = collected;
