@@ -39,6 +39,13 @@ namespace DeltaVHistoryCLI
 
     class BatchSender
     {
+        private class PendingBatch
+        {
+            public string Directory;
+            public bool HasRangeStart;
+            public DateTime RangeStart;
+        }
+
         private string _url;
         private string _apiKey;
         private int _timeoutMilliseconds;
@@ -103,16 +110,15 @@ namespace DeltaVHistoryCLI
             Directory.CreateDirectory(failedRoot);
             Directory.CreateDirectory(quarantineRoot);
 
-            string[] batches = Directory.GetDirectories(pendingRoot);
-            Array.Sort(batches, StringComparer.OrdinalIgnoreCase);
+            List<PendingBatch> batches = GetPendingBatches(pendingRoot);
 
-            int limit = batches.Length < _maxBatches ? batches.Length : _maxBatches;
+            int limit = batches.Count < _maxBatches ? batches.Count : _maxBatches;
             int sent = 0;
             int invalid = 0;
             int i;
             for (i = 0; i < limit; i++)
             {
-                string batchDirectory = batches[i];
+                string batchDirectory = batches[i].Directory;
                 string batchName = Path.GetFileName(batchDirectory);
                 try
                 {
@@ -157,6 +163,59 @@ namespace DeltaVHistoryCLI
             _log.Write("Sender completed sent=" + sent.ToString() + " remaining=" +
                 (Directory.GetDirectories(pendingRoot).Length).ToString());
             return invalid == 0 ? 0 : 41;
+        }
+
+        private static List<PendingBatch> GetPendingBatches(string pendingRoot)
+        {
+            string[] directories = Directory.GetDirectories(pendingRoot);
+            List<PendingBatch> result = new List<PendingBatch>();
+            int i;
+            for (i = 0; i < directories.Length; i++)
+            {
+                PendingBatch item = new PendingBatch();
+                item.Directory = directories[i];
+                item.HasRangeStart = TryReadRangeStart(directories[i], out item.RangeStart);
+                result.Add(item);
+            }
+            result.Sort(delegate(PendingBatch a, PendingBatch b)
+            {
+                if (a.HasRangeStart != b.HasRangeStart)
+                    return a.HasRangeStart ? 1 : -1;
+                if (a.HasRangeStart)
+                {
+                    int byTime = a.RangeStart.CompareTo(b.RangeStart);
+                    if (byTime != 0)
+                        return byTime;
+                }
+                return String.Compare(
+                    a.Directory,
+                    b.Directory,
+                    StringComparison.OrdinalIgnoreCase);
+            });
+            return result;
+        }
+
+        private static bool TryReadRangeStart(string batchDirectory, out DateTime value)
+        {
+            value = DateTime.MinValue;
+            try
+            {
+                string metaPath = Path.Combine(batchDirectory, "meta.ini");
+                if (!File.Exists(metaPath))
+                    return false;
+                IniConfig meta = IniConfig.Load(metaPath);
+                return DateTime.TryParseExact(
+                    meta.Get("Batch", "Start", ""),
+                    "yyyy-MM-dd HH:mm:ss.fffffff",
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.None,
+                    out value);
+            }
+            catch
+            {
+                value = DateTime.MinValue;
+                return false;
+            }
         }
 
         private BatchReceipt SendOne(string batchDirectory)

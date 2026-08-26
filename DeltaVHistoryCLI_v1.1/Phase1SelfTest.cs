@@ -22,6 +22,7 @@ namespace DeltaVHistoryCLI
                 TestMemoryBatchAndSpool(root);
                 TestAtomicSyncState(root);
                 TestOutboxCheckpointRecovery(root);
+                TestPendingRangeOrder(root);
                 TestCsvCombination(root);
                 TestStagingRecovery(root);
                 Console.WriteLine("PHASE 1 SELF-TEST PASSED");
@@ -176,6 +177,49 @@ namespace DeltaVHistoryCLI
             Assert(
                 recovered.LastAcceptedEnd == baseline && recovered.LastCommittedEnd == baseline,
                 "outbox recovery does not imply remote commit");
+        }
+
+        private static void TestPendingRangeOrder(string root)
+        {
+            string pending = Path.Combine(root, "ordered-pending");
+            Directory.CreateDirectory(Path.Combine(pending, "z_later"));
+            Directory.CreateDirectory(Path.Combine(pending, "a_earlier"));
+            Directory.CreateDirectory(Path.Combine(pending, "m_invalid"));
+            WritePendingMeta(
+                Path.Combine(pending, "z_later", "meta.ini"),
+                "2026-08-26 09:05:00.0000000");
+            WritePendingMeta(
+                Path.Combine(pending, "a_earlier", "meta.ini"),
+                "2026-08-26 09:00:00.0000000");
+
+            MethodInfo order = typeof(BatchSender).GetMethod(
+                "GetPendingBatches",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            if (order == null)
+                throw new Exception("GetPendingBatches was not found.");
+            System.Collections.IList batches = (System.Collections.IList)order.Invoke(
+                null,
+                new object[] { pending });
+            Assert(batches.Count == 3, "pending order batch count");
+            FieldInfo directory = batches[0].GetType().GetField("Directory");
+            Assert(
+                Path.GetFileName((string)directory.GetValue(batches[0])) == "m_invalid",
+                "invalid pending metadata is processed before valid batches");
+            Assert(
+                Path.GetFileName((string)directory.GetValue(batches[1])) == "a_earlier",
+                "pending batches are sorted by RangeStart");
+            Assert(
+                Path.GetFileName((string)directory.GetValue(batches[2])) == "z_later",
+                "pending later range follows earlier range");
+        }
+
+        private static void WritePendingMeta(string path, string start)
+        {
+            using (StreamWriter writer = new StreamWriter(path, false, Encoding.UTF8))
+            {
+                writer.WriteLine("[Batch]");
+                writer.WriteLine("Start=" + start);
+            }
         }
 
         private static void TestCsvCombination(string root)

@@ -42,8 +42,9 @@ DeltaV Historian -> Historian Core -> RangeSyncEngine -> in-memory batch
    durably stored in the local outbox.
 2. `LastCommittedEnd` advances only for a contiguous sequence of batches that
    PostgreSQL has committed.
-3. Pending batches are sent oldest first. If an older batch is still pending,
-   newer batches cannot bypass it through direct HTTP sending.
+3. Pending batches with valid metadata are sent by `RangeStart`, oldest first.
+   Direct HTTP sending cannot bypass an older pending batch; malformed local
+   batches are isolated before valid batches are sent.
 4. Initial-load and backfill jobs never modify continuous-sync checkpoints.
 5. State updates use write, flush, and atomic rename.
 6. A checkpoint never advances when batch persistence fails.
