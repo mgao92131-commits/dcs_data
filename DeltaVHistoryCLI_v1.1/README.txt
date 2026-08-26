@@ -223,7 +223,7 @@ Receiver configuration:
 
   [Receiver]
   Enabled=true
-  Url=http://192.168.50.20:8080/api/history/batch
+  Url=http://192.168.1.10:8080/api/history/batch
   TimeoutSeconds=15
   MaxBatchesPerRun=20
   AckMode=database
