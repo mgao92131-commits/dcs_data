@@ -66,7 +66,7 @@ SequenceNo unavailable (temporary fallback):
 ## 健康检查
 
 ```text
-GET http://RECEIVER_IP:8080/healthz
+GET http://192.168.1.10:8080/healthz
 ```
 
 数据库同步 ACK 必须包含 `commit_level=database`；未启用同步提交时为
