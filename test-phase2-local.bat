@@ -1,6 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+set GOCACHE=%~dp0.gocache
 
 echo Testing HistoryReceiver...
 pushd HistoryReceiver
@@ -27,7 +28,7 @@ if not defined CSC (
 
 echo Compiling HistorySync Phase 2...
 pushd DeltaVHistoryCLI_v1.1
-"%CSC%" /nologo /target:exe /platform:x86 /main:DeltaVHistoryCLI.SyncProgram /out:HistorySync.phase2test.exe HistoryReader.cs HistorySync.cs BatchSender.cs SpoolMaintenance.cs
+"%CSC%" /nologo /target:exe /platform:x86 /reference:System.ServiceProcess.dll /main:DeltaVHistoryCLI.SyncProgram /out:HistorySync.phase2test.exe HistorianCore.cs HistoryBatch.cs SyncState.cs HistoryReader.cs HistorySync.cs HistorySyncService.cs BatchSender.cs SpoolMaintenance.cs
 if errorlevel 1 (
     popd
     exit /b 1

@@ -91,13 +91,46 @@ namespace DeltaVHistoryCLI
 
         public void SavePending(HistoryBatch batch, byte[] data)
         {
-            string stagingRoot = Path.Combine(_spoolDirectory, "staging");
+            Save(batch, data, "pending", batch.BatchId);
+        }
+
+        public void SaveFailed(HistoryBatch batch, byte[] data, string reason)
+        {
+            Save(
+                batch,
+                data,
+                "failed",
+                batch.BatchId + "_" + SafeName(reason) + "_" + Guid.NewGuid().ToString("N"));
+        }
+
+        public void EnsurePendingCapacity(int maxBatches, long maxBytes)
+        {
             string pendingRoot = Path.Combine(_spoolDirectory, "pending");
-            Directory.CreateDirectory(stagingRoot);
             Directory.CreateDirectory(pendingRoot);
+            string[] directories = Directory.GetDirectories(pendingRoot);
+            long bytes = 0;
+            int i;
+            for (i = 0; i < directories.Length; i++)
+            {
+                string dataPath = Path.Combine(directories[i], "data.csv");
+                if (File.Exists(dataPath))
+                    bytes += new FileInfo(dataPath).Length;
+            }
+            if (directories.Length >= maxBatches || bytes >= maxBytes)
+                throw new IOException(
+                    "Pending outbox capacity reached. batches=" + directories.Length.ToString() +
+                    " bytes=" + bytes.ToString(CultureInfo.InvariantCulture));
+        }
+
+        private void Save(HistoryBatch batch, byte[] data, string area, string directoryName)
+        {
+            string stagingRoot = Path.Combine(_spoolDirectory, "staging");
+            string destinationRoot = Path.Combine(_spoolDirectory, area);
+            Directory.CreateDirectory(stagingRoot);
+            Directory.CreateDirectory(destinationRoot);
             string temporary = Path.Combine(stagingRoot, batch.BatchId + ".tmp");
-            string pending = Path.Combine(pendingRoot, batch.BatchId);
-            if (Directory.Exists(temporary) || Directory.Exists(pending))
+            string destination = Path.Combine(destinationRoot, directoryName);
+            if (Directory.Exists(temporary) || Directory.Exists(destination))
                 throw new IOException("Batch already exists in spool: " + batch.BatchId);
 
             Directory.CreateDirectory(temporary);
@@ -106,7 +139,7 @@ namespace DeltaVHistoryCLI
             {
                 WriteBytes(Path.Combine(temporary, "data.csv"), data);
                 WriteMetadata(Path.Combine(temporary, "meta.ini"), batch, data.Length);
-                Directory.Move(temporary, pending);
+                Directory.Move(temporary, destination);
                 committed = true;
             }
             finally
@@ -117,6 +150,20 @@ namespace DeltaVHistoryCLI
                     catch { }
                 }
             }
+        }
+
+        private static string SafeName(string value)
+        {
+            if (String.IsNullOrEmpty(value))
+                return "failed";
+            StringBuilder result = new StringBuilder(value.Length);
+            int i;
+            for (i = 0; i < value.Length; i++)
+            {
+                char c = value[i];
+                result.Append(Char.IsLetterOrDigit(c) || c == '-' || c == '_' ? c : '_');
+            }
+            return result.ToString();
         }
 
         private static void WriteBytes(string path, byte[] data)

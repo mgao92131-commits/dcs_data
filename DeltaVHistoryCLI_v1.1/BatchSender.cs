@@ -9,6 +9,34 @@ using System.Text.RegularExpressions;
 
 namespace DeltaVHistoryCLI
 {
+    class BatchSendException : Exception
+    {
+        public readonly int StatusCode;
+        public readonly bool Permanent;
+        public readonly bool AuthenticationFailure;
+
+        public BatchSendException(
+            string message,
+            int statusCode,
+            bool permanent,
+            bool authenticationFailure) : base(message)
+        {
+            StatusCode = statusCode;
+            Permanent = permanent;
+            AuthenticationFailure = authenticationFailure;
+        }
+    }
+
+    class BatchReceipt
+    {
+        public string BatchId;
+        public string Mode;
+        public DateTime RangeStart;
+        public DateTime RangeEnd;
+    }
+
+    delegate void BatchAcknowledged(BatchReceipt receipt);
+
     class BatchSender
     {
         private string _url;
@@ -38,7 +66,7 @@ namespace DeltaVHistoryCLI
                 throw new Exception("Receiver timeout and MaxBatchesPerRun must be positive.");
         }
 
-        public void Send(HistoryBatch batch, byte[] data)
+        public BatchReceipt Send(HistoryBatch batch, byte[] data)
         {
             if (batch == null)
                 throw new ArgumentNullException("batch");
@@ -49,7 +77,7 @@ namespace DeltaVHistoryCLI
                 !String.Equals(batch.Sha256, actualHash, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException("In-memory batch SHA-256 mismatch.");
             batch.Sha256 = actualHash;
-            SendPayload(
+            return SendPayload(
                 batch.BatchId,
                 batch.CollectorId,
                 batch.Mode,
@@ -63,12 +91,17 @@ namespace DeltaVHistoryCLI
 
         public int SendPending()
         {
+            return SendPending(null);
+        }
+
+        public int SendPending(BatchAcknowledged acknowledged)
+        {
             string pendingRoot = Path.Combine(_spoolDirectory, "pending");
-            string archiveRoot = Path.Combine(_spoolDirectory, "archive");
             string failedRoot = Path.Combine(_spoolDirectory, "failed");
+            string quarantineRoot = Path.Combine(_spoolDirectory, "quarantine");
             Directory.CreateDirectory(pendingRoot);
-            Directory.CreateDirectory(archiveRoot);
             Directory.CreateDirectory(failedRoot);
+            Directory.CreateDirectory(quarantineRoot);
 
             string[] batches = Directory.GetDirectories(pendingRoot);
             Array.Sort(batches, StringComparer.OrdinalIgnoreCase);
@@ -83,22 +116,36 @@ namespace DeltaVHistoryCLI
                 string batchName = Path.GetFileName(batchDirectory);
                 try
                 {
-                    SendOne(batchDirectory);
-                    string archiveDirectory = Path.Combine(archiveRoot, batchName);
-                    if (Directory.Exists(archiveDirectory))
-                        archiveDirectory += "_duplicate_" + Guid.NewGuid().ToString("N");
-                    Directory.Move(batchDirectory, archiveDirectory);
+                    BatchReceipt receipt = SendOne(batchDirectory);
+                    if (acknowledged != null)
+                        acknowledged(receipt);
+                    Directory.Delete(batchDirectory, true);
                     sent++;
-                    _log.Write("Archived acknowledged batch=" + batchName);
+                    _log.Write("Removed acknowledged outbox batch=" + batchName);
                 }
                 catch (InvalidDataException ex)
                 {
                     string failedDirectory = Path.Combine(
-                        failedRoot,
+                        quarantineRoot,
                         batchName + "_invalid_" + Guid.NewGuid().ToString("N"));
                     Directory.Move(batchDirectory, failedDirectory);
-                    _log.Write("Moved invalid local batch to failed=" + batchName + " error=" + ex.Message);
+                    _log.Write("Moved invalid local batch to quarantine=" + batchName + " error=" + ex.Message);
                     invalid++;
+                }
+                catch (BatchSendException ex)
+                {
+                    if (ex.Permanent)
+                    {
+                        string failedDirectory = Path.Combine(
+                            failedRoot,
+                            batchName + "_http" + ex.StatusCode.ToString() + "_" + Guid.NewGuid().ToString("N"));
+                        Directory.Move(batchDirectory, failedDirectory);
+                        _log.Write("Receiver permanently rejected batch=" + batchName + " error=" + ex.Message);
+                        invalid++;
+                        continue;
+                    }
+                    _log.Write("Send stopped; pending retained batch=" + batchName + " error=" + ex.Message);
+                    return ex.AuthenticationFailure ? 42 : 40;
                 }
                 catch (Exception ex)
                 {
@@ -112,7 +159,7 @@ namespace DeltaVHistoryCLI
             return invalid == 0 ? 0 : 41;
         }
 
-        private void SendOne(string batchDirectory)
+        private BatchReceipt SendOne(string batchDirectory)
         {
             string metaPath = Path.Combine(batchDirectory, "meta.ini");
             string dataPath = Path.Combine(batchDirectory, "data.csv");
@@ -144,7 +191,7 @@ namespace DeltaVHistoryCLI
             ValidateHeader(end);
 
             byte[] data = File.ReadAllBytes(dataPath);
-            SendPayload(
+            return SendPayload(
                 batchId,
                 collectorId,
                 mode,
@@ -156,7 +203,7 @@ namespace DeltaVHistoryCLI
                 data);
         }
 
-        private void SendPayload(
+        private BatchReceipt SendPayload(
             string batchId,
             string collectorId,
             string mode,
@@ -219,7 +266,14 @@ namespace DeltaVHistoryCLI
                 using (response)
                 using (StreamReader reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
                     responseText = reader.ReadToEnd();
-                throw new Exception("Receiver HTTP " + ((int)response.StatusCode).ToString() + ": " + responseText);
+                int statusCode = (int)response.StatusCode;
+                bool permanent = statusCode == 400 || statusCode == 409 || statusCode == 413;
+                bool authentication = statusCode == 401 || statusCode == 403;
+                throw new BatchSendException(
+                    "Receiver HTTP " + statusCode.ToString() + ": " + responseText,
+                    statusCode,
+                    permanent,
+                    authentication);
             }
 
             if (status != HttpStatusCode.OK)
@@ -227,11 +281,30 @@ namespace DeltaVHistoryCLI
 
             ValidateAck(responseText, batchId, actualHash, expectedRows);
             _log.Write("ACK batch=" + batchId + " rows=" + expectedRows.ToString());
+            BatchReceipt receipt = new BatchReceipt();
+            receipt.BatchId = batchId;
+            receipt.Mode = mode;
+            receipt.RangeStart = ParseTime(start);
+            receipt.RangeEnd = ParseTime(end);
+            return receipt;
         }
 
         private static string FormatTime(DateTime value)
         {
             return value.ToString("yyyy-MM-dd HH:mm:ss.fffffff", CultureInfo.InvariantCulture);
+        }
+
+        private static DateTime ParseTime(string value)
+        {
+            DateTime parsed;
+            if (!DateTime.TryParseExact(
+                value,
+                "yyyy-MM-dd HH:mm:ss.fffffff",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out parsed))
+                throw new InvalidDataException("Invalid batch range time: " + value);
+            return parsed;
         }
 
         private static void ValidateAck(

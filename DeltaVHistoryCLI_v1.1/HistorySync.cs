@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -89,10 +90,19 @@ namespace DeltaVHistoryCLI
         public string TagsFile;
         public string SingleTag;
         public string SpoolDirectory;
+        public string StatePath;
+        public string LogsDirectory;
         public string CollectorId;
+        public string AckMode;
         public DateTime Start;
         public DateTime End;
         public TimeSpan Slice;
+        public int OverlapSeconds;
+        public int MinWindowSeconds;
+        public int MaxPendingBatches;
+        public long MaxPendingBytes;
+        public int ConnectRetries;
+        public int RetrySeconds;
         public int MaxSamples;
         public int MaxBatchRows;
         public long MaxBatchBytes;
@@ -135,6 +145,15 @@ namespace DeltaVHistoryCLI
         private const string Version = "2.0-refactor";
 
         static int Main(string[] args)
+        {
+            if (args.Length == 1 && String.Equals(args[0], "--service", StringComparison.OrdinalIgnoreCase))
+                return HistorySyncService.RunService();
+            if (args.Length == 1 && String.Equals(args[0], "--console", StringComparison.OrdinalIgnoreCase))
+                return HistorySyncService.RunConsole();
+            return Execute(args);
+        }
+
+        internal static int Execute(string[] args)
         {
             string baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
             Directory.SetCurrentDirectory(baseDirectory);
@@ -191,7 +210,7 @@ namespace DeltaVHistoryCLI
 
             string command = args[0].ToLowerInvariant();
             if (command != "sync" && command != "init" && command != "backfill" &&
-                command != "validate" && command != "send")
+                command != "validate" && command != "send" && command != "status")
                 throw new Exception("Unknown command: " + args[0]);
 
             string configText = FindOption(args, "--config");
@@ -204,15 +223,44 @@ namespace DeltaVHistoryCLI
             using (SyncLogger log = new SyncLogger(logsDirectory))
             {
                 log.Write("HistorySync " + Version + " mode=" + command);
-                log.Write("Server=" + options.Server + " Start=" + FormatTime(options.Start) + " End=" + FormatTime(options.End));
 
                 if (command == "validate")
                     return RunValidate(options, log);
+                if (command == "status")
+                    return RunStatus(options, config);
 
                 PrepareSpool(options.SpoolDirectory, log);
                 SpoolMaintenance.Run(config, options.SpoolDirectory, logsDirectory, log);
+
+                SyncStateStore stateStore = null;
+                SyncState state = null;
+                if (command == "sync")
+                {
+                    stateStore = new SyncStateStore(options.StatePath);
+                    state = stateStore.LoadOrCreate(BuildInitialState(options));
+                    options.Start = state.LastCollectedEnd.AddSeconds(-options.OverlapSeconds);
+                    log.Write(
+                        "Checkpoint collected=" + FormatTime(state.LastCollectedEnd) +
+                        " accepted=" + FormatTime(state.LastAcceptedEnd) +
+                        " committed=" + FormatTime(state.LastCommittedEnd));
+                }
+                else if (command == "send" && File.Exists(options.StatePath))
+                {
+                    stateStore = new SyncStateStore(options.StatePath);
+                    state = stateStore.LoadOrCreate(DateTime.Now);
+                }
+
+                log.Write("Server=" + options.Server + " Start=" + FormatTime(options.Start) + " End=" + FormatTime(options.End));
+                BatchAcknowledged acknowledged = CreateAcknowledgedHandler(
+                    options,
+                    state,
+                    stateStore,
+                    log);
                 if (command == "send")
-                    return RunSender(config, options.SpoolDirectory, log);
+                {
+                    BatchSender sendOnly = new BatchSender(config, options.SpoolDirectory, log);
+                    return sendOnly.SendPending(acknowledged);
+                }
 
                 bool senderEnabled = config.GetBool("Receiver", "Enabled", false);
                 bool sendRequested = senderEnabled && !HasArg(args, "--no-send");
@@ -223,17 +271,42 @@ namespace DeltaVHistoryCLI
                 bool directSendAllowed = false;
                 if (sender != null)
                 {
-                    senderCode = sender.SendPending();
+                    senderCode = sender.SendPending(acknowledged);
                     directSendAllowed = senderCode == 0 &&
                         Directory.GetDirectories(
                             Path.Combine(options.SpoolDirectory, "pending")).Length == 0;
+                    if (senderCode == 42)
+                    {
+                        log.Write("Collection paused because Receiver authentication failed.");
+                        return 42;
+                    }
+                }
+
+                if (command == "sync" && HasBlockingContinuousFailures(options.SpoolDirectory))
+                {
+                    log.Write("Collection paused because failed or quarantined continuous batches require attention.");
+                    return 44;
+                }
+
+                try
+                {
+                    new SpoolStore(options.SpoolDirectory).EnsurePendingCapacity(
+                        options.MaxPendingBatches,
+                        options.MaxPendingBytes);
+                }
+                catch (IOException ex)
+                {
+                    log.Write("Collection paused: " + ex.Message);
+                    return 43;
                 }
 
                 int collectionCode = RunCollection(
                     options,
                     log,
                     sender,
-                    directSendAllowed);
+                    directSendAllowed,
+                    state,
+                    stateStore);
                 if (collectionCode != 0 && collectionCode != 5)
                     return collectionCode;
                 return senderCode == 0 ? collectionCode : senderCode;
@@ -256,7 +329,16 @@ namespace DeltaVHistoryCLI
             string tagsText = OptionOrDefault(args, "--tags", config.Get("Files", "Tags", "tags.txt"));
             options.TagsFile = ResolvePath(baseDirectory, tagsText);
             options.SpoolDirectory = ResolvePath(baseDirectory, config.Get("Files", "Spool", "spool"));
+            options.StatePath = ResolvePath(baseDirectory, config.Get("Files", "State", "state.ini"));
+            options.LogsDirectory = ResolvePath(baseDirectory, config.Get("Files", "Logs", "logs"));
             options.CollectorId = config.Get("Collector", "Id", Environment.MachineName);
+            options.ConnectRetries = config.GetInt("Historian", "ConnectRetries", 3);
+            options.RetrySeconds = config.GetInt("Historian", "RetrySeconds", 10);
+            if (options.ConnectRetries <= 0 || options.RetrySeconds < 0)
+                throw new Exception("Invalid Historian reconnect configuration.");
+            options.AckMode = config.Get("Receiver", "AckMode", "inbox").ToLowerInvariant();
+            if (options.AckMode != "inbox" && options.AckMode != "database")
+                throw new Exception("[Receiver] AckMode must be inbox or database.");
             options.MaxSamples = ParsePositiveInt(
                 OptionOrDefault(args, "--max", config.Get("Sync", "MaxSamples", "10000")),
                 "--max");
@@ -264,10 +346,16 @@ namespace DeltaVHistoryCLI
             options.MaxBatchBytes = ParsePositiveLong(
                 config.Get("Spool", "MaxBatchBytes", "20971520"),
                 "[Spool] MaxBatchBytes");
-            if (options.MaxBatchRows <= 0)
-                throw new Exception("[Spool] MaxBatchRows must be positive.");
+            options.MinWindowSeconds = config.GetInt("Sync", "MinWindowSeconds", 5);
+            options.MaxPendingBatches = config.GetInt("Spool", "MaxPendingBatches", 200);
+            options.MaxPendingBytes = ParsePositiveLong(
+                config.Get("Spool", "MaxPendingBytes", "1073741824"),
+                "[Spool] MaxPendingBytes");
+            if (options.MaxBatchRows <= 0 || options.MinWindowSeconds <= 0 ||
+                options.MaxPendingBatches <= 0)
+                throw new Exception("Batch and dynamic window limits must be positive.");
 
-            if (command == "validate" || command == "send")
+            if (command == "validate" || command == "send" || command == "status")
             {
                 options.Start = DateTime.Now.AddMinutes(-1);
                 options.End = DateTime.Now;
@@ -279,12 +367,17 @@ namespace DeltaVHistoryCLI
             {
                 int lookback = config.GetInt("Sync", "LookbackMinutes", 15);
                 int endDelay = config.GetInt("Sync", "EndDelaySeconds", 30);
-                if (lookback <= 0 || endDelay < 0)
-                    throw new Exception("LookbackMinutes must be positive and EndDelaySeconds cannot be negative.");
+                int overlap = config.GetInt("Sync", "OverlapSeconds", 60);
+                int maxWindow = config.GetInt("Sync", "MaxWindowMinutes", 30);
+                int minWindow = config.GetInt("Sync", "MinWindowSeconds", 5);
+                if (lookback <= 0 || endDelay < 0 || overlap < 0 || maxWindow <= 0 || minWindow <= 0)
+                    throw new Exception("Invalid continuous sync timing configuration.");
 
                 options.End = DateTime.Now.AddSeconds(-endDelay);
                 options.Start = options.End.AddMinutes(-lookback);
-                options.Slice = options.End.Subtract(options.Start);
+                options.Slice = TimeSpan.FromMinutes(maxWindow);
+                options.OverlapSeconds = overlap;
+                options.MinWindowSeconds = minWindow;
                 return options;
             }
 
@@ -318,10 +411,7 @@ namespace DeltaVHistoryCLI
             HistorianClient client = null;
             try
             {
-                client = new HistorianClient(
-                    @"C:\DeltaV",
-                    delegate(string message) { log.Write("Historian " + message); });
-                client.Connect(options.Server);
+                client = ConnectHistorian(options, log);
                 List<TagResult> tags = client.ResolveTags(LoadSyncTags(options));
                 int bad = 0;
                 int i;
@@ -340,6 +430,145 @@ namespace DeltaVHistoryCLI
             }
         }
 
+        private static HistorianClient ConnectHistorian(SyncOptions options, SyncLogger log)
+        {
+            Exception last = null;
+            int attempt;
+            for (attempt = 1; attempt <= options.ConnectRetries; attempt++)
+            {
+                HistorianClient client = new HistorianClient(
+                    @"C:\DeltaV",
+                    delegate(string message) { log.Write("Historian " + message); });
+                try
+                {
+                    client.Connect(options.Server);
+                    if (attempt > 1)
+                        log.Write("Historian reconnect succeeded attempt=" + attempt.ToString());
+                    return client;
+                }
+                catch (Exception ex)
+                {
+                    last = ex;
+                    client.Dispose();
+                    log.Write(
+                        "Historian connect failed attempt=" + attempt.ToString() +
+                        "/" + options.ConnectRetries.ToString() + " error=" + ex.Message);
+                    if (attempt < options.ConnectRetries && options.RetrySeconds > 0)
+                        Thread.Sleep(options.RetrySeconds * 1000);
+                }
+            }
+            throw new Exception("Historian connection failed after retries.", last);
+        }
+
+        private static int RunStatus(SyncOptions options, IniConfig config)
+        {
+            Console.WriteLine("Historian       Not checked");
+            Console.WriteLine("Receiver        " + (ReceiverOnline(config) ? "Online" : "Offline"));
+            if (File.Exists(options.StatePath))
+            {
+                SyncState state = new SyncStateStore(options.StatePath).LoadOrCreate(DateTime.Now);
+                Console.WriteLine("LastCollected   " + FormatTime(state.LastCollectedEnd));
+                Console.WriteLine("LastAccepted    " + FormatTime(state.LastAcceptedEnd));
+                Console.WriteLine("LastCommitted   " + FormatTime(state.LastCommittedEnd));
+            }
+            else
+            {
+                Console.WriteLine("LastCollected   Not initialized");
+                Console.WriteLine("LastAccepted    Not initialized");
+                Console.WriteLine("LastCommitted   Not initialized");
+            }
+            Console.WriteLine("PendingBatches  " + CountDirectories(options.SpoolDirectory, "pending").ToString());
+            Console.WriteLine("FailedBatches   " + CountDirectories(options.SpoolDirectory, "failed").ToString());
+            Console.WriteLine("Quarantined     " + CountDirectories(options.SpoolDirectory, "quarantine").ToString());
+            Console.WriteLine("AckMode         " + options.AckMode);
+            Console.WriteLine("LastError       " + FindLastError(options.LogsDirectory));
+            return 0;
+        }
+
+        private static bool ReceiverOnline(IniConfig config)
+        {
+            try
+            {
+                Uri batchUri = new Uri(config.Get("Receiver", "Url", ""));
+                Uri healthUri = new Uri(batchUri, "/healthz");
+                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(healthUri);
+                request.Method = "GET";
+                request.Timeout = 3000;
+                request.KeepAlive = false;
+                using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+                    return response.StatusCode == HttpStatusCode.OK;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static int CountDirectories(string spoolDirectory, string name)
+        {
+            string path = Path.Combine(spoolDirectory, name);
+            return Directory.Exists(path) ? Directory.GetDirectories(path).Length : 0;
+        }
+
+        private static bool HasBlockingContinuousFailures(string spoolDirectory)
+        {
+            string[] areas = new string[] { "failed", "quarantine" };
+            int areaIndex;
+            for (areaIndex = 0; areaIndex < areas.Length; areaIndex++)
+            {
+                string root = Path.Combine(spoolDirectory, areas[areaIndex]);
+                if (!Directory.Exists(root))
+                    continue;
+                string[] directories = Directory.GetDirectories(root);
+                int i;
+                for (i = 0; i < directories.Length; i++)
+                {
+                    string metaPath = Path.Combine(directories[i], "meta.ini");
+                    if (!File.Exists(metaPath))
+                        return true;
+                    try
+                    {
+                        IniConfig meta = IniConfig.Load(metaPath);
+                        if (String.Equals(
+                            meta.Get("Batch", "Mode", "sync"),
+                            "sync",
+                            StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+                    catch
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        private static string FindLastError(string logsDirectory)
+        {
+            if (!Directory.Exists(logsDirectory))
+                return "None";
+            string[] files = Directory.GetFiles(logsDirectory, "sync_*.log");
+            Array.Sort(files, StringComparer.OrdinalIgnoreCase);
+            int fileIndex;
+            for (fileIndex = files.Length - 1; fileIndex >= 0; fileIndex--)
+            {
+                string[] lines;
+                try { lines = File.ReadAllLines(files[fileIndex], Encoding.UTF8); }
+                catch { continue; }
+                int lineIndex;
+                for (lineIndex = lines.Length - 1; lineIndex >= 0; lineIndex--)
+                {
+                    string lower = lines[lineIndex].ToLowerInvariant();
+                    if (lower.IndexOf("error=") >= 0 ||
+                        lower.IndexOf("fatal") >= 0 ||
+                        lower.IndexOf(" failed") >= 0)
+                        return lines[lineIndex];
+                }
+            }
+            return "None";
+        }
+
         private static int RunSender(IniConfig config, string spoolDirectory, SyncLogger log)
         {
             BatchSender sender = new BatchSender(config, spoolDirectory, log);
@@ -350,15 +579,14 @@ namespace DeltaVHistoryCLI
             SyncOptions options,
             SyncLogger log,
             BatchSender sender,
-            bool directSendAllowed)
+            bool directSendAllowed,
+            SyncState state,
+            SyncStateStore stateStore)
         {
             HistorianClient client = null;
             try
             {
-                client = new HistorianClient(
-                    @"C:\DeltaV",
-                    delegate(string message) { log.Write("Historian " + message); });
-                client.Connect(options.Server);
+                client = ConnectHistorian(options, log);
                 List<string> tagNames = LoadSyncTags(options);
                 List<TagResult> tags = client.ResolveTags(tagNames);
                 int badTags = 0;
@@ -377,7 +605,8 @@ namespace DeltaVHistoryCLI
                     if (sliceEnd > options.End)
                         sliceEnd = options.End;
 
-                    int result = CreateBatch(
+                    int created = 0;
+                    int result = CollectWindow(
                         options,
                         sliceStart,
                         sliceEnd,
@@ -385,10 +614,13 @@ namespace DeltaVHistoryCLI
                         client,
                         tags,
                         sender,
-                        ref directSendAllowed);
+                        ref directSendAllowed,
+                        state,
+                        stateStore,
+                        ref created);
                     if (result != 0 && result != 5)
                         return result;
-                    batches++;
+                    batches += created;
                     sliceStart = sliceEnd;
                 }
                 log.Write("Completed batches=" + batches.ToString() + " invalidTags=" + badTags.ToString());
@@ -409,7 +641,9 @@ namespace DeltaVHistoryCLI
             HistorianClient client,
             List<TagResult> tags,
             BatchSender sender,
-            ref bool directSendAllowed)
+            ref bool directSendAllowed,
+            SyncState state,
+            SyncStateStore stateStore)
         {
             string batchId = BuildBatchId(options.CollectorId);
             log.Write("Collect batch=" + batchId + " range=" + FormatTime(start) + " .. " + FormatTime(end));
@@ -454,8 +688,36 @@ namespace DeltaVHistoryCLI
                     try
                     {
                         sender.Send(batch, data);
+                        AdvanceAfterCollection(
+                            options,
+                            state,
+                            stateStore,
+                            end,
+                            true);
                         log.Write("Direct ACK batch=" + batchId + " rows=" + batch.Samples.Count.ToString());
                         return invalidTags == 0 ? 0 : 5;
+                    }
+                    catch (BatchSendException ex)
+                    {
+                        directSendAllowed = false;
+                        SpoolStore rejectedStore = new SpoolStore(options.SpoolDirectory);
+                        if (ex.Permanent)
+                        {
+                            rejectedStore.SaveFailed(
+                                batch,
+                                data,
+                                "http" + ex.StatusCode.ToString(CultureInfo.InvariantCulture));
+                            AdvanceAfterCollection(options, state, stateStore, end, false);
+                            log.Write("Receiver permanently rejected batch=" + batchId + " error=" + ex.Message);
+                            return 41;
+                        }
+                        rejectedStore.EnsurePendingCapacity(
+                            options.MaxPendingBatches,
+                            options.MaxPendingBytes);
+                        rejectedStore.SavePending(batch, data);
+                        AdvanceAfterCollection(options, state, stateStore, end, false);
+                        log.Write("Direct send failed; saved to outbox batch=" + batchId + " error=" + ex.Message);
+                        return ex.AuthenticationFailure ? 42 : 0;
                     }
                     catch (Exception ex)
                     {
@@ -465,15 +727,88 @@ namespace DeltaVHistoryCLI
                 }
 
                 SpoolStore spool = new SpoolStore(options.SpoolDirectory);
+                spool.EnsurePendingCapacity(
+                    options.MaxPendingBatches,
+                    options.MaxPendingBytes);
                 spool.SavePending(batch, data);
+                AdvanceAfterCollection(
+                    options,
+                    state,
+                    stateStore,
+                    end,
+                    false);
                 log.Write("Pending batch=" + batchId + " rows=" + batch.Samples.Count.ToString() + " sha256=" + batch.Sha256);
                 return invalidTags == 0 ? 0 : 5;
+            }
+            catch (BatchLimitException ex)
+            {
+                log.Write("Batch limit batch=" + batchId + " error=" + ex.Message);
+                return 21;
+            }
+            catch (IOException ex)
+            {
+                log.Write("Outbox unavailable batch=" + batchId + " error=" + ex.Message);
+                return 43;
             }
             catch (Exception ex)
             {
                 log.Write("Batch failed=" + batchId + " error=" + ex.Message);
                 return 20;
             }
+        }
+
+        private static int CollectWindow(
+            SyncOptions options,
+            DateTime start,
+            DateTime end,
+            SyncLogger log,
+            HistorianClient client,
+            List<TagResult> tags,
+            BatchSender sender,
+            ref bool directSendAllowed,
+            SyncState state,
+            SyncStateStore stateStore,
+            ref int created)
+        {
+            int result = CreateBatch(
+                options,
+                start,
+                end,
+                log,
+                client,
+                tags,
+                sender,
+                ref directSendAllowed,
+                state,
+                stateStore);
+            if (result != 21)
+            {
+                if (result == 0 || result == 5)
+                    created++;
+                return result;
+            }
+
+            if (end.Subtract(start).TotalSeconds <= options.MinWindowSeconds)
+            {
+                log.Write("Minimum dynamic window reached; batch still exceeds limits.");
+                return 20;
+            }
+
+            DateTime middle = start.AddTicks((end.Ticks - start.Ticks) / 2);
+            log.Write(
+                "Dynamic split " + FormatTime(start) + " .. " + FormatTime(end) +
+                " at " + FormatTime(middle));
+            int first = CollectWindow(
+                options, start, middle, log, client, tags, sender,
+                ref directSendAllowed, state, stateStore, ref created);
+            if (first != 0 && first != 5)
+                return first;
+            int second = CollectWindow(
+                options, middle, end, log, client, tags, sender,
+                ref directSendAllowed, state, stateStore, ref created);
+            if (second != 0 && second != 5)
+                return second;
+            return first == 5 || second == 5 ? 5 : 0;
         }
 
         private static long CombineReaderFiles(
@@ -570,6 +905,125 @@ namespace DeltaVHistoryCLI
             return result;
         }
 
+        private static SyncState BuildInitialState(SyncOptions options)
+        {
+            SyncState state = new SyncState();
+            DateTime baseline = options.Start;
+            DateTime collected = baseline;
+            string pendingRoot = Path.Combine(options.SpoolDirectory, "pending");
+            string[] directories = Directory.Exists(pendingRoot)
+                ? Directory.GetDirectories(pendingRoot)
+                : new string[0];
+            int i;
+            for (i = 0; i < directories.Length; i++)
+            {
+                string metaPath = Path.Combine(directories[i], "meta.ini");
+                if (!File.Exists(metaPath))
+                    continue;
+                IniConfig meta = IniConfig.Load(metaPath);
+                if (!String.Equals(
+                    meta.Get("Batch", "Mode", ""),
+                    "sync",
+                    StringComparison.OrdinalIgnoreCase))
+                    continue;
+                DateTime start = ParseCheckpointTime(meta.Get("Batch", "Start", ""));
+                DateTime end = ParseCheckpointTime(meta.Get("Batch", "End", ""));
+                if (start < baseline)
+                    baseline = start;
+                if (end > collected)
+                    collected = end;
+            }
+            state.LastCollectedEnd = collected;
+            state.LastAcceptedEnd = baseline;
+            state.LastCommittedEnd = baseline;
+            return state;
+        }
+
+        private static BatchAcknowledged CreateAcknowledgedHandler(
+            SyncOptions options,
+            SyncState state,
+            SyncStateStore stateStore,
+            SyncLogger log)
+        {
+            if (state == null || stateStore == null)
+                return null;
+            return delegate(BatchReceipt receipt)
+            {
+                if (!String.Equals(receipt.Mode, "sync", StringComparison.OrdinalIgnoreCase))
+                    return;
+                if (receipt.RangeEnd <= state.LastAcceptedEnd)
+                    return;
+                if (receipt.RangeStart > state.LastAcceptedEnd)
+                    throw new InvalidDataException(
+                        "Outbox gap detected before batch " + receipt.BatchId +
+                        ": expected start at or before " + FormatTime(state.LastAcceptedEnd));
+                if (receipt.RangeEnd > state.LastCollectedEnd)
+                    throw new InvalidDataException(
+                        "Acknowledged batch exceeds LastCollectedEnd: " + receipt.BatchId);
+
+                SyncState before = state.Copy();
+                try
+                {
+                    state.LastAcceptedEnd = receipt.RangeEnd;
+                    if (options.AckMode == "database")
+                        state.LastCommittedEnd = receipt.RangeEnd;
+                    stateStore.Save(state);
+                    log.Write(
+                        "Checkpoint ACK accepted=" + FormatTime(state.LastAcceptedEnd) +
+                        " committed=" + FormatTime(state.LastCommittedEnd));
+                }
+                catch
+                {
+                    state.LastCollectedEnd = before.LastCollectedEnd;
+                    state.LastAcceptedEnd = before.LastAcceptedEnd;
+                    state.LastCommittedEnd = before.LastCommittedEnd;
+                    throw;
+                }
+            };
+        }
+
+        private static void AdvanceAfterCollection(
+            SyncOptions options,
+            SyncState state,
+            SyncStateStore stateStore,
+            DateTime end,
+            bool acknowledged)
+        {
+            if (state == null || stateStore == null || options.Command != "sync")
+                return;
+            SyncState before = state.Copy();
+            try
+            {
+                if (end > state.LastCollectedEnd)
+                    state.LastCollectedEnd = end;
+                if (acknowledged && end > state.LastAcceptedEnd)
+                    state.LastAcceptedEnd = end;
+                if (acknowledged && options.AckMode == "database" && end > state.LastCommittedEnd)
+                    state.LastCommittedEnd = end;
+                stateStore.Save(state);
+            }
+            catch
+            {
+                state.LastCollectedEnd = before.LastCollectedEnd;
+                state.LastAcceptedEnd = before.LastAcceptedEnd;
+                state.LastCommittedEnd = before.LastCommittedEnd;
+                throw;
+            }
+        }
+
+        private static DateTime ParseCheckpointTime(string text)
+        {
+            DateTime value;
+            if (!DateTime.TryParseExact(
+                text,
+                "yyyy-MM-dd HH:mm:ss.fffffff",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out value))
+                throw new InvalidDataException("Invalid batch checkpoint time: " + text);
+            return value;
+        }
+
         private static void WriteBatchMetadata(
             string path,
             string batchId,
@@ -603,20 +1057,20 @@ namespace DeltaVHistoryCLI
             string staging = Path.Combine(spoolDirectory, "staging");
             string pending = Path.Combine(spoolDirectory, "pending");
             string failed = Path.Combine(spoolDirectory, "failed");
-            string archive = Path.Combine(spoolDirectory, "archive");
+            string quarantine = Path.Combine(spoolDirectory, "quarantine");
             Directory.CreateDirectory(staging);
             Directory.CreateDirectory(pending);
             Directory.CreateDirectory(failed);
-            Directory.CreateDirectory(archive);
+            Directory.CreateDirectory(quarantine);
 
             string[] leftovers = Directory.GetDirectories(staging, "*.tmp");
             int i;
             for (i = 0; i < leftovers.Length; i++)
             {
                 string name = Path.GetFileName(leftovers[i]);
-                string destination = Path.Combine(failed, name + "_recovered_" + Guid.NewGuid().ToString("N"));
+                string destination = Path.Combine(quarantine, name + "_recovered_" + Guid.NewGuid().ToString("N"));
                 Directory.Move(leftovers[i], destination);
-                log.Write("Recovered incomplete staging batch to failed: " + name);
+                log.Write("Recovered incomplete staging batch to quarantine: " + name);
             }
         }
 

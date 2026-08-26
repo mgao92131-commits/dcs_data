@@ -24,14 +24,14 @@ func TestReadImportRowsUsesOnlyCoreFields(t *testing.T) {
 		timezone: time.FixedZone("Asia/Shanghai", 8*60*60),
 		logger:   log.New(io.Discard, "", 0),
 	}
-	rows, err := importer.readImportRows(path)
+	rows, err := importer.readImportRows(path, "DCS-TEST")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(rows) != 1 {
 		t.Fatalf("expected one row, got %d", len(rows))
 	}
-	if rows[0].Tag != "TAG/A" || rows[0].Value != 1.25 {
+	if rows[0].Tag != "TAG/A" || rows[0].ValueDouble == nil || *rows[0].ValueDouble != 1.25 || rows[0].ValueText != "1.25" {
 		t.Fatalf("unexpected imported row: %+v", rows[0])
 	}
 	if rows[0].TimeText != "2026-08-26 09:00:00.123456" {
@@ -39,12 +39,38 @@ func TestReadImportRowsUsesOnlyCoreFields(t *testing.T) {
 	}
 }
 
+func TestReadImportRowsAcceptsTextValue(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "data.csv")
+	content := "Tag,Timestamp,Value,DataType,Flags,SequenceNo,ArchiveStatus\n" +
+		"\"MODE/A\",\"2026-08-26 09:00:00.0000000\",\"RUN\",\"String\",\"\",\"7\",\"Current\"\n"
+	if err := os.WriteFile(path, []byte(content), 0640); err != nil {
+		t.Fatal(err)
+	}
+	importer := &batchImporter{timezone: time.FixedZone("Asia/Shanghai", 8*60*60)}
+	rows, err := importer.readImportRows(path, "DCS-TEST")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ValueText != "RUN" || rows[0].ValueDouble != nil {
+		t.Fatalf("unexpected text row: %+v", rows)
+	}
+	if rows[0].DataType != "String" || rows[0].SequenceNo != "7" || rows[0].ArchiveStatus != "Current" {
+		t.Fatalf("extended fields were not preserved: %+v", rows[0])
+	}
+}
+
 func TestSampleKeyIsStable(t *testing.T) {
-	first := sampleKey("TAG/A", "2026-08-26 09:00:00.1000000", "1.25")
-	second := sampleKey("TAG/A", "2026-08-26 09:00:00.1000000", "1.25")
-	different := sampleKey("TAG/A", "2026-08-26 09:00:00.1000000", "1.26")
+	first := sampleKey("DCS-TEST", "TAG/A", "2026-08-26 09:00:00.1000000", "", "1.25")
+	second := sampleKey("DCS-TEST", "TAG/A", "2026-08-26 09:00:00.1000000", "", "1.25")
+	different := sampleKey("DCS-TEST", "TAG/A", "2026-08-26 09:00:00.1000000", "", "1.26")
 	if first != second || first == different || len(first) != 64 {
 		t.Fatal("sample key is not stable")
+	}
+	withSequence := sampleKey("DCS-TEST", "TAG/A", "2026-08-26 09:00:00.1000000", "7", "1.25")
+	changedValue := sampleKey("DCS-TEST", "TAG/A", "2026-08-26 09:00:00.1000000", "7", "1.26")
+	if withSequence != changedValue {
+		t.Fatal("reliable sequence identity must allow value updates")
 	}
 }
 
@@ -64,6 +90,7 @@ func TestLoadBatchRejectsChangedCSV(t *testing.T) {
 	meta := strings.Join([]string{
 		"[Batch]",
 		"BatchId=" + batchID,
+		"CollectorId=DCS-TEST",
 		"Rows=0",
 		"Sha256=" + hash,
 		"",

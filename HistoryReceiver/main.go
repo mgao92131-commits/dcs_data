@@ -29,16 +29,19 @@ import (
 )
 
 type receiverConfig struct {
-	Listen       string
-	APIKey       string
-	MaxBodyBytes int64
-	Inbox        string
-	Archive      string
-	Staging      string
-	Rejected     string
-	Logs         string
+	Listen               string
+	APIKey               string
+	MaxBodyBytes         int64
+	Inbox                string
+	Archive              string
+	Staging              string
+	Rejected             string
+	Logs                 string
+	ArchiveRetentionDays int
+	LogRetentionDays     int
 
 	PostgresEnabled   bool
+	SynchronousCommit bool
 	PostgresURL       string
 	PostgresTimezone  string
 	ImportInterval    time.Duration
@@ -51,6 +54,7 @@ type receiverServer struct {
 	config   receiverConfig
 	logger   *log.Logger
 	dbPool   *pgxpool.Pool
+	importer *batchImporter
 	commitMu sync.Mutex
 }
 
@@ -120,6 +124,7 @@ func main() {
 	}
 
 	ctx := context.Background()
+	go runReceiverMaintenance(ctx, config, logger)
 	if config.PostgresEnabled {
 		pool, err := pgxpool.New(ctx, config.PostgresURL)
 		if err != nil {
@@ -143,7 +148,17 @@ func main() {
 			}
 			return
 		}
-		go importer.run(ctx)
+		server.importer = importer
+		if config.SynchronousCommit {
+			imported, failed, scanErr := importer.importOnce(ctx)
+			if scanErr != nil {
+				logger.Printf("startup inbox import scan failed: %v", scanErr)
+			} else if imported > 0 || failed > 0 {
+				logger.Printf("startup inbox import imported=%d failed=%d", imported, failed)
+			}
+		} else {
+			go importer.run(ctx)
+		}
 	} else if *importOnce {
 		logger.Fatal("cannot use --import-once while [PostgreSQL] Enabled=false")
 	}
@@ -215,22 +230,24 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if ack, found, err := s.findExisting(headers); err != nil {
-		writeError(w, http.StatusConflict, err.Error())
-		return
-	} else if found {
-		actualHash, bodyBytes, err := hashBody(r.Body, s.config.MaxBodyBytes)
-		if errors.Is(err, errBodyTooLarge) {
-			writeError(w, http.StatusRequestEntityTooLarge, err.Error())
+	if !s.config.SynchronousCommit {
+		if ack, found, err := s.findExisting(headers); err != nil {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		} else if found {
+			actualHash, bodyBytes, err := hashBody(r.Body, s.config.MaxBodyBytes)
+			if errors.Is(err, errBodyTooLarge) {
+				writeError(w, http.StatusRequestEntityTooLarge, err.Error())
+				return
+			}
+			if err != nil || bodyBytes == 0 || !strings.EqualFold(actualHash, headers.SHA256) {
+				writeError(w, http.StatusBadRequest, "retry body does not match existing batch")
+				return
+			}
+			s.logger.Printf("idempotent ACK batch=%s rows=%d", headers.BatchID, headers.Rows)
+			writeJSON(w, http.StatusOK, ack)
 			return
 		}
-		if err != nil || bodyBytes == 0 || !strings.EqualFold(actualHash, headers.SHA256) {
-			writeError(w, http.StatusBadRequest, "retry body does not match existing batch")
-			return
-		}
-		s.logger.Printf("idempotent ACK batch=%s rows=%d", headers.BatchID, headers.Rows)
-		writeJSON(w, http.StatusOK, ack)
-		return
 	}
 
 	tempDir := filepath.Join(
@@ -280,6 +297,31 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 
 	if err := writeReceiverMeta(filepath.Join(tempDir, "meta.ini"), headers, bodyBytes); err != nil {
 		writeError(w, http.StatusInternalServerError, "cannot write batch metadata")
+		return
+	}
+
+	if s.config.SynchronousCommit {
+		if s.importer == nil {
+			writeError(w, http.StatusServiceUnavailable, "database importer is unavailable")
+			return
+		}
+		s.commitMu.Lock()
+		batch, importErr := s.importer.importDirectory(r.Context(), tempDir)
+		if importErr == nil {
+			importErr = s.importer.moveToArchive(tempDir, headers.BatchID)
+		}
+		s.commitMu.Unlock()
+		if importErr != nil {
+			s.logger.Printf("synchronous import failed batch=%s error=%v", headers.BatchID, importErr)
+			writeError(w, http.StatusServiceUnavailable, "PostgreSQL commit failed")
+			return
+		}
+		keepTemp = true
+		s.logger.Printf(
+			"committed PostgreSQL batch=%s collector=%s rows=%d bytes=%d elapsed=%s",
+			batch.BatchID, headers.CollectorID, rows, bodyBytes,
+			time.Since(started).Round(time.Millisecond))
+		writeJSON(w, http.StatusOK, makeAck(headers))
 		return
 	}
 
@@ -530,6 +572,13 @@ func loadReceiverConfig(path, baseDir string) (receiverConfig, error) {
 	if err != nil {
 		return receiverConfig{}, fmt.Errorf("invalid [PostgreSQL] Enabled: %w", err)
 	}
+	synchronousCommit, err := parseBool(valueOr(values, "PostgreSQL.SynchronousCommit", "false"))
+	if err != nil {
+		return receiverConfig{}, fmt.Errorf("invalid [PostgreSQL] SynchronousCommit: %w", err)
+	}
+	if synchronousCommit && !postgresEnabled {
+		return receiverConfig{}, errors.New("SynchronousCommit requires PostgreSQL Enabled=true")
+	}
 	intervalSeconds, err := strconv.Atoi(valueOr(values, "PostgreSQL.ImportIntervalSeconds", "30"))
 	if err != nil || intervalSeconds <= 0 {
 		return receiverConfig{}, errors.New("invalid [PostgreSQL] ImportIntervalSeconds")
@@ -537,6 +586,14 @@ func loadReceiverConfig(path, baseDir string) (receiverConfig, error) {
 	maxBatches, err := strconv.Atoi(valueOr(values, "PostgreSQL.MaxBatchesPerPass", "20"))
 	if err != nil || maxBatches <= 0 {
 		return receiverConfig{}, errors.New("invalid [PostgreSQL] MaxBatchesPerPass")
+	}
+	archiveRetentionDays, err := strconv.Atoi(valueOr(values, "Maintenance.ArchiveRetentionDays", "30"))
+	if err != nil || archiveRetentionDays <= 0 {
+		return receiverConfig{}, errors.New("invalid [Maintenance] ArchiveRetentionDays")
+	}
+	logRetentionDays, err := strconv.Atoi(valueOr(values, "Maintenance.LogRetentionDays", "30"))
+	if err != nil || logRetentionDays <= 0 {
+		return receiverConfig{}, errors.New("invalid [Maintenance] LogRetentionDays")
 	}
 	importTimeoutSeconds, err := strconv.Atoi(valueOr(values, "PostgreSQL.ImportTimeoutSeconds", "120"))
 	if err != nil || importTimeoutSeconds <= 0 {
@@ -547,20 +604,23 @@ func loadReceiverConfig(path, baseDir string) (receiverConfig, error) {
 		return receiverConfig{}, errors.New("invalid [PostgreSQL] ImportBatchSize")
 	}
 	config := receiverConfig{
-		Listen:            valueOr(values, "Server.Listen", "0.0.0.0:8080"),
-		APIKey:            values["Server.ApiKey"],
-		MaxBodyBytes:      maximum,
-		Inbox:             resolvePath(baseDir, valueOr(values, "Files.Inbox", "inbox")),
-		Archive:           resolvePath(baseDir, valueOr(values, "Files.Archive", "archive")),
-		Staging:           resolvePath(baseDir, valueOr(values, "Files.Staging", "staging")),
-		Rejected:          resolvePath(baseDir, valueOr(values, "Files.Rejected", "rejected")),
-		Logs:              resolvePath(baseDir, valueOr(values, "Files.Logs", "logs")),
-		PostgresEnabled:   postgresEnabled,
-		PostgresTimezone:  valueOr(values, "PostgreSQL.Timezone", "Asia/Shanghai"),
-		ImportInterval:    time.Duration(intervalSeconds) * time.Second,
-		ImportTimeout:     time.Duration(importTimeoutSeconds) * time.Second,
-		ImportBatchSize:   importBatchSize,
-		MaxBatchesPerPass: maxBatches,
+		Listen:               valueOr(values, "Server.Listen", "0.0.0.0:8080"),
+		APIKey:               values["Server.ApiKey"],
+		MaxBodyBytes:         maximum,
+		Inbox:                resolvePath(baseDir, valueOr(values, "Files.Inbox", "inbox")),
+		Archive:              resolvePath(baseDir, valueOr(values, "Files.Archive", "archive")),
+		Staging:              resolvePath(baseDir, valueOr(values, "Files.Staging", "staging")),
+		Rejected:             resolvePath(baseDir, valueOr(values, "Files.Rejected", "rejected")),
+		Logs:                 resolvePath(baseDir, valueOr(values, "Files.Logs", "logs")),
+		ArchiveRetentionDays: archiveRetentionDays,
+		LogRetentionDays:     logRetentionDays,
+		PostgresEnabled:      postgresEnabled,
+		SynchronousCommit:    synchronousCommit,
+		PostgresTimezone:     valueOr(values, "PostgreSQL.Timezone", "Asia/Shanghai"),
+		ImportInterval:       time.Duration(intervalSeconds) * time.Second,
+		ImportTimeout:        time.Duration(importTimeoutSeconds) * time.Second,
+		ImportBatchSize:      importBatchSize,
+		MaxBatchesPerPass:    maxBatches,
 	}
 	if config.APIKey == "" {
 		return receiverConfig{}, errors.New("[Server] ApiKey is required")

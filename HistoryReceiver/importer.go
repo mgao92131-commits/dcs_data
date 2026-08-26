@@ -34,17 +34,23 @@ type batchImporter struct {
 }
 
 type importRow struct {
-	SampleKey string
-	Tag       string
-	TimeText  string
-	Value     float64
+	SampleKey     string
+	Tag           string
+	TimeText      string
+	ValueText     string
+	ValueDouble   *float64
+	DataType      string
+	Flags         string
+	SequenceNo    string
+	ArchiveStatus string
 }
 
 type importBatch struct {
-	BatchID string
-	SHA256  string
-	Rows    int
-	Data    []importRow
+	BatchID     string
+	CollectorID string
+	SHA256      string
+	Rows        int
+	Data        []importRow
 }
 
 func newBatchImporter(config receiverConfig, pool *pgxpool.Pool, logger *log.Logger) (*batchImporter, error) {
@@ -133,6 +139,20 @@ func (i *batchImporter) importOnce(ctx context.Context) (int, int, error) {
 	return imported, failed, nil
 }
 
+func (i *batchImporter) importDirectory(ctx context.Context, directory string) (importBatch, error) {
+	batch, err := i.loadBatch(directory)
+	if err != nil {
+		return importBatch{}, err
+	}
+	batchCtx, cancel := context.WithTimeout(ctx, i.importTimeout)
+	err = i.importBatch(batchCtx, batch)
+	cancel()
+	if err != nil {
+		return importBatch{}, err
+	}
+	return batch, nil
+}
+
 func (i *batchImporter) loadBatch(directory string) (importBatch, error) {
 	metaPath := filepath.Join(directory, "meta.ini")
 	dataPath := filepath.Join(directory, "data.csv")
@@ -141,10 +161,16 @@ func (i *batchImporter) loadBatch(directory string) (importBatch, error) {
 		return importBatch{}, err
 	}
 	batchID := values["Batch.BatchId"]
+	collectorID := values["Batch.CollectorId"]
 	expectedHash := strings.ToLower(values["Batch.Sha256"])
 	expectedRows, err := strconv.Atoi(values["Batch.Rows"])
-	if batchID == "" || !safeID.MatchString(batchID) || batchID != filepath.Base(directory) {
+	directoryName := filepath.Base(directory)
+	validDirectory := batchID == directoryName || strings.HasPrefix(directoryName, batchID+".tmp.")
+	if batchID == "" || !safeID.MatchString(batchID) || !validDirectory {
 		return importBatch{}, errors.New("invalid BatchId in meta.ini")
+	}
+	if collectorID == "" || !safeID.MatchString(collectorID) {
+		return importBatch{}, errors.New("invalid CollectorId in meta.ini")
 	}
 	if err != nil || expectedRows < 0 {
 		return importBatch{}, errors.New("invalid Rows in meta.ini")
@@ -160,17 +186,17 @@ func (i *batchImporter) loadBatch(directory string) (importBatch, error) {
 		return importBatch{}, errors.New("data.csv SHA-256 does not match meta.ini")
 	}
 
-	rows, err := i.readImportRows(dataPath)
+	rows, err := i.readImportRows(dataPath, collectorID)
 	if err != nil {
 		return importBatch{}, err
 	}
 	if len(rows) != expectedRows {
 		return importBatch{}, fmt.Errorf("row count mismatch: expected %d, got %d", expectedRows, len(rows))
 	}
-	return importBatch{BatchID: batchID, SHA256: expectedHash, Rows: expectedRows, Data: rows}, nil
+	return importBatch{BatchID: batchID, CollectorID: collectorID, SHA256: expectedHash, Rows: expectedRows, Data: rows}, nil
 }
 
-func (i *batchImporter) readImportRows(path string) ([]importRow, error) {
+func (i *batchImporter) readImportRows(path, collectorID string) ([]importRow, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -212,15 +238,20 @@ func (i *batchImporter) readImportRows(path string) ([]importRow, error) {
 		if err != nil {
 			return nil, fmt.Errorf("CSV line %d: invalid Timestamp %q", line, timestamp)
 		}
-		value, err := strconv.ParseFloat(valueText, 64)
-		if err != nil {
-			return nil, fmt.Errorf("CSV line %d: invalid numeric Value %q", line, valueText)
+		var valueDouble *float64
+		if value, parseErr := strconv.ParseFloat(valueText, 64); parseErr == nil {
+			valueDouble = &value
 		}
 		rows = append(rows, importRow{
-			SampleKey: sampleKey(tag, timestamp, valueText),
-			Tag:       tag,
-			TimeText:  parsedTime.Format("2006-01-02 15:04:05.000000"),
-			Value:     value,
+			SampleKey:     sampleKey(collectorID, tag, timestamp, strings.TrimSpace(record[5]), valueText),
+			Tag:           tag,
+			TimeText:      parsedTime.Format("2006-01-02 15:04:05.000000"),
+			ValueText:     valueText,
+			ValueDouble:   valueDouble,
+			DataType:      strings.TrimSpace(record[3]),
+			Flags:         strings.TrimSpace(record[4]),
+			SequenceNo:    strings.TrimSpace(record[5]),
+			ArchiveStatus: strings.TrimSpace(record[6]),
 		})
 	}
 	return rows, nil
@@ -257,10 +288,18 @@ func (i *batchImporter) importBatch(ctx context.Context, batch importBatch) erro
 		queued := &pgx.Batch{}
 		for _, row := range batch.Data[start:end] {
 			queued.Queue(
-				`INSERT INTO history_raw (sample_key, tag, sample_time, value, batch_id)
-				 VALUES ($1, $2, $3::timestamp, $4, $5)
-				 ON CONFLICT (sample_key) DO NOTHING`,
-				row.SampleKey, row.Tag, row.TimeText, row.Value, batch.BatchID)
+				`INSERT INTO history_samples
+				 (sample_key, collector_id, tag, sample_time, value_double, value_text,
+				  data_type, flags, sequence_no, archive_status, batch_id)
+				 VALUES ($1, $2, $3, $4::timestamp, $5, $6, $7, $8, $9, $10, $11)
+				 ON CONFLICT (sample_key) DO UPDATE SET
+				  value_double=EXCLUDED.value_double, value_text=EXCLUDED.value_text,
+				  data_type=EXCLUDED.data_type, flags=EXCLUDED.flags,
+				  archive_status=EXCLUDED.archive_status, batch_id=EXCLUDED.batch_id,
+				  received_at=CURRENT_TIMESTAMP`,
+				row.SampleKey, batch.CollectorID, row.Tag, row.TimeText,
+				row.ValueDouble, row.ValueText, row.DataType, row.Flags,
+				row.SequenceNo, row.ArchiveStatus, batch.BatchID)
 		}
 		results := tx.SendBatch(ctx, queued)
 		for index := start; index < end; index++ {
@@ -297,8 +336,12 @@ func (i *batchImporter) moveToArchive(source, batchID string) error {
 	return os.Rename(source, destination)
 }
 
-func sampleKey(tag, timestamp, value string) string {
-	digest := sha256.Sum256([]byte(tag + "\x1f" + timestamp + "\x1f" + value))
+func sampleKey(collectorID, tag, timestamp, sequenceNo, valueText string) string {
+	identity := "sequence:" + sequenceNo
+	if sequenceNo == "" {
+		identity = "value:" + valueText
+	}
+	digest := sha256.Sum256([]byte(collectorID + "\x1f" + tag + "\x1f" + timestamp + "\x1f" + identity))
 	return hex.EncodeToString(digest[:])
 }
 

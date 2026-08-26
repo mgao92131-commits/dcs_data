@@ -25,6 +25,7 @@ hda/
 # Editor and OS files
 .vs/
 .vscode/
+.gocache/
 *.user
 Thumbs.db
 .DS_Store

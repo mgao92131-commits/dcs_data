@@ -1,86 +1,65 @@
-# HistoryReceiver
+# HistoryReceiver v2
 
-The Receiver accepts completed DeltaV History spool batches and commits them
-to a durable local inbox, then imports validated batches into PostgreSQL.
+HistoryReceiver 校验 DCS 批次并在 PostgreSQL 事务提交后返回 ACK。
 
-## Build
+## 请求处理
+
+```text
+HTTP body
+ -> Bearer authentication
+ -> size / SHA-256 / CSV / row-count validation
+ -> PostgreSQL transaction
+ -> history_samples UPSERT
+ -> imported_batches INSERT
+ -> COMMIT
+ -> committed=true ACK
+```
+
+配置 `SynchronousCommit=true` 时不会先写 inbox 再提前 ACK。数据库不可用或
+事务失败返回 HTTP 503，DCS Collector 会把批次保存到 pending outbox。
+
+同一 BatchId、SHA-256 和行数可以安全重试；数据库中的 `imported_batches`
+保证幂等。相同 BatchId 对应不同内容会失败。
+
+## 构建与测试
 
 ```bat
+go test ./...
+go vet ./...
 build.bat
 ```
 
-## Configure
-
-Set the same strong API key in:
-
-- Receiver `receiver.ini`: `[Server] ApiKey`
-- DCS `config.ini`: `[Receiver] ApiKey`
-
-Do not leave `CHANGE_ME_BEFORE_USE` in production.
-
-## Run
-
-```bat
-HistoryReceiver.exe --config receiver.ini
-```
-
-Health check:
-
-```text
-GET http://192.168.1.10:8080/healthz
-```
-
-Committed batches are stored atomically as:
-
-```text
-inbox\{batch-id}\
-  data.csv
-  meta.ini
-```
-
-The Receiver validates authentication, IDs, body size, SHA-256, CSV columns,
-and row count before returning `committed=true`. Repeating the same BatchId
-with the same content returns the same successful ACK without creating a
-duplicate. Reusing a BatchId with different content returns HTTP 409.
-
-## Phase 3 PostgreSQL import
-
-Phase 3 uses only two database tables. Create them with:
+## 数据库
 
 ```bat
 psql -d deltav_history -f sql\create_tables.sql
 ```
 
-Then configure `receiver.ini`:
+`history_samples` 保存 Collector、Tag、时间、文本值、可选数值、数据类型、
+Flags、SequenceNo、ArchiveStatus、BatchId 和接收时间。字符串状态值不会再因
+`ParseFloat` 失败而丢弃。
 
-```ini
-[PostgreSQL]
-Enabled=true
-Host=127.0.0.1
-Port=5432
-Database=deltav_history
-User=deltav_writer
-Password=replace-with-real-password
-SSLMode=disable
-Timezone=Asia/Shanghai
-ImportIntervalSeconds=30
-ImportTimeoutSeconds=120
-ImportBatchSize=500
-MaxBatchesPerPass=20
+样本身份目前使用：
+
+```text
+SequenceNo available:
+  SHA256(CollectorId + Tag + original Timestamp + SequenceNo)
+
+SequenceNo unavailable (temporary fallback):
+  SHA256(CollectorId + Tag + original Timestamp + ValueText)
 ```
 
-The Receiver continues accepting batches into `inbox` when PostgreSQL is
-offline. Its built-in importer retries automatically and moves a batch from
-`inbox` to `archive` only after the database transaction commits.
-Database inserts are grouped by `ImportBatchSize`; `ImportTimeoutSeconds`
-prevents one damaged or blocked batch from occupying the importer forever.
+该 fallback 优先避免丢样本，但历史修订值可能并存。上线前必须在目标 DeltaV
+版本确认 SequenceNo/ArchiveStatus 的实际属性名与稳定性，再决定最终唯一键。
 
-To perform one manual import pass without starting the HTTP server:
+旧 `history_raw` 保留为 v1 只读历史，不会因身份规则不同而自动复制到新表。
+如需迁移，请通过 v2 backfill 重新读取对应历史范围。
 
-```bat
-HistoryReceiver.exe --config receiver.ini --import-once
+## 健康检查
+
+```text
+GET http://RECEIVER_IP:8080/healthz
 ```
 
-The importer stores only Tag, local sample time, numeric value, BatchId, and a
-stable SHA-256 sample key. Extra CSV columns remain available in the archived
-source file but are intentionally not stored in PostgreSQL.
+响应包括 `database_ok` 和 `inbox_batches`。Receiver archive 默认保留 30 天，
+日志默认保留 30 天；rejected 批次只报警，不自动删除。

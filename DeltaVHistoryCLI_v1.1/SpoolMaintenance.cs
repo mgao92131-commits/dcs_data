@@ -18,7 +18,6 @@ namespace DeltaVHistoryCLI
             if (archiveDays < 1 || logDays < 1 || minimumFreeMB < 128)
                 throw new Exception("Invalid [Maintenance] retention or free-space setting.");
 
-            EnsureFreeSpace(spoolDirectory, minimumFreeMB);
             int archivesDeleted = DeleteOldDirectories(
                 Path.Combine(spoolDirectory, "archive"),
                 DateTime.Now.AddDays(-archiveDays));
@@ -26,14 +25,19 @@ namespace DeltaVHistoryCLI
                 logsDirectory,
                 "*.log",
                 DateTime.Now.AddDays(-logDays));
+            EnsureFreeSpace(spoolDirectory, minimumFreeMB);
             int failedCount = Directory.GetDirectories(
                 Path.Combine(spoolDirectory, "failed")).Length;
+            int quarantineCount = Directory.GetDirectories(
+                Path.Combine(spoolDirectory, "quarantine")).Length;
 
             if (archivesDeleted > 0 || logsDeleted > 0)
                 log.Write("Maintenance deleted archives=" + archivesDeleted.ToString() +
                     " logs=" + logsDeleted.ToString());
             if (failedCount > 0)
                 log.Write("WARNING: failed spool batches require attention count=" + failedCount.ToString());
+            if (quarantineCount > 0)
+                log.Write("WARNING: quarantined spool batches require attention count=" + quarantineCount.ToString());
         }
 
         private static void EnsureFreeSpace(string path, int minimumFreeMB)

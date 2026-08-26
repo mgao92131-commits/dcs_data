@@ -70,3 +70,11 @@ can prove.
 9. Expand the database model after verifying DeltaV identity fields.
 10. Unify continuous, initial-load, and backfill range jobs.
 11. Complete production fault handling and long-running validation.
+
+## Implementation status
+
+Phases 1 through 11 are implemented on `refactor/v2`. Local regression,
+Receiver unit/vet checks, PostgreSQL schema migration, synchronous COMMIT/ACK,
+text-value import, and duplicate retry have been verified. The remaining
+promotion gate is hardware-specific: compile with .NET 2.0/3.5 on the DCS
+workstation and compare real Historian output against `v1-legacy`.

@@ -3,6 +3,7 @@ setlocal
 cd /d "%~dp0\HistoryReceiver"
 
 set GOTOOLCHAIN=local
+set GOCACHE=%~dp0.gocache
 
 go test ./...
 if errorlevel 1 exit /b 1

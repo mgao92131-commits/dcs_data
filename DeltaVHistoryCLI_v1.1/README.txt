@@ -227,3 +227,28 @@ Receiver configuration:
   TimeoutSeconds=15
   MaxBatchesPerRun=20
   ApiKey=replace-with-the-same-strong-secret-as-receiver.ini
+HistorySync v2 - Current Operation
+==================================
+
+The collector now reads DeltaV through HistorianClient, builds CSV batches in
+memory, sends directly to a synchronous-commit Receiver, and uses disk only as
+a failure outbox. The older Phase 1/2 notes later in this file are retained as
+legacy implementation history; README.md at the repository root is the
+authoritative deployment guide.
+
+Continuous state is stored atomically in state.ini:
+  LastCollectedEnd
+  LastAcceptedEnd
+  LastCommittedEnd
+
+Commands:
+  HistorySync.exe sync
+  HistorySync.exe send
+  HistorySync.exe status
+  HistorySync.exe --console
+
+Install as a Windows Service only after console validation:
+  install-service.bat
+
+The DCS build remains x86 and requires the .NET Framework 2.0/3.5 compiler.
+Run test-dcs-compatibility.bat on the target DCS workstation before promotion.

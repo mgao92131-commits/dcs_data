@@ -19,6 +19,8 @@ namespace DeltaVHistoryCLI
                 Directory.CreateDirectory(root);
                 TestIni(root);
                 TestHistorySampleNormalization();
+                TestMemoryBatchAndSpool(root);
+                TestAtomicSyncState(root);
                 TestCsvCombination(root);
                 TestStagingRecovery(root);
                 Console.WriteLine("PHASE 1 SELF-TEST PASSED");
@@ -26,7 +28,7 @@ namespace DeltaVHistoryCLI
             }
             catch (Exception ex)
             {
-                Console.WriteLine("PHASE 1 SELF-TEST FAILED: " + ex.Message);
+                Console.WriteLine("PHASE 1 SELF-TEST FAILED: " + ex.ToString());
                 return 1;
             }
             finally
@@ -69,6 +71,57 @@ namespace DeltaVHistoryCLI
             sample.SequenceNo = "";
             sample.ArchiveStatus = "";
             return sample;
+        }
+
+        private static void TestMemoryBatchAndSpool(string root)
+        {
+            HistoryBatch batch = new HistoryBatch();
+            batch.BatchId = "test_batch_memory";
+            batch.CollectorId = "DCS-TEST";
+            batch.Mode = "sync";
+            batch.Server = "APP";
+            batch.RangeStart = new DateTime(2026, 8, 26, 9, 0, 0);
+            batch.RangeEnd = batch.RangeStart.AddMinutes(5);
+            batch.Samples.Add(MakeSample("TAG/A", batch.RangeStart.AddSeconds(1), "1.25"));
+
+            byte[] data = BatchEncoder.EncodeCsv(batch);
+            batch.Sha256 = BatchEncoder.ComputeSha256(data);
+            string csv = Encoding.UTF8.GetString(data);
+            Assert(csv.IndexOf("Tag,Timestamp,Value,DataType,Flags,SequenceNo,ArchiveStatus") >= 0,
+                "in-memory batch header");
+            Assert(csv.IndexOf("\"TAG/A\"") >= 0, "in-memory batch row");
+            Assert(batch.Sha256.Length == 64, "in-memory batch SHA-256");
+
+            string spool = Path.Combine(root, "memory-spool");
+            SpoolStore store = new SpoolStore(spool);
+            store.SavePending(batch, data);
+            string pending = Path.Combine(spool, "pending", batch.BatchId);
+            Assert(File.Exists(Path.Combine(pending, "data.csv")), "outbox data persistence");
+            Assert(File.Exists(Path.Combine(pending, "meta.ini")), "outbox metadata persistence");
+            Assert(Directory.GetDirectories(Path.Combine(spool, "staging")).Length == 0,
+                "outbox atomic staging cleanup");
+            bool capacityBlocked = false;
+            try { store.EnsurePendingCapacity(1, 1024 * 1024); }
+            catch (IOException) { capacityBlocked = true; }
+            Assert(capacityBlocked, "outbox batch capacity");
+        }
+
+        private static void TestAtomicSyncState(string root)
+        {
+            string path = Path.Combine(root, "state", "state.ini");
+            DateTime baseline = new DateTime(2026, 8, 26, 9, 0, 0);
+            SyncStateStore store = new SyncStateStore(path);
+            SyncState state = store.LoadOrCreate(baseline);
+            state.LastCollectedEnd = baseline.AddMinutes(5);
+            state.LastAcceptedEnd = baseline.AddMinutes(5);
+            store.Save(state);
+
+            SyncState loaded = store.LoadOrCreate(baseline);
+            Assert(loaded.LastCollectedEnd == baseline.AddMinutes(5), "state collected persistence");
+            Assert(loaded.LastAcceptedEnd == baseline.AddMinutes(5), "state accepted persistence");
+            Assert(loaded.LastCommittedEnd == baseline, "legacy ACK does not imply DB commit");
+            Assert(Directory.GetFiles(Path.GetDirectoryName(path), "*.tmp.*").Length == 0,
+                "state temporary cleanup");
         }
 
         private static void TestIni(string root)
@@ -134,7 +187,7 @@ namespace DeltaVHistoryCLI
             }
 
             Assert(Directory.GetDirectories(staging).Length == 0, "staging recovery source");
-            Assert(Directory.GetDirectories(Path.Combine(spool, "failed")).Length == 1, "staging recovery destination");
+            Assert(Directory.GetDirectories(Path.Combine(spool, "quarantine")).Length == 1, "staging recovery destination");
         }
 
         private static void WriteReaderCsv(

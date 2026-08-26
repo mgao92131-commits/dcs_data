@@ -26,7 +26,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-"%CSC%" /nologo /target:exe /platform:x86 /optimize+ /main:DeltaVHistoryCLI.SyncProgram /out:HistorySync.exe HistorianCore.cs HistoryBatch.cs HistoryReader.cs HistorySync.cs BatchSender.cs SpoolMaintenance.cs
+"%CSC%" /nologo /target:exe /platform:x86 /optimize+ /reference:System.ServiceProcess.dll /main:DeltaVHistoryCLI.SyncProgram /out:HistorySync.exe HistorianCore.cs HistoryBatch.cs SyncState.cs HistoryReader.cs HistorySync.cs HistorySyncService.cs BatchSender.cs SpoolMaintenance.cs
 
 if errorlevel 1 (
     echo.
