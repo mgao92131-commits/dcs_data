@@ -53,6 +53,11 @@ value, data type, and flags field byte-for-byte.
 
 ## 3. End-to-end commit
 
+Before starting, confirm that the DCS `[Receiver] Url` points to the actual
+database computer address and port shown by the Receiver log. Do not promote
+with an old or unreachable address; a successful local `/healthz` check on the
+database computer does not prove that the DCS route is correct.
+
 With `HistoryReceiver` configured as `SynchronousCommit=true` and the DCS
 config set to `AckMode=database`:
 
@@ -83,5 +88,8 @@ Run these one at a time and record the result:
 ## 5. Promotion record
 
 Promote v2 only after this checklist, the baseline tests, and the database
-backup/restore procedure are recorded. Installing the Windows Service does
-not reboot, stop, or restart the DCS workstation.
+backup/restore procedure are recorded. If `postgresql.conf` was changed to
+`listen_addresses='127.0.0.1'`, restart the PostgreSQL service on the database
+computer as an administrator and verify the listener before recording the
+promotion. Installing the Windows Service does not reboot, stop, or restart
+the DCS workstation.
