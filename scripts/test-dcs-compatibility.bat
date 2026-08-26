@@ -13,23 +13,25 @@ if not defined CSC (
 )
 
 if not exist "%OUT%" mkdir "%OUT%"
-del /q "%OUT%\Phase1SelfTest.exe" "%OUT%\ArchitectureProbe.exe" "%OUT%\HistoryReader.exe" "%OUT%\HistorySync.exe" 2>nul
+del /q "%OUT%\DcsData.Historian.dll" "%OUT%\Phase1SelfTest.exe" "%OUT%\ArchitectureProbe.exe" "%OUT%\HistoryReader.exe" "%OUT%\HistorySync.exe" 2>nul
 
 "%CSC%" /nologo /target:exe /platform:x86 /out:"%OUT%\ArchitectureProbe.exe" "%ROOT%\tests\DcsCollector\ArchitectureProbe.cs"
 if errorlevel 1 goto failed
-"%CSC%" /nologo /target:exe /platform:x86 /reference:System.ServiceProcess.dll /main:DeltaVHistoryCLI.Phase1SelfTest /out:"%OUT%\Phase1SelfTest.exe" "%ROOT%\src\DcsData.Historian\HistorianCore.cs" "%ROOT%\src\HistorySync\HistoryBatch.cs" "%ROOT%\src\HistorySync\SyncState.cs" "%ROOT%\src\HistoryReader\HistoryReader.cs" "%ROOT%\src\HistorySync\HistorySync.cs" "%ROOT%\src\HistorySync\HistorySyncService.cs" "%ROOT%\src\HistorySync\BatchSender.cs" "%ROOT%\src\HistorySync\SpoolMaintenance.cs" "%ROOT%\tests\DcsCollector\Phase1SelfTest.cs"
+"%CSC%" /nologo /target:library /platform:x86 /out:"%OUT%\DcsData.Historian.dll" "%ROOT%\src\DcsData.Historian\HistorianCore.cs"
+if errorlevel 1 goto failed
+"%CSC%" /nologo /target:exe /platform:x86 /reference:System.ServiceProcess.dll /reference:"%OUT%\DcsData.Historian.dll" /main:DeltaVHistoryCLI.Phase1SelfTest /out:"%OUT%\Phase1SelfTest.exe" "%ROOT%\src\HistorySync\HistoryBatch.cs" "%ROOT%\src\HistorySync\SyncState.cs" "%ROOT%\src\HistorySync\HistorySync.cs" "%ROOT%\src\HistorySync\HistorySyncService.cs" "%ROOT%\src\HistorySync\BatchSender.cs" "%ROOT%\src\HistorySync\SpoolMaintenance.cs" "%ROOT%\tests\DcsCollector\Phase1SelfTest.cs"
 if errorlevel 1 goto failed
 "%OUT%\Phase1SelfTest.exe"
 if errorlevel 1 goto failed
 
-"%CSC%" /nologo /target:exe /platform:x86 /main:DeltaVHistoryCLI.Program /out:"%OUT%\HistoryReader.exe" "%ROOT%\src\DcsData.Historian\HistorianCore.cs" "%ROOT%\src\HistoryReader\HistoryReader.cs"
+"%CSC%" /nologo /target:exe /platform:x86 /reference:"%OUT%\DcsData.Historian.dll" /main:DeltaVHistoryCLI.Program /out:"%OUT%\HistoryReader.exe" "%ROOT%\src\HistoryReader\HistoryReader.cs"
 if errorlevel 1 goto failed
 "%OUT%\HistoryReader.exe" --version
 if errorlevel 1 goto failed
 "%OUT%\ArchitectureProbe.exe" "%OUT%\HistoryReader.exe"
 if errorlevel 1 goto failed
 
-"%CSC%" /nologo /target:exe /platform:x86 /reference:System.ServiceProcess.dll /main:DeltaVHistoryCLI.SyncProgram /out:"%OUT%\HistorySync.exe" "%ROOT%\src\DcsData.Historian\HistorianCore.cs" "%ROOT%\src\HistorySync\HistoryBatch.cs" "%ROOT%\src\HistorySync\SyncState.cs" "%ROOT%\src\HistoryReader\HistoryReader.cs" "%ROOT%\src\HistorySync\HistorySync.cs" "%ROOT%\src\HistorySync\HistorySyncService.cs" "%ROOT%\src\HistorySync\BatchSender.cs" "%ROOT%\src\HistorySync\SpoolMaintenance.cs"
+"%CSC%" /nologo /target:exe /platform:x86 /reference:System.ServiceProcess.dll /reference:"%OUT%\DcsData.Historian.dll" /main:DeltaVHistoryCLI.SyncProgram /out:"%OUT%\HistorySync.exe" "%ROOT%\src\HistorySync\HistoryBatch.cs" "%ROOT%\src\HistorySync\SyncState.cs" "%ROOT%\src\HistorySync\HistorySync.cs" "%ROOT%\src\HistorySync\HistorySyncService.cs" "%ROOT%\src\HistorySync\BatchSender.cs" "%ROOT%\src\HistorySync\SpoolMaintenance.cs"
 if errorlevel 1 goto failed
 "%OUT%\HistorySync.exe" --version
 if errorlevel 1 goto failed

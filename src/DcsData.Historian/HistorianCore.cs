@@ -7,9 +7,9 @@ using System.Reflection;
 
 namespace DeltaVHistoryCLI
 {
-    delegate void HistorianLog(string message);
+    public delegate void HistorianLog(string message);
 
-    class HistorySample
+    public class HistorySample
     {
         public string Tag;
         public DateTime Timestamp;
@@ -20,14 +20,14 @@ namespace DeltaVHistoryCLI
         public string ArchiveStatus;
     }
 
-    class TagResult
+    public class TagResult
     {
         public string Name;
         public int Handle;
         public int Status;
     }
 
-    static class HistorySampleSet
+    public static class HistorySampleSet
     {
         public static List<HistorySample> Normalize(List<HistorySample> rows)
         {
@@ -57,7 +57,7 @@ namespace DeltaVHistoryCLI
         }
     }
 
-    class HistorianClient : IDisposable
+    public class HistorianClient : IDisposable
     {
         private readonly string _deltaVRoot;
         private readonly HistorianLog _log;
