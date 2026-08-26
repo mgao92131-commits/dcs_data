@@ -114,7 +114,6 @@ namespace DeltaVHistoryCLI
 
             int limit = batches.Count < _maxBatches ? batches.Count : _maxBatches;
             int sent = 0;
-            int invalid = 0;
             int i;
             for (i = 0; i < limit; i++)
             {
@@ -136,7 +135,8 @@ namespace DeltaVHistoryCLI
                         batchName + "_invalid_" + Guid.NewGuid().ToString("N"));
                     Directory.Move(batchDirectory, failedDirectory);
                     _log.Write("Moved invalid local batch to quarantine=" + batchName + " error=" + ex.Message);
-                    invalid++;
+                    _log.Write("Send stopped after quarantining invalid batch=" + batchName);
+                    return 41;
                 }
                 catch (BatchSendException ex)
                 {
@@ -147,8 +147,8 @@ namespace DeltaVHistoryCLI
                             batchName + "_http" + ex.StatusCode.ToString() + "_" + Guid.NewGuid().ToString("N"));
                         Directory.Move(batchDirectory, failedDirectory);
                         _log.Write("Receiver permanently rejected batch=" + batchName + " error=" + ex.Message);
-                        invalid++;
-                        continue;
+                        _log.Write("Send stopped after permanent rejection batch=" + batchName);
+                        return 41;
                     }
                     _log.Write("Send stopped; pending retained batch=" + batchName + " error=" + ex.Message);
                     return ex.AuthenticationFailure ? 42 : 40;
@@ -162,7 +162,7 @@ namespace DeltaVHistoryCLI
 
             _log.Write("Sender completed sent=" + sent.ToString() + " remaining=" +
                 (Directory.GetDirectories(pendingRoot).Length).ToString());
-            return invalid == 0 ? 0 : 41;
+            return 0;
         }
 
         private static List<PendingBatch> GetPendingBatches(string pendingRoot)
