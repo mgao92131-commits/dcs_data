@@ -2,13 +2,10 @@
 setlocal
 cd /d "%~dp0"
 
-call DeltaVHistoryCLI_v1.1\test-phase1-local.bat
+call scripts\test-dcs-local.bat
 if errorlevel 1 exit /b 1
 
-call test-phase2-local.bat
+call scripts\test-receiver.bat
 if errorlevel 1 exit /b 1
 
-call test-phase3-local.bat
-if errorlevel 1 exit /b 1
-
-echo V1 LEGACY BASELINE TESTS PASSED
+echo LOCAL BASELINE TESTS PASSED
