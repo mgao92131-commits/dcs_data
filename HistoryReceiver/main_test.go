@@ -106,6 +106,24 @@ func TestSynchronousInvalidPayloadReturnsBadRequest(t *testing.T) {
 	}
 }
 
+func TestHealthReturnsServiceUnavailableWhenDatabaseIsDown(t *testing.T) {
+	server, _ := newTestReceiver(t)
+	server.config.PostgresEnabled = true
+	request := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected health 503, got %d body=%s", response.Code, response.Body.String())
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["ok"] != false || payload["database_ok"] != false {
+		t.Fatalf("unexpected health payload: %v", payload)
+	}
+}
+
 func TestIdempotentRetryValidatesBody(t *testing.T) {
 	server, _ := newTestReceiver(t)
 	body := testCSV()

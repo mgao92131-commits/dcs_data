@@ -203,8 +203,14 @@ func (s *receiverServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		databaseOK = s.dbPool.Ping(ctx) == nil
 		cancel()
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok": true, "service": "HistoryReceiver",
+	status := http.StatusOK
+	serviceOK := true
+	if s.config.PostgresEnabled && !databaseOK {
+		status = http.StatusServiceUnavailable
+		serviceOK = false
+	}
+	writeJSON(w, status, map[string]interface{}{
+		"ok": serviceOK, "service": "HistoryReceiver",
 		"database_ok": databaseOK, "inbox_batches": inboxBatches,
 	})
 }
