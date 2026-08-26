@@ -11,6 +11,9 @@ if not defined CSC (
     exit /b 1
 )
 
+"%CSC%" /nologo /target:exe /platform:x86 /out:ArchitectureProbe.compat.exe ArchitectureProbe.cs
+if errorlevel 1 goto failed
+
 "%CSC%" /nologo /target:exe /platform:x86 /reference:System.ServiceProcess.dll /main:DeltaVHistoryCLI.Phase1SelfTest /out:Phase1SelfTest.compat.exe HistorianCore.cs HistoryBatch.cs SyncState.cs HistoryReader.cs HistorySync.cs HistorySyncService.cs BatchSender.cs SpoolMaintenance.cs Phase1SelfTest.cs
 if errorlevel 1 goto failed
 
@@ -21,18 +24,22 @@ if errorlevel 1 goto failed
 if errorlevel 1 goto failed
 HistoryReader.compat.exe --version
 if errorlevel 1 goto failed
+ArchitectureProbe.compat.exe HistoryReader.compat.exe
+if errorlevel 1 goto failed
 
 "%CSC%" /nologo /target:exe /platform:x86 /reference:System.ServiceProcess.dll /main:DeltaVHistoryCLI.SyncProgram /out:HistorySync.compat.exe HistorianCore.cs HistoryBatch.cs SyncState.cs HistoryReader.cs HistorySync.cs HistorySyncService.cs BatchSender.cs SpoolMaintenance.cs
 if errorlevel 1 goto failed
 HistorySync.compat.exe --version
 if errorlevel 1 goto failed
+ArchitectureProbe.compat.exe HistorySync.compat.exe
+if errorlevel 1 goto failed
 
-del /q Phase1SelfTest.compat.exe HistoryReader.compat.exe HistorySync.compat.exe 2>nul
+del /q ArchitectureProbe.compat.exe Phase1SelfTest.compat.exe HistoryReader.compat.exe HistorySync.compat.exe 2>nul
 
 echo DCS .NET 2.0/3.5 X86 COMPATIBILITY TEST PASSED
 exit /b 0
 
 :failed
-del /q Phase1SelfTest.compat.exe HistoryReader.compat.exe HistorySync.compat.exe 2>nul
+del /q ArchitectureProbe.compat.exe Phase1SelfTest.compat.exe HistoryReader.compat.exe HistorySync.compat.exe 2>nul
 echo DCS .NET 2.0/3.5 X86 COMPATIBILITY TEST FAILED
 exit /b 1

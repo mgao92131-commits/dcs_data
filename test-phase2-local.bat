@@ -28,12 +28,22 @@ if not defined CSC (
 
 echo Compiling HistorySync Phase 2...
 pushd DeltaVHistoryCLI_v1.1
+"%CSC%" /nologo /target:exe /platform:x86 /out:ArchitectureProbe.phase2test.exe ArchitectureProbe.cs
+if errorlevel 1 (
+    popd
+    exit /b 1
+)
 "%CSC%" /nologo /target:exe /platform:x86 /reference:System.ServiceProcess.dll /main:DeltaVHistoryCLI.SyncProgram /out:HistorySync.phase2test.exe HistorianCore.cs HistoryBatch.cs SyncState.cs HistoryReader.cs HistorySync.cs HistorySyncService.cs BatchSender.cs SpoolMaintenance.cs
 if errorlevel 1 (
     popd
     exit /b 1
 )
-del /q HistorySync.phase2test.exe 2>nul
+ArchitectureProbe.phase2test.exe HistorySync.phase2test.exe
+if errorlevel 1 (
+    popd
+    exit /b 1
+)
+del /q ArchitectureProbe.phase2test.exe HistorySync.phase2test.exe 2>nul
 popd
 
 echo PHASE 2 LOCAL TESTS PASSED

@@ -17,7 +17,7 @@ Required evidence:
 
 - compiler found under `.NET Framework 2.0` or `3.5`
 - `HistoryReader.compat.exe` and `HistorySync.compat.exe` compile successfully
-- both outputs are x86
+- the architecture probe prints `X86 OK` for both outputs
 - self-test and version checks pass
 
 Do not use the local regression fallback to .NET 4 as this gate.
