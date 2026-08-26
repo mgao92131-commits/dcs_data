@@ -17,7 +17,7 @@ if not defined CSC (
 
 echo Compiler: "%CSC%"
 
-"%CSC%" /nologo /target:exe /platform:x86 /optimize+ /main:DeltaVHistoryCLI.Program /out:HistoryReader.exe HistoryReader.cs
+"%CSC%" /nologo /target:exe /platform:x86 /optimize+ /main:DeltaVHistoryCLI.Program /out:HistoryReader.exe HistorianCore.cs HistoryReader.cs
 
 if errorlevel 1 (
     echo.
@@ -26,7 +26,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-"%CSC%" /nologo /target:exe /platform:x86 /optimize+ /main:DeltaVHistoryCLI.SyncProgram /out:HistorySync.exe HistoryReader.cs HistorySync.cs BatchSender.cs SpoolMaintenance.cs
+"%CSC%" /nologo /target:exe /platform:x86 /optimize+ /main:DeltaVHistoryCLI.SyncProgram /out:HistorySync.exe HistorianCore.cs HistoryBatch.cs HistoryReader.cs HistorySync.cs BatchSender.cs SpoolMaintenance.cs
 
 if errorlevel 1 (
     echo.

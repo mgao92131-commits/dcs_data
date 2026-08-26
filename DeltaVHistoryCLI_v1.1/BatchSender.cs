@@ -38,6 +38,29 @@ namespace DeltaVHistoryCLI
                 throw new Exception("Receiver timeout and MaxBatchesPerRun must be positive.");
         }
 
+        public void Send(HistoryBatch batch, byte[] data)
+        {
+            if (batch == null)
+                throw new ArgumentNullException("batch");
+            if (data == null)
+                throw new ArgumentNullException("data");
+            string actualHash = BatchEncoder.ComputeSha256(data);
+            if (!String.IsNullOrEmpty(batch.Sha256) &&
+                !String.Equals(batch.Sha256, actualHash, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("In-memory batch SHA-256 mismatch.");
+            batch.Sha256 = actualHash;
+            SendPayload(
+                batch.BatchId,
+                batch.CollectorId,
+                batch.Mode,
+                batch.Server,
+                FormatTime(batch.RangeStart),
+                FormatTime(batch.RangeEnd),
+                batch.Samples.Count,
+                actualHash,
+                data);
+        }
+
         public int SendPending()
         {
             string pendingRoot = Path.Combine(_spoolDirectory, "pending");
@@ -120,6 +143,37 @@ namespace DeltaVHistoryCLI
             ValidateHeader(start);
             ValidateHeader(end);
 
+            byte[] data = File.ReadAllBytes(dataPath);
+            SendPayload(
+                batchId,
+                collectorId,
+                mode,
+                server,
+                start,
+                end,
+                expectedRows,
+                actualHash,
+                data);
+        }
+
+        private void SendPayload(
+            string batchId,
+            string collectorId,
+            string mode,
+            string server,
+            string start,
+            string end,
+            int expectedRows,
+            string actualHash,
+            byte[] data)
+        {
+            ValidateHeader(batchId);
+            ValidateHeader(collectorId);
+            ValidateHeader(mode);
+            ValidateHeader(server);
+            ValidateHeader(start);
+            ValidateHeader(end);
+
             _log.Write("Sending batch=" + batchId + " rows=" + expectedRows.ToString());
 
             HttpWebRequest request = (HttpWebRequest)WebRequest.Create(_url);
@@ -138,16 +192,11 @@ namespace DeltaVHistoryCLI
             request.Headers["X-Row-Count"] = expectedRows.ToString(CultureInfo.InvariantCulture);
             request.Headers["X-Content-SHA256"] = actualHash;
 
-            FileInfo info = new FileInfo(dataPath);
-            request.ContentLength = info.Length;
+            request.ContentLength = data.Length;
 
-            using (FileStream input = File.OpenRead(dataPath))
             using (Stream output = request.GetRequestStream())
             {
-                byte[] buffer = new byte[65536];
-                int count;
-                while ((count = input.Read(buffer, 0, buffer.Length)) > 0)
-                    output.Write(buffer, 0, count);
+                output.Write(data, 0, data.Length);
                 output.Flush();
             }
 
@@ -178,6 +227,11 @@ namespace DeltaVHistoryCLI
 
             ValidateAck(responseText, batchId, actualHash, expectedRows);
             _log.Write("ACK batch=" + batchId + " rows=" + expectedRows.ToString());
+        }
+
+        private static string FormatTime(DateTime value)
+        {
+            return value.ToString("yyyy-MM-dd HH:mm:ss.fffffff", CultureInfo.InvariantCulture);
         }
 
         private static void ValidateAck(

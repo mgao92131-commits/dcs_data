@@ -11,7 +11,7 @@ if not defined CSC (
     exit /b 1
 )
 
-"%CSC%" /nologo /target:exe /platform:x86 /main:DeltaVHistoryCLI.Phase1SelfTest /out:Phase1SelfTest.compat.exe HistoryReader.cs HistorySync.cs BatchSender.cs SpoolMaintenance.cs Phase1SelfTest.cs
+"%CSC%" /nologo /target:exe /platform:x86 /main:DeltaVHistoryCLI.Phase1SelfTest /out:Phase1SelfTest.compat.exe HistorianCore.cs HistoryBatch.cs HistoryReader.cs HistorySync.cs BatchSender.cs SpoolMaintenance.cs Phase1SelfTest.cs
 if errorlevel 1 exit /b 1
 
 Phase1SelfTest.compat.exe

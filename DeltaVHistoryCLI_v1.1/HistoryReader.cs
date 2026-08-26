@@ -341,106 +341,30 @@ namespace DeltaVHistoryCLI
                 "Auto split  : " +
                 opt.AutoSplit.ToString());
 
-            object readInterface = null;
-            int connectionHandle = -1;
+            HistorianClient client = null;
 
             try
             {
-                Assembly asm =
-                    LoadDvCHAssembly();
-
-                Type accessType =
-                    FindTypeBySimpleName(
-                        asm,
-                        "DvCHDataAccess");
-
-                if (accessType == null)
-                {
-                    throw new Exception(
-                        "Type DvCHDataAccess was not found.");
-                }
-
-                MethodInfo initialize =
-                    FindMethod(
-                        accessType,
-                        "Initialize",
-                        true,
-                        0);
-
-                if (initialize == null)
-                {
-                    throw new Exception(
-                        "DvCHDataAccess.Initialize() was not found.");
-                }
-
-                initialize.Invoke(null, null);
-
-                readInterface =
-                    GetStaticMember(
-                        accessType,
-                        "ReadInterface");
-
-                if (readInterface == null)
-                {
-                    throw new Exception(
-                        "DvCHDataAccess.ReadInterface returned null.");
-                }
-
-                object connResult =
-                    InvokeNamed(
-                        readInterface,
-                        "createConnection",
-                        new object[]
-                        {
-                            opt.Server,
-                            "DeltaVHistoryCLI",
-                            30
-                        });
-
-                connectionHandle =
-                    Convert.ToInt32(
-                        connResult,
-                        CultureInfo.InvariantCulture);
+                client = new HistorianClient(
+                    _deltaVRoot,
+                    delegate(string message) { Log(message); });
+                client.Connect(opt.Server);
 
                 Console.WriteLine(
                     "Connection  : OK (handle " +
-                    connectionHandle.ToString() + ")");
+                    client.ConnectionHandle.ToString() + ")");
 
-                object connection = null;
-
-                try
+                List<TagResult> coreTags = client.ResolveTags(tagNames);
+                List<TagInfo> tags = new List<TagInfo>();
+                int coreIndex;
+                for (coreIndex = 0; coreIndex < coreTags.Count; coreIndex++)
                 {
-                    connection =
-                        InvokeNamed(
-                            readInterface,
-                            "connection",
-                            new object[]
-                            {
-                                connectionHandle
-                            });
+                    TagInfo legacyTag = new TagInfo();
+                    legacyTag.Name = coreTags[coreIndex].Name;
+                    legacyTag.Handle = coreTags[coreIndex].Handle;
+                    legacyTag.Status = coreTags[coreIndex].Status;
+                    tags.Add(legacyTag);
                 }
-                catch
-                {
-                    connection =
-                        InvokeNamed(
-                            readInterface,
-                            "getConnection",
-                            new object[]
-                            {
-                                connectionHandle
-                            });
-                }
-
-                if (connection == null)
-                {
-                    throw new Exception(
-                        "Could not obtain DvCH read connection.");
-                }
-
-                List<TagInfo> tags =
-                    ResolveTags(
-                        connection,
-                        tagNames);
 
                 int ok = 0;
                 int bad = 0;
@@ -491,16 +415,6 @@ namespace DeltaVHistoryCLI
                         opt.OutputDirectory);
                 }
 
-                MethodInfo readRaw =
-                    FindReadRaw6(
-                        connection.GetType());
-
-                if (readRaw == null)
-                {
-                    throw new Exception(
-                        "Six-argument readRaw() overload was not found.");
-                }
-
                 long totalRows = 0;
                 int exportedFiles = 0;
 
@@ -515,32 +429,23 @@ namespace DeltaVHistoryCLI
                     Console.WriteLine(
                         "Reading     : " + ti.Name);
 
-                    List<SampleRow> rows =
-                        new List<SampleRow>();
-
-                    ReadRangeRecursive(
-                        readInterface,
-                        connection,
-                        readRaw,
-                        ti.Handle,
+                    List<HistorySample> coreRows = client.ReadRaw(
+                        coreTags[t],
                         opt.Start,
                         opt.End,
                         opt.MaxSamples,
-                        opt.AutoSplit,
-                        0,
-                        rows);
-
-                    rows.Sort(
-                        delegate(
-                            SampleRow a,
-                            SampleRow b)
-                        {
-                            return a.Timestamp.CompareTo(
-                                b.Timestamp);
-                        });
-
-                    rows =
-                        Deduplicate(rows);
+                        opt.AutoSplit);
+                    List<SampleRow> rows = new List<SampleRow>();
+                    int rowIndex;
+                    for (rowIndex = 0; rowIndex < coreRows.Count; rowIndex++)
+                    {
+                        SampleRow row = new SampleRow();
+                        row.Timestamp = coreRows[rowIndex].Timestamp;
+                        row.Value = coreRows[rowIndex].Value;
+                        row.DataType = coreRows[rowIndex].DataType;
+                        row.Flags = coreRows[rowIndex].Flags;
+                        rows.Add(row);
+                    }
 
                     string fileName =
                         BuildOutputFileName(
@@ -634,17 +539,8 @@ namespace DeltaVHistoryCLI
             }
             finally
             {
-                if (readInterface != null &&
-                    connectionHandle >= 0)
-                {
-                    TryInvoke(
-                        readInterface,
-                        "closeConnection",
-                        new object[]
-                        {
-                            connectionHandle
-                        });
-                }
+                if (client != null)
+                    client.Dispose();
             }
         }
 

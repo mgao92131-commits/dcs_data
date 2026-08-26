@@ -18,6 +18,7 @@ namespace DeltaVHistoryCLI
             {
                 Directory.CreateDirectory(root);
                 TestIni(root);
+                TestHistorySampleNormalization();
                 TestCsvCombination(root);
                 TestStagingRecovery(root);
                 Console.WriteLine("PHASE 1 SELF-TEST PASSED");
@@ -37,6 +38,37 @@ namespace DeltaVHistoryCLI
                 }
                 catch { }
             }
+        }
+
+        private static void TestHistorySampleNormalization()
+        {
+            DateTime firstTime = new DateTime(2026, 8, 26, 9, 0, 0);
+            HistorySample later = MakeSample("TAG/A", firstTime.AddSeconds(1), "2");
+            HistorySample first = MakeSample("TAG/A", firstTime, "1");
+            HistorySample duplicate = MakeSample("TAG/A", firstTime, "1");
+            System.Collections.Generic.List<HistorySample> rows =
+                new System.Collections.Generic.List<HistorySample>();
+            rows.Add(later);
+            rows.Add(first);
+            rows.Add(duplicate);
+
+            rows = HistorySampleSet.Normalize(rows);
+            Assert(rows.Count == 2, "Historian Core deduplication");
+            Assert(rows[0].Timestamp == firstTime, "Historian Core timestamp ordering");
+            Assert(rows[1].Value == "2", "Historian Core sample preservation");
+        }
+
+        private static HistorySample MakeSample(string tag, DateTime timestamp, string value)
+        {
+            HistorySample sample = new HistorySample();
+            sample.Tag = tag;
+            sample.Timestamp = timestamp;
+            sample.Value = value;
+            sample.DataType = "Float";
+            sample.Flags = "";
+            sample.SequenceNo = "";
+            sample.ArchiveStatus = "";
+            return sample;
         }
 
         private static void TestIni(string root)

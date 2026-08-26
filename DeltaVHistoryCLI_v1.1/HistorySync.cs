@@ -132,7 +132,7 @@ namespace DeltaVHistoryCLI
 
     class SyncProgram
     {
-        private const string Version = "0.2-phase2";
+        private const string Version = "2.0-refactor";
 
         static int Main(string[] args)
         {
@@ -214,19 +214,29 @@ namespace DeltaVHistoryCLI
                 if (command == "send")
                     return RunSender(config, options.SpoolDirectory, log);
 
-                int collectionCode = RunCollection(options, log);
-                if (collectionCode != 0 && collectionCode != 5)
-                    return collectionCode;
-
                 bool senderEnabled = config.GetBool("Receiver", "Enabled", false);
-                if (senderEnabled && !HasArg(args, "--no-send"))
+                bool sendRequested = senderEnabled && !HasArg(args, "--no-send");
+                BatchSender sender = sendRequested
+                    ? new BatchSender(config, options.SpoolDirectory, log)
+                    : null;
+                int senderCode = 0;
+                bool directSendAllowed = false;
+                if (sender != null)
                 {
-                    int senderCode = RunSender(config, options.SpoolDirectory, log);
-                    if (senderCode != 0)
-                        return senderCode;
+                    senderCode = sender.SendPending();
+                    directSendAllowed = senderCode == 0 &&
+                        Directory.GetDirectories(
+                            Path.Combine(options.SpoolDirectory, "pending")).Length == 0;
                 }
 
-                return collectionCode;
+                int collectionCode = RunCollection(
+                    options,
+                    log,
+                    sender,
+                    directSendAllowed);
+                if (collectionCode != 0 && collectionCode != 5)
+                    return collectionCode;
+                return senderCode == 0 ? collectionCode : senderCode;
             }
         }
 
@@ -305,14 +315,29 @@ namespace DeltaVHistoryCLI
 
         private static int RunValidate(SyncOptions options, SyncLogger log)
         {
-            List<string> readerArgs = new List<string>();
-            readerArgs.Add("validate");
-            AddTagArguments(readerArgs, options);
-            readerArgs.Add("--server");
-            readerArgs.Add(options.Server);
-            int code = Program.Execute(readerArgs.ToArray());
-            log.Write("Validate exit code=" + code.ToString(CultureInfo.InvariantCulture));
-            return code;
+            HistorianClient client = null;
+            try
+            {
+                client = new HistorianClient(
+                    @"C:\DeltaV",
+                    delegate(string message) { log.Write("Historian " + message); });
+                client.Connect(options.Server);
+                List<TagResult> tags = client.ResolveTags(LoadSyncTags(options));
+                int bad = 0;
+                int i;
+                for (i = 0; i < tags.Count; i++)
+                {
+                    log.Write("Tag " + tags[i].Name + " status=" + tags[i].Status.ToString());
+                    if (tags[i].Status != 1)
+                        bad++;
+                }
+                return bad == 0 ? 0 : 4;
+            }
+            finally
+            {
+                if (client != null)
+                    client.Dispose();
+            }
         }
 
         private static int RunSender(IniConfig config, string spoolDirectory, SyncLogger log)
@@ -321,106 +346,132 @@ namespace DeltaVHistoryCLI
             return sender.SendPending();
         }
 
-        private static int RunCollection(SyncOptions options, SyncLogger log)
+        private static int RunCollection(
+            SyncOptions options,
+            SyncLogger log,
+            BatchSender sender,
+            bool directSendAllowed)
         {
-            DateTime sliceStart = options.Start;
-            int batches = 0;
-            int partial = 0;
-
-            while (sliceStart < options.End)
+            HistorianClient client = null;
+            try
             {
-                DateTime sliceEnd = sliceStart.Add(options.Slice);
-                if (sliceEnd > options.End)
-                    sliceEnd = options.End;
+                client = new HistorianClient(
+                    @"C:\DeltaV",
+                    delegate(string message) { log.Write("Historian " + message); });
+                client.Connect(options.Server);
+                List<string> tagNames = LoadSyncTags(options);
+                List<TagResult> tags = client.ResolveTags(tagNames);
+                int badTags = 0;
+                int tagIndex;
+                for (tagIndex = 0; tagIndex < tags.Count; tagIndex++)
+                    if (tags[tagIndex].Status != 1)
+                        badTags++;
+                if (badTags == tags.Count)
+                    throw new Exception("No valid Historian tags.");
 
-                int result = CreateBatch(options, sliceStart, sliceEnd, log);
-                if (result == 0)
-                    batches++;
-                else if (result == 5)
+                DateTime sliceStart = options.Start;
+                int batches = 0;
+                while (sliceStart < options.End)
                 {
+                    DateTime sliceEnd = sliceStart.Add(options.Slice);
+                    if (sliceEnd > options.End)
+                        sliceEnd = options.End;
+
+                    int result = CreateBatch(
+                        options,
+                        sliceStart,
+                        sliceEnd,
+                        log,
+                        client,
+                        tags,
+                        sender,
+                        ref directSendAllowed);
+                    if (result != 0 && result != 5)
+                        return result;
                     batches++;
-                    partial++;
+                    sliceStart = sliceEnd;
                 }
-                else
-                    return result;
-
-                sliceStart = sliceEnd;
+                log.Write("Completed batches=" + batches.ToString() + " invalidTags=" + badTags.ToString());
+                return badTags == 0 ? 0 : 5;
             }
-
-            log.Write("Completed batches=" + batches.ToString() + " partial=" + partial.ToString());
-            return partial == 0 ? 0 : 5;
+            finally
+            {
+                if (client != null)
+                    client.Dispose();
+            }
         }
 
         private static int CreateBatch(
             SyncOptions options,
             DateTime start,
             DateTime end,
-            SyncLogger log)
+            SyncLogger log,
+            HistorianClient client,
+            List<TagResult> tags,
+            BatchSender sender,
+            ref bool directSendAllowed)
         {
             string batchId = BuildBatchId(options.CollectorId);
-            string stagingRoot = Path.Combine(options.SpoolDirectory, "staging");
-            string pendingRoot = Path.Combine(options.SpoolDirectory, "pending");
-            string failedRoot = Path.Combine(options.SpoolDirectory, "failed");
-            string temporaryDirectory = Path.Combine(stagingRoot, batchId + ".tmp");
-            string readerDirectory = Path.Combine(temporaryDirectory, "reader");
-
-            Directory.CreateDirectory(readerDirectory);
             log.Write("Collect batch=" + batchId + " range=" + FormatTime(start) + " .. " + FormatTime(end));
 
             try
             {
-                List<string> readerArgs = new List<string>();
-                readerArgs.Add("export");
-                AddTagArguments(readerArgs, options);
-                readerArgs.Add("--server");
-                readerArgs.Add(options.Server);
-                readerArgs.Add("--start");
-                readerArgs.Add(FormatReaderTime(start));
-                readerArgs.Add("--end");
-                readerArgs.Add(FormatReaderTime(end));
-                readerArgs.Add("--max");
-                readerArgs.Add(options.MaxSamples.ToString(CultureInfo.InvariantCulture));
-                readerArgs.Add("--out-dir");
-                readerArgs.Add(readerDirectory);
+                HistoryBatch batch = new HistoryBatch();
+                batch.BatchId = batchId;
+                batch.CollectorId = options.CollectorId;
+                batch.Mode = options.Command;
+                batch.Server = options.Server;
+                batch.RangeStart = start;
+                batch.RangeEnd = end;
 
-                int readerCode = Program.Execute(readerArgs.ToArray());
-                if (readerCode != 0 && readerCode != 5)
-                    throw new Exception("HistoryReader failed with exit code " + readerCode.ToString());
+                int tagIndex;
+                int invalidTags = 0;
+                for (tagIndex = 0; tagIndex < tags.Count; tagIndex++)
+                {
+                    if (tags[tagIndex].Status != 1)
+                    {
+                        invalidTags++;
+                        continue;
+                    }
+                    List<HistorySample> samples = client.ReadRaw(
+                        tags[tagIndex],
+                        start,
+                        end,
+                        options.MaxSamples,
+                        true);
+                    batch.Samples.AddRange(samples);
+                    if (batch.Samples.Count > options.MaxBatchRows)
+                        throw new BatchLimitException("Batch row limit exceeded.");
+                }
 
-                string dataPath = Path.Combine(temporaryDirectory, "data.csv");
-                long rows = CombineReaderFiles(
-                    readerDirectory,
-                    dataPath,
-                    options.MaxBatchRows,
-                    options.MaxBatchBytes);
-                string checksum = ComputeSha256(dataPath);
+                byte[] data = BatchEncoder.EncodeCsv(batch);
+                if (data.Length > options.MaxBatchBytes)
+                    throw new BatchLimitException("Batch size limit exceeded.");
+                batch.Sha256 = BatchEncoder.ComputeSha256(data);
 
-                WriteBatchMetadata(
-                    Path.Combine(temporaryDirectory, "meta.ini"),
-                    batchId,
-                    options,
-                    start,
-                    end,
-                    rows,
-                    checksum,
-                    readerCode == 5 ? "partial" : "success");
+                if (sender != null && directSendAllowed)
+                {
+                    try
+                    {
+                        sender.Send(batch, data);
+                        log.Write("Direct ACK batch=" + batchId + " rows=" + batch.Samples.Count.ToString());
+                        return invalidTags == 0 ? 0 : 5;
+                    }
+                    catch (Exception ex)
+                    {
+                        directSendAllowed = false;
+                        log.Write("Direct send failed; switching to outbox batch=" + batchId + " error=" + ex.Message);
+                    }
+                }
 
-                Directory.Delete(readerDirectory, true);
-                string pendingDirectory = Path.Combine(pendingRoot, batchId);
-                Directory.Move(temporaryDirectory, pendingDirectory);
-
-                log.Write("Pending batch=" + batchId + " rows=" + rows.ToString() + " sha256=" + checksum);
-                return readerCode;
+                SpoolStore spool = new SpoolStore(options.SpoolDirectory);
+                spool.SavePending(batch, data);
+                log.Write("Pending batch=" + batchId + " rows=" + batch.Samples.Count.ToString() + " sha256=" + batch.Sha256);
+                return invalidTags == 0 ? 0 : 5;
             }
             catch (Exception ex)
             {
                 log.Write("Batch failed=" + batchId + " error=" + ex.Message);
-                if (Directory.Exists(temporaryDirectory))
-                {
-                    string failedDirectory = Path.Combine(failedRoot, batchId + "_" + Guid.NewGuid().ToString("N"));
-                    try { Directory.Move(temporaryDirectory, failedDirectory); }
-                    catch { }
-                }
                 return 20;
             }
         }
@@ -485,6 +536,38 @@ namespace DeltaVHistoryCLI
                     " bytes). Use a smaller --slice.");
 
             return rows;
+        }
+
+        private static List<string> LoadSyncTags(SyncOptions options)
+        {
+            List<string> result = new List<string>();
+            Dictionary<string, bool> seen = new Dictionary<string, bool>(
+                StringComparer.OrdinalIgnoreCase);
+            if (!String.IsNullOrEmpty(options.SingleTag))
+            {
+                result.Add(options.SingleTag);
+                return result;
+            }
+            if (!File.Exists(options.TagsFile))
+                throw new FileNotFoundException("Tags file not found: " + options.TagsFile);
+            using (StreamReader reader = new StreamReader(options.TagsFile, Encoding.Default, true))
+            {
+                string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    line = line.Trim();
+                    if (line.Length == 0 || line.StartsWith("#") || line.StartsWith(";"))
+                        continue;
+                    if (!seen.ContainsKey(line))
+                    {
+                        seen.Add(line, true);
+                        result.Add(line);
+                    }
+                }
+            }
+            if (result.Count == 0)
+                throw new Exception("No tags were found in " + options.TagsFile);
+            return result;
         }
 
         private static void WriteBatchMetadata(
