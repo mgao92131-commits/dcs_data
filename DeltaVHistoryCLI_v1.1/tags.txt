@@ -1,0 +1,6 @@
+﻿# DeltaV Historian tags
+# One exact Historian tag per line.
+# Lines starting with # are ignored.
+
+TI-021007/AI1/PV.CV
+# TI-118020/AI1/PV.CV

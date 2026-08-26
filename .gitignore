@@ -1,0 +1,30 @@
+# Production secrets and machine-specific configuration
+DeltaVHistoryCLI_v1.1/config.ini
+HistoryReceiver/receiver.ini
+.env
+.env.*
+
+# Runtime data
+DeltaVHistoryCLI_v1.1/spool/
+DeltaVHistoryCLI_v1.1/logs/
+HistoryReceiver/inbox/
+HistoryReceiver/archive/
+HistoryReceiver/staging/
+HistoryReceiver/rejected/
+HistoryReceiver/logs/
+HistoryReceiver/backup/
+*.log
+
+# Build output and vendor binaries
+*.exe
+*.dll
+*.tlb
+*.pdb
+hda/
+
+# Editor and OS files
+.vs/
+.vscode/
+*.user
+Thumbs.db
+.DS_Store
