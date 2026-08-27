@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Reflection;
+using System.Text;
 
 namespace DeltaVHistoryCLI
 {
@@ -77,6 +78,46 @@ namespace DeltaVHistoryCLI
         public int ConnectionHandle
         {
             get { return _connectionHandle; }
+        }
+
+        public static int Probe(string deltaVRoot, HistorianLog log)
+        {
+            HistorianClient client = new HistorianClient(deltaVRoot, log);
+            try
+            {
+                Assembly assembly = client.LoadDvCHAssembly();
+                Console.WriteLine("Assembly: " + assembly.FullName);
+                Console.WriteLine();
+                Type[] types = assembly.GetTypes();
+                int typeIndex;
+                for (typeIndex = 0; typeIndex < types.Length; typeIndex++)
+                {
+                    Type type = types[typeIndex];
+                    string fullName = type.FullName == null ? "" : type.FullName;
+                    if (fullName.IndexOf("DvCH", StringComparison.OrdinalIgnoreCase) < 0 &&
+                        fullName.IndexOf("RawHistory", StringComparison.OrdinalIgnoreCase) < 0)
+                        continue;
+                    Console.WriteLine("=== " + fullName + " ===");
+                    MethodInfo[] methods = type.GetMethods(
+                        BindingFlags.Public | BindingFlags.NonPublic |
+                        BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly);
+                    int methodIndex;
+                    for (methodIndex = 0; methodIndex < methods.Length; methodIndex++)
+                        Console.WriteLine("  " + MethodSignature(methods[methodIndex]));
+                }
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("PROBE ERROR: " + ex.Message);
+                if (log != null)
+                    log("Probe failed: " + ex.Message);
+                return 20;
+            }
+            finally
+            {
+                client.Dispose();
+            }
         }
 
         public void Connect(string server)
@@ -428,6 +469,34 @@ namespace DeltaVHistoryCLI
         private static MethodInfo FindCompatibleMethod(Type type, string name, int parameterCount)
         {
             return FindMethod(type, name, false, parameterCount);
+        }
+
+        private static string MethodSignature(MethodInfo method)
+        {
+            try
+            {
+                ParameterInfo[] parameters = method.GetParameters();
+                StringBuilder text = new StringBuilder();
+                text.Append(method.ReturnType.FullName);
+                text.Append(" ");
+                text.Append(method.Name);
+                text.Append("(");
+                int index;
+                for (index = 0; index < parameters.Length; index++)
+                {
+                    if (index > 0)
+                        text.Append(", ");
+                    text.Append(parameters[index].ParameterType.FullName);
+                    text.Append(" ");
+                    text.Append(parameters[index].Name);
+                }
+                text.Append(")");
+                return text.ToString();
+            }
+            catch
+            {
+                return method.Name;
+            }
         }
 
         private object InvokeNamed(object target, string methodName, object[] args)

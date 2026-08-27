@@ -64,6 +64,10 @@ namespace DeltaVHistoryCLI
                     Console.WriteLine("DeltaV History CLI v" + Version);
                     return 0;
                 }
+                if (args.Length == 1 && String.Equals(
+                    args[0], "--probe", StringComparison.OrdinalIgnoreCase))
+                    return HistorianClient.Probe(_deltaVRoot,
+                        delegate(string message) { Log(message); });
 
                 Options options = ParseOptions(args);
                 return Run(options);
@@ -460,6 +464,7 @@ namespace DeltaVHistoryCLI
             Console.WriteLine("  --out-dir DIR       default .\\export");
             Console.WriteLine("  --max N             samples/read, default 10000");
             Console.WriteLine("  --no-auto-split     disable automatic split");
+            Console.WriteLine("  --probe             dump DvCH API signatures");
         }
 
         private static void Log(string text)
