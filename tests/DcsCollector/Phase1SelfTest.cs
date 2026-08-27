@@ -104,7 +104,8 @@ namespace DeltaVHistoryCLI
             string spool = Path.Combine(root, "memory-spool");
             SpoolStore store = new SpoolStore(spool);
             store.SavePending(batch, data);
-            string pending = Path.Combine(spool, "pending", batch.BatchId);
+            string pending = Path.Combine(
+                Path.Combine(spool, "pending"), batch.BatchId);
             Assert(File.Exists(Path.Combine(pending, "data.csv")), "outbox data persistence");
             Assert(File.Exists(Path.Combine(pending, "meta.ini")), "outbox metadata persistence");
             Assert(Directory.GetDirectories(Path.Combine(spool, "staging")).Length == 0,
@@ -117,7 +118,8 @@ namespace DeltaVHistoryCLI
 
         private static void TestAtomicSyncState(string root)
         {
-            string path = Path.Combine(root, "state", "state.ini");
+            string path = Path.Combine(
+                Path.Combine(root, "state"), "state.ini");
             DateTime baseline = new DateTime(2026, 8, 26, 9, 0, 0);
             SyncStateStore store = new SyncStateStore(path);
             SyncState state = store.LoadOrCreate(baseline);
@@ -152,7 +154,8 @@ namespace DeltaVHistoryCLI
         private static void TestOutboxCheckpointRecovery(string root)
         {
             string spool = Path.Combine(root, "recovery-spool");
-            string pending = Path.Combine(spool, "pending", "recovery_batch");
+            string pending = Path.Combine(
+                Path.Combine(spool, "pending"), "recovery_batch");
             Directory.CreateDirectory(pending);
             using (StreamWriter writer = new StreamWriter(
                 Path.Combine(pending, "meta.ini"), false, Encoding.UTF8))
@@ -193,10 +196,10 @@ namespace DeltaVHistoryCLI
             Directory.CreateDirectory(Path.Combine(pending, "a_earlier"));
             Directory.CreateDirectory(Path.Combine(pending, "m_invalid"));
             WritePendingMeta(
-                Path.Combine(pending, "z_later", "meta.ini"),
+                Path.Combine(Path.Combine(pending, "z_later"), "meta.ini"),
                 "2026-08-26 09:05:00.0000000");
             WritePendingMeta(
-                Path.Combine(pending, "a_earlier", "meta.ini"),
+                Path.Combine(Path.Combine(pending, "a_earlier"), "meta.ini"),
                 "2026-08-26 09:00:00.0000000");
 
             MethodInfo order = typeof(BatchSender).GetMethod(
@@ -223,7 +226,8 @@ namespace DeltaVHistoryCLI
         private static void TestInitialStateSkipsCorruptOutbox(string root)
         {
             string spool = Path.Combine(root, "corrupt-initial-spool");
-            string pending = Path.Combine(spool, "pending", "corrupt_batch");
+            string pending = Path.Combine(
+                Path.Combine(spool, "pending"), "corrupt_batch");
             Directory.CreateDirectory(pending);
             using (StreamWriter writer = new StreamWriter(
                 Path.Combine(pending, "meta.ini"), false, Encoding.UTF8))
