@@ -506,7 +506,6 @@ namespace DeltaVHistoryCLI
             MethodInfo method = FindCompatibleMethod(target.GetType(), methodName, args.Length);
             if (method == null)
                 throw new MissingMethodException(target.GetType().FullName, methodName);
-            WriteLog("Invoke: " + method.Name);
             return method.Invoke(target, args);
         }
 
