@@ -166,7 +166,8 @@ namespace DeltaVHistoryCLI
                 writer.WriteLine("End=2026-08-26 09:05:00.0000000");
             }
 
-            string statePath = Path.Combine(root, "recovery-state", "state.ini");
+            string statePath = Path.Combine(
+                Path.Combine(root, "recovery-state"), "state.ini");
             DateTime baseline = new DateTime(2026, 8, 26, 9, 0, 0);
             SyncStateStore store = new SyncStateStore(statePath);
             SyncState state = store.LoadOrCreate(baseline);
