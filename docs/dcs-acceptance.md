@@ -59,10 +59,10 @@ with an old or unreachable address; a successful local `/healthz` check on the
 database computer does not prove that the DCS route is correct.
 
 With `HistoryReceiver` configured as `SynchronousCommit=true` and the DCS
-config set to `AckMode=database`:
+config set to `AckMode=database`, start the normal no-admin host:
 
 ```bat
-HistorySync.exe --console
+start-historysync.vbs
 HistorySync.exe status
 ```
 
@@ -70,10 +70,11 @@ Record the BatchId, ACK, `history_samples` row count, and
 `LastCommittedEnd`. The ACK must include `commit_level=database`; it is valid
 for `LastCommittedEnd` only when the PostgreSQL transaction has committed.
 
-Before unattended operation, record the service identity and validate that the
-same identity can connect to the DeltaV APP Historian. `install-service.bat`
-uses `LocalSystem` explicitly; if the site requires a dedicated account,
-configure it with `sc.exe config` and repeat the service-mode read test.
+Before unattended operation, record the logged-in DCS user and verify that this
+user can read the DeltaV APP Historian and write the collector directory. The
+normal package does not install a Windows Service or startup task and requires
+no administrator permission. Use `stop-historysync.vbs` for a graceful stop;
+do not terminate the process forcibly.
 
 ## 4. Failure and recovery
 
@@ -96,5 +97,5 @@ Promote v2 only after this checklist, the baseline tests, and the database
 backup/restore procedure are recorded. If `postgresql.conf` was changed to
 `listen_addresses='127.0.0.1'`, restart the PostgreSQL service on the database
 computer as an administrator and verify the listener before recording the
-promotion. Installing the Windows Service does not reboot, stop, or restart
-the DCS workstation.
+promotion. The normal user-mode launcher does not reboot, stop, or restart the
+DCS workstation.

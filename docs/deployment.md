@@ -39,15 +39,18 @@ does not restart or power-cycle the DCS workstation.
    `tags.txt`.
 3. Set the Receiver URL and the same API key. The current Receiver is
    `http://192.168.1.10:8080/api/history/batch`.
-4. Run `HistorySync.exe status` and then `HistorySync.exe --console`.
-5. Run the strict compatibility gate from the package/source checkout:
+4. Run the strict compatibility gate from the source checkout:
    `scripts\test-dcs-compatibility.bat`.
-6. Install the service only after console and Historian output checks pass.
+5. From the release directory, run `HistorySync.exe status` and then
+   double-click `start-historysync.vbs`. This starts `HistorySync.exe
+   --console` with a hidden window under the logged-in DCS user.
+6. To stop it, double-click `stop-historysync.vbs`. The stop is graceful and
+   uses a user-mode named event; it does not kill the process.
 
-`install-service.bat` explicitly uses `LocalSystem`. Record that identity and
-prove it can read the DeltaV APP Historian. If the site requires a dedicated
-account, configure the service with `sc.exe config` and repeat the service-mode
-test.
+No administrator permission, Windows Service, Scheduled Task, or startup entry
+is required for the normal deployment. The optional `install-service.bat`
+remains source-only for an administrator-managed host and is not included in
+the normal DCS package.
 
 ## Upgrade
 
@@ -57,12 +60,13 @@ test.
 3. Stop only the component being upgraded.
 4. Replace the executable/package files, preserving local configuration and
    runtime directories.
-5. Start the component and verify health/status before resuming unattended
-   operation.
+5. Start the component with `start-historysync.vbs` and verify status before
+   resuming unattended operation.
 
 ## Rollback
 
-Restore the previous package binaries while preserving `state.ini` and
+First run `stop-historysync.vbs`, then restore the previous package binaries
+while preserving `state.ini` and
 `spool\pending`. The old v1 Receiver protocol does not prove a PostgreSQL
 commit; do not run a DCS configured with `AckMode=database` against that old
 Receiver. If rollback crosses the protocol boundary, first stop collection and

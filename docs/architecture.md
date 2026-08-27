@@ -9,8 +9,11 @@ The DCS collector must remain compatible with:
 - x86 process architecture
 - the existing DeltaV Historian assemblies
 
-The Receiver remains a Go service on the database computer. DCS computers
-must never be rebooted or power-cycled by the collector.
+The Receiver remains a Go service on the database computer. The normal DCS
+host is a user-mode console process launched by `start-historysync.vbs` with a
+hidden window. It must never reboot, power-cycle, shut down, or forcibly kill
+anything on the DCS computer. Windows Service mode is optional and
+administrator-managed only.
 
 ## Stable baseline
 
@@ -48,8 +51,8 @@ DeltaV Historian -> Historian Core -> RangeSyncEngine -> in-memory batch
 4. Initial-load and backfill jobs never modify continuous-sync checkpoints.
 5. State updates use write, flush, and atomic rename.
 6. A checkpoint never advances when batch persistence fails.
-7. A global named mutex prevents a console host and Windows Service from
-   running the same collector simultaneously across Windows sessions.
+7. A global named mutex prevents multiple collector hosts from running the
+   same collector simultaneously across Windows sessions.
 
 ## ACK commit proof
 

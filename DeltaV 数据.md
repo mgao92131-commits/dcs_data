@@ -644,7 +644,7 @@ Phase 1 验证稳定以后，我们再接网络。
 2. `HistorySync` 正常路径直接从内存 Batch 发送 HTTP，不再先生成 Tag CSV 再重新读取组合 CSV。
 3. 已加入 `LastCollectedEnd`、`LastAcceptedEnd`、`LastCommittedEnd` 状态，以及自动追赶、重叠窗口和动态切片。
 4. spool 已调整为失败时使用的 Outbox，并按时间顺序补发 pending Batch。
-5. 已支持 Console、Windows Service、`status`、`init` 和 `backfill`，不包含强制结束进程或重启 DCS 电脑的逻辑。
+5. 已支持 Console、用户态隐藏启动/优雅停止、`status`、`init` 和 `backfill`；Windows Service 仅作为管理员可选模式，不包含强制结束进程或重启 DCS 电脑的逻辑。
 6. Receiver 已支持 PostgreSQL 同步提交模式：只有数据库事务 COMMIT 成功才返回 `committed=true`。
 7. PostgreSQL 已增加 `history_samples` 完整字段模型，支持数值和文本值；旧 `history_raw` 保留为 v1 历史数据。
 

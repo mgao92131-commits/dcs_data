@@ -78,27 +78,36 @@ namespace DeltaVHistoryCLI
         public static int RunConsole()
         {
             ManualResetEvent stop = new ManualResetEvent(false);
-            ConsoleCancelEventHandler handler = delegate(object sender, ConsoleCancelEventArgs e)
+            bool created;
+            using (EventWaitHandle stopEvent = new EventWaitHandle(
+                false, EventResetMode.ManualReset,
+                SyncProgram.ConsoleStopEventName, out created))
             {
-                e.Cancel = true;
-                stop.Set();
-            };
-            Console.CancelKeyPress += handler;
-            Console.WriteLine("HistorySync console host started. Press Ctrl+C to stop.");
-            try
-            {
-                while (!stop.WaitOne(0, false))
+                stopEvent.Reset();
+                ConsoleCancelEventHandler handler = delegate(object sender, ConsoleCancelEventArgs e)
                 {
-                    int result = SyncProgram.ExecuteCycle(new string[] { "sync" });
-                    Console.WriteLine("Sync exit code: " + result.ToString());
-                    if (stop.WaitOne(ReadIntervalMilliseconds(), false))
-                        break;
+                    e.Cancel = true;
+                    stop.Set();
+                };
+                Console.CancelKeyPress += handler;
+                Console.WriteLine("HistorySync console host started. Press Ctrl+C to stop.");
+                try
+                {
+                    while (!stop.WaitOne(0, false) && !stopEvent.WaitOne(0, false))
+                    {
+                        int result = SyncProgram.ExecuteCycle(new string[] { "sync" });
+                        Console.WriteLine("Sync exit code: " + result.ToString());
+                        WaitHandle[] waitHandles = new WaitHandle[] { stop, stopEvent };
+                        if (WaitHandle.WaitAny(
+                            waitHandles, ReadIntervalMilliseconds(), false) != WaitHandle.WaitTimeout)
+                            break;
+                    }
                 }
-            }
-            finally
-            {
-                Console.CancelKeyPress -= handler;
-                stop.Close();
+                finally
+                {
+                    Console.CancelKeyPress -= handler;
+                    stop.Close();
+                }
             }
             return 0;
         }

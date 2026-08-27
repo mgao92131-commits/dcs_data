@@ -145,16 +145,44 @@ namespace DeltaVHistoryCLI
         private const string Version = "2.0-refactor";
         private const string MutexName = "Global\\DeltaVHistorySync";
         private const string HostMutexName = "Global\\DeltaVHistorySyncHost";
+        internal const string ConsoleStopEventName =
+            "Local\\DeltaVHistorySyncConsoleStop";
 
         private delegate int HostRunner();
 
         static int Main(string[] args)
         {
+            if (args.Length == 1 && String.Equals(args[0], "--stop", StringComparison.OrdinalIgnoreCase))
+                return SignalConsoleStop();
             if (args.Length == 1 && String.Equals(args[0], "--service", StringComparison.OrdinalIgnoreCase))
                 return RunHost(new HostRunner(HistorySyncService.RunService));
             if (args.Length == 1 && String.Equals(args[0], "--console", StringComparison.OrdinalIgnoreCase))
                 return RunHost(new HostRunner(HistorySyncService.RunConsole));
             return Execute(args);
+        }
+
+        private static int SignalConsoleStop()
+        {
+            try
+            {
+                using (EventWaitHandle stop =
+                    EventWaitHandle.OpenExisting(ConsoleStopEventName))
+                {
+                    stop.Set();
+                    Console.WriteLine("HistorySync stop requested.");
+                    return 0;
+                }
+            }
+            catch (WaitHandleCannotBeOpenedException)
+            {
+                Console.WriteLine("No HistorySync console host is running.");
+                return 31;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Could not stop HistorySync: " + ex.Message);
+                return 31;
+            }
         }
 
         internal static int Execute(string[] args)
@@ -1423,6 +1451,8 @@ namespace DeltaVHistoryCLI
             Console.WriteLine("  HistorySync.exe backfill --tag \"TI-021007/AI1/PV.CV\" --last 2d --slice 6h");
             Console.WriteLine("  HistorySync.exe validate --tags tags.txt");
             Console.WriteLine("  HistorySync.exe send");
+            Console.WriteLine("  HistorySync.exe --stop");
+            Console.WriteLine("  HistorySync.exe --console");
             Console.WriteLine();
             Console.WriteLine("Options: --config --server --tag --tags --start --end --last --slice --max --no-send");
         }
