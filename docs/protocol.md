@@ -56,7 +56,7 @@ After PostgreSQL transaction commit, the Receiver returns HTTP 200:
 `commit_level=database` is required before the DCS collector advances
 `LastCommittedEnd`. An asynchronous/inbox-only Receiver may return
 `commit_level=inbox`; that can advance `LastAcceptedEnd` but never proves a
-PostgreSQL commit. An ACK without `commit_level` is rejected by the v2 DCS
+PostgreSQL commit. An ACK without `commit_level` is rejected by the DCS
 sender.
 
 ## Response handling

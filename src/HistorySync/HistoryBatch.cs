@@ -17,6 +17,10 @@ namespace DeltaVHistoryCLI
         public string BatchId;
         public string CollectorId;
         public string Mode;
+        public string Sampling;
+        public int SamplingIntervalSeconds;
+        public int FailedTags;
+        public int InvalidSlots;
         public string Server;
         public DateTime RangeStart;
         public DateTime RangeEnd;
@@ -196,6 +200,13 @@ namespace DeltaVHistoryCLI
                 writer.WriteLine("BatchId=" + batch.BatchId);
                 writer.WriteLine("CollectorId=" + batch.CollectorId);
                 writer.WriteLine("Mode=" + batch.Mode);
+                writer.WriteLine("Sampling=" + batch.Sampling);
+                writer.WriteLine("SamplingIntervalSeconds=" +
+                    batch.SamplingIntervalSeconds.ToString(CultureInfo.InvariantCulture));
+                writer.WriteLine("FailedTags=" +
+                    batch.FailedTags.ToString(CultureInfo.InvariantCulture));
+                writer.WriteLine("InvalidSlots=" +
+                    batch.InvalidSlots.ToString(CultureInfo.InvariantCulture));
                 writer.WriteLine("Server=" + batch.Server);
                 writer.WriteLine("Start=" + FormatTime(batch.RangeStart));
                 writer.WriteLine("End=" + FormatTime(batch.RangeEnd));

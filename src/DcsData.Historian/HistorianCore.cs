@@ -4,7 +4,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Reflection;
-using System.Text;
 
 namespace DeltaVHistoryCLI
 {
@@ -26,6 +25,15 @@ namespace DeltaVHistoryCLI
         public string Name;
         public int Handle;
         public int Status;
+    }
+
+    public class ProcessedHistoryResult
+    {
+        public string Aggregate;
+        public int IntervalSeconds;
+        public int ReturnedSlots;
+        public int InvalidSlots;
+        public readonly List<HistorySample> Samples = new List<HistorySample>();
     }
 
     public static class HistorySampleSet
@@ -60,11 +68,16 @@ namespace DeltaVHistoryCLI
 
     public class HistorianClient : IDisposable
     {
+        private static readonly object MemberAccessorLock = new object();
+        private static readonly Dictionary<string, MemberAccessor> MemberAccessors =
+            new Dictionary<string, MemberAccessor>(StringComparer.OrdinalIgnoreCase);
         private readonly string _deltaVRoot;
         private readonly HistorianLog _log;
         private object _readInterface;
         private object _connection;
-        private MethodInfo _readRaw;
+        private MethodInfo _readProcessed;
+        private object _processedSampleType;
+        private object _interpolatedAggregate;
         private int _connectionHandle = -1;
         private string _assemblyDirectory;
         private bool _resolverAttached;
@@ -80,46 +93,6 @@ namespace DeltaVHistoryCLI
             get { return _connectionHandle; }
         }
 
-        public static int Probe(string deltaVRoot, HistorianLog log)
-        {
-            HistorianClient client = new HistorianClient(deltaVRoot, log);
-            try
-            {
-                Assembly assembly = client.LoadDvCHAssembly();
-                Console.WriteLine("Assembly: " + assembly.FullName);
-                Console.WriteLine();
-                Type[] types = assembly.GetTypes();
-                int typeIndex;
-                for (typeIndex = 0; typeIndex < types.Length; typeIndex++)
-                {
-                    Type type = types[typeIndex];
-                    string fullName = type.FullName == null ? "" : type.FullName;
-                    if (fullName.IndexOf("DvCH", StringComparison.OrdinalIgnoreCase) < 0 &&
-                        fullName.IndexOf("RawHistory", StringComparison.OrdinalIgnoreCase) < 0)
-                        continue;
-                    Console.WriteLine("=== " + fullName + " ===");
-                    MethodInfo[] methods = type.GetMethods(
-                        BindingFlags.Public | BindingFlags.NonPublic |
-                        BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly);
-                    int methodIndex;
-                    for (methodIndex = 0; methodIndex < methods.Length; methodIndex++)
-                        Console.WriteLine("  " + MethodSignature(methods[methodIndex]));
-                }
-                return 0;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("PROBE ERROR: " + ex.Message);
-                if (log != null)
-                    log("Probe failed: " + ex.Message);
-                return 20;
-            }
-            finally
-            {
-                client.Dispose();
-            }
-        }
-
         public void Connect(string server)
         {
             if (_connection != null)
@@ -131,6 +104,7 @@ namespace DeltaVHistoryCLI
             _resolverAttached = true;
 
             Assembly assembly = LoadDvCHAssembly();
+            LoadDeltaVAssembly("DeltaV.Historian.Data.dll");
             Type accessType = FindTypeBySimpleName(assembly, "DvCHDataAccess");
             if (accessType == null)
                 throw new Exception("Type DvCHDataAccess was not found.");
@@ -167,9 +141,21 @@ namespace DeltaVHistoryCLI
             if (_connection == null)
                 throw new Exception("Could not obtain DvCH read connection.");
 
-            _readRaw = FindCompatibleMethod(_connection.GetType(), "readRaw", 6);
-            if (_readRaw == null)
-                throw new Exception("Six-argument readRaw() overload was not found.");
+            _readProcessed = FindCompatibleMethod(_connection.GetType(), "readProcessed", 4);
+            if (_readProcessed == null)
+                throw new Exception("Four-argument readProcessed() overload was not found.");
+            ParameterInfo[] processedParameters = _readProcessed.GetParameters();
+            _processedSampleType = EnumOrNumber(
+                processedParameters[2].ParameterType,
+                "AllSamples",
+                3);
+            Type aggregateType = FindLoadedType("DeltaV.Historian.Data.Aggregate");
+            if (aggregateType == null || !aggregateType.IsEnum)
+                throw new Exception("DeltaV Historian Aggregate enum was not found.");
+            _interpolatedAggregate = Enum.Parse(
+                aggregateType,
+                "InterpolatedValue",
+                true);
         }
 
         public List<TagResult> ResolveTags(List<string> names)
@@ -209,84 +195,26 @@ namespace DeltaVHistoryCLI
             return result;
         }
 
-        public List<HistorySample> ReadRaw(
+        public ProcessedHistoryResult ReadProcessed(
             TagResult tag,
             DateTime start,
             DateTime end,
-            int maxSamples,
-            bool autoSplit)
+            int intervalSeconds)
         {
             EnsureConnected();
+            if (_readProcessed == null)
+                throw new MissingMethodException(
+                    _connection.GetType().FullName,
+                    "readProcessed");
             if (tag == null)
                 throw new ArgumentNullException("tag");
             if (tag.Status != 1)
                 throw new ArgumentException("Tag is not valid.", "tag");
             if (start >= end)
                 throw new ArgumentException("Start time must be earlier than end time.");
-            if (maxSamples <= 0)
-                throw new ArgumentOutOfRangeException("maxSamples");
+            if (intervalSeconds <= 0)
+                throw new ArgumentOutOfRangeException("intervalSeconds");
 
-            List<HistorySample> rows = new List<HistorySample>();
-            ReadRangeRecursive(tag, start, end, maxSamples, autoSplit, 0, rows);
-            return HistorySampleSet.Normalize(rows);
-        }
-
-        public void Dispose()
-        {
-            if (_readInterface != null && _connectionHandle >= 0)
-                TryInvoke(_readInterface, "closeConnection", new object[] { _connectionHandle });
-            _connectionHandle = -1;
-            _connection = null;
-            _readRaw = null;
-            _readInterface = null;
-            if (_resolverAttached)
-            {
-                AppDomain.CurrentDomain.AssemblyResolve -= CurrentDomainAssemblyResolve;
-                _resolverAttached = false;
-            }
-        }
-
-        private void ReadRangeRecursive(
-            TagResult tag,
-            DateTime start,
-            DateTime end,
-            int maxSamples,
-            bool autoSplit,
-            int depth,
-            List<HistorySample> output)
-        {
-            RawHistorySegment segment = ReadRawSegment(tag, start, end, maxSamples);
-            if (segment.Truncated && autoSplit && depth < 20 && end.Subtract(start).TotalSeconds > 2.0)
-            {
-                DateTime middle = start.AddTicks((end.Ticks - start.Ticks) / 2);
-                WriteLog(
-                    "Truncated; split depth " + depth.ToString(CultureInfo.InvariantCulture) +
-                    ": " + start.ToString("yyyy-MM-dd HH:mm:ss") +
-                    " -> " + end.ToString("yyyy-MM-dd HH:mm:ss"));
-                Console.WriteLine(
-                    "  Truncated  : split " + start.ToString("MM-dd HH:mm:ss") +
-                    " .. " + end.ToString("MM-dd HH:mm:ss"));
-                ReadRangeRecursive(tag, start, middle, maxSamples, true, depth + 1, output);
-                ReadRangeRecursive(tag, middle, end, maxSamples, true, depth + 1, output);
-                return;
-            }
-            if (segment.Truncated)
-            {
-                throw new Exception(
-                    "Historian result is still truncated after automatic splitting. " +
-                    "The incomplete segment was rejected: " +
-                    start.ToString("yyyy-MM-dd HH:mm:ss.fffffff") + " -> " +
-                    end.ToString("yyyy-MM-dd HH:mm:ss.fffffff"));
-            }
-            output.AddRange(segment.Rows);
-        }
-
-        private RawHistorySegment ReadRawSegment(
-            TagResult tag,
-            DateTime start,
-            DateTime end,
-            int maxSamples)
-        {
             int timeSpanHandle = -1;
             try
             {
@@ -298,53 +226,68 @@ namespace DeltaVHistoryCLI
                     new object[] { timeSpanHandle });
                 SetHistorianAbsoluteTime(timeSpan, "setAbsoluteStartTime", start);
                 SetHistorianAbsoluteTime(timeSpan, "setAbsoluteEndTime", end);
+                SetHistorianResampleInterval(timeSpan, TimeSpan.FromSeconds(intervalSeconds));
 
-                ParameterInfo[] parameters = _readRaw.GetParameters();
-                object raw = _readRaw.Invoke(
+                ArrayList aggregates = new ArrayList();
+                aggregates.Add(_interpolatedAggregate);
+
+                object processed = _readProcessed.Invoke(
                     _connection,
                     new object[]
                     {
                         timeSpanHandle,
                         tag.Handle,
-                        EnumOrNumber(parameters[2].ParameterType, "AllSamples", 3),
-                        EnumOrNumber(parameters[3].ParameterType, "None", 0),
-                        EnumOrNumber(parameters[4].ParameterType, "None", 0),
-                        maxSamples
+                        _processedSampleType,
+                        aggregates
                     });
-                if (raw == null)
-                    throw new Exception("readRaw() returned null.");
+                if (processed == null)
+                    throw new Exception("readProcessed() returned null.");
 
-                RawHistorySegment segment = new RawHistorySegment();
-                segment.Truncated = ToBool(GetMemberValue(raw, "dataTruncated"), false);
-                IEnumerable samples = GetMemberValue(raw, "dataSamples") as IEnumerable;
-                if (samples == null)
-                    throw new Exception("RawHistorySamples.dataSamples is not enumerable.");
+                ProcessedHistoryResult readResult = new ProcessedHistoryResult();
+                readResult.Aggregate = "InterpolatedValue";
+                readResult.IntervalSeconds = intervalSeconds;
+                readResult.ReturnedSlots = ToInt32(
+                    GetMemberValue(processed, "nSamples"), 0);
 
-                foreach (object point in samples)
+                IEnumerable aggregateResults = GetMemberValue(processed, "dataSamples") as IEnumerable;
+                if (aggregateResults == null)
+                    throw new Exception("ProcessedHistorySamples.dataSamples is not enumerable.");
+
+                int aggregateCount = 0;
+                foreach (object aggregateResult in aggregateResults)
                 {
-                    if (point == null)
-                        continue;
-                    DateTime timestamp;
-                    object rawTimestamp = GetMemberValue(point, "timestamp");
-                    if (rawTimestamp is DateTime)
-                        timestamp = (DateTime)rawTimestamp;
-                    else if (!DateTime.TryParse(
-                        rawTimestamp == null ? "" : rawTimestamp.ToString(),
-                        out timestamp))
-                        continue;
-
-                    HistorySample sample = new HistorySample();
-                    sample.Tag = tag.Name;
-                    sample.Timestamp = timestamp;
-                    sample.Value = FormatValue(GetMemberValue(point, "value"));
-                    object dataType = GetMemberValue(point, "dataType");
-                    sample.DataType = dataType == null ? "" : dataType.ToString();
-                    sample.Flags = BuildFlags(point);
-                    sample.SequenceNo = FormatValue(GetMemberValue(point, "sequenceNo"));
-                    sample.ArchiveStatus = FormatValue(GetMemberValue(point, "archiveStatus"));
-                    segment.Rows.Add(sample);
+                    aggregateCount++;
+                    if (aggregateCount > 1)
+                        throw new Exception("readProcessed() returned more than one aggregate result.");
+                    IEnumerable samples = aggregateResult as IEnumerable;
+                    if (samples == null)
+                        throw new Exception("Processed aggregate result is not enumerable.");
+                    foreach (object point in samples)
+                    {
+                        if (point == null)
+                            continue;
+                        object archiveStatus = GetMemberValue(point, "archiveStatus");
+                        if (HasArchiveStatusFlag(archiveStatus, 16))
+                        {
+                            readResult.InvalidSlots++;
+                            continue;
+                        }
+                        HistorySample sample = BuildHistorySample(tag.Name, point);
+                        if (sample != null)
+                        {
+                            sample.Timestamp = ToCollectorLocalTime(sample.Timestamp);
+                            sample.SequenceNo = BuildProcessedSequence(intervalSeconds);
+                            readResult.Samples.Add(sample);
+                        }
+                    }
                 }
-                return segment;
+                if (aggregateCount != 1)
+                    throw new Exception("readProcessed() did not return the requested aggregate.");
+
+                List<HistorySample> normalized = HistorySampleSet.Normalize(readResult.Samples);
+                readResult.Samples.Clear();
+                readResult.Samples.AddRange(normalized);
+                return readResult;
             }
             finally
             {
@@ -353,15 +296,36 @@ namespace DeltaVHistoryCLI
             }
         }
 
+        public void Dispose()
+        {
+            if (_readInterface != null && _connectionHandle >= 0)
+                TryInvoke(_readInterface, "closeConnection", new object[] { _connectionHandle });
+            _connectionHandle = -1;
+            _connection = null;
+            _readProcessed = null;
+            _processedSampleType = null;
+            _interpolatedAggregate = null;
+            _readInterface = null;
+            if (_resolverAttached)
+            {
+                AppDomain.CurrentDomain.AssemblyResolve -= CurrentDomainAssemblyResolve;
+                _resolverAttached = false;
+            }
+        }
+
         private void EnsureConnected()
         {
-            if (_connection == null || _readInterface == null || _readRaw == null)
+            if (_connection == null || _readInterface == null || _readProcessed == null)
                 throw new InvalidOperationException("HistorianClient is not connected.");
         }
 
         private Assembly LoadDvCHAssembly()
         {
-            const string fileName = "DeltaV.Historian.DvCHDataAccess.dll";
+            return LoadDeltaVAssembly("DeltaV.Historian.DvCHDataAccess.dll");
+        }
+
+        private Assembly LoadDeltaVAssembly(string fileName)
+        {
             string assemblyPath = null;
             string local = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, fileName);
             if (File.Exists(local))
@@ -391,8 +355,8 @@ namespace DeltaVHistoryCLI
                 throw new FileNotFoundException(fileName + " was not found under " + _deltaVRoot + ".");
 
             _assemblyDirectory = Path.GetDirectoryName(assemblyPath);
-            Console.WriteLine("DvCH DLL    : " + assemblyPath);
-            WriteLog("Loading DvCH: " + assemblyPath);
+            Console.WriteLine("DeltaV DLL  : " + assemblyPath);
+            WriteLog("Loading DeltaV assembly: " + assemblyPath);
             return Assembly.LoadFrom(assemblyPath);
         }
 
@@ -471,34 +435,6 @@ namespace DeltaVHistoryCLI
             return FindMethod(type, name, false, parameterCount);
         }
 
-        private static string MethodSignature(MethodInfo method)
-        {
-            try
-            {
-                ParameterInfo[] parameters = method.GetParameters();
-                StringBuilder text = new StringBuilder();
-                text.Append(method.ReturnType.FullName);
-                text.Append(" ");
-                text.Append(method.Name);
-                text.Append("(");
-                int index;
-                for (index = 0; index < parameters.Length; index++)
-                {
-                    if (index > 0)
-                        text.Append(", ");
-                    text.Append(parameters[index].ParameterType.FullName);
-                    text.Append(" ");
-                    text.Append(parameters[index].Name);
-                }
-                text.Append(")");
-                return text.ToString();
-            }
-            catch
-            {
-                return method.Name;
-            }
-        }
-
         private object InvokeNamed(object target, string methodName, object[] args)
         {
             if (target == null)
@@ -546,16 +482,46 @@ namespace DeltaVHistoryCLI
         {
             if (instance == null)
                 return null;
-            BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
             Type type = instance.GetType();
+            string key = type.AssemblyQualifiedName + "|" + name;
+            MemberAccessor accessor;
+            lock (MemberAccessorLock)
+            {
+                if (!MemberAccessors.TryGetValue(key, out accessor))
+                {
+                    accessor = FindMemberAccessor(type, name);
+                    MemberAccessors.Add(key, accessor);
+                }
+            }
+            if (accessor == null)
+                return null;
+            try
+            {
+                if (accessor.Property != null)
+                    return accessor.Property.GetValue(instance, null);
+                if (accessor.Field != null)
+                    return accessor.Field.GetValue(instance);
+                return accessor.Getter.Invoke(instance, null);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static MemberAccessor FindMemberAccessor(Type type, string name)
+        {
+            BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic |
+                BindingFlags.Instance;
             PropertyInfo[] properties = type.GetProperties(flags);
             int i;
             for (i = 0; i < properties.Length; i++)
             {
                 if (String.Equals(properties[i].Name, name, StringComparison.OrdinalIgnoreCase))
                 {
-                    try { return properties[i].GetValue(instance, null); }
-                    catch { }
+                    MemberAccessor accessor = new MemberAccessor();
+                    accessor.Property = properties[i];
+                    return accessor;
                 }
             }
             FieldInfo[] fields = type.GetFields(flags);
@@ -563,17 +529,96 @@ namespace DeltaVHistoryCLI
             {
                 if (String.Equals(fields[i].Name, name, StringComparison.OrdinalIgnoreCase))
                 {
-                    try { return fields[i].GetValue(instance); }
-                    catch { }
+                    MemberAccessor accessor = new MemberAccessor();
+                    accessor.Field = fields[i];
+                    return accessor;
                 }
             }
             MethodInfo getter = type.GetMethod("get_" + name, flags);
             if (getter != null)
             {
-                try { return getter.Invoke(instance, null); }
-                catch { }
+                MemberAccessor accessor = new MemberAccessor();
+                accessor.Getter = getter;
+                return accessor;
             }
             return null;
+        }
+
+        private static HistorySample BuildHistorySample(string tagName, object point)
+        {
+            DateTime timestamp;
+            object rawTimestamp = GetMemberValue(point, "timestamp");
+            if (rawTimestamp is DateTime)
+                timestamp = (DateTime)rawTimestamp;
+            else if (!DateTime.TryParse(
+                rawTimestamp == null ? "" : rawTimestamp.ToString(),
+                out timestamp))
+                return null;
+
+            HistorySample sample = new HistorySample();
+            sample.Tag = tagName;
+            sample.Timestamp = timestamp;
+            sample.Value = FormatValue(GetMemberValue(point, "value"));
+            object dataType = GetMemberValue(point, "dataType");
+            sample.DataType = dataType == null ? "" : dataType.ToString();
+            sample.Flags = BuildFlags(point);
+            sample.SequenceNo = FormatValue(GetMemberValue(point, "sequenceNo"));
+            sample.ArchiveStatus = FormatValue(GetMemberValue(point, "archiveStatus"));
+            return sample;
+        }
+
+        private static DateTime ToCollectorLocalTime(DateTime timestamp)
+        {
+            if (timestamp.Kind == DateTimeKind.Utc)
+                return timestamp.ToLocalTime();
+            return timestamp;
+        }
+
+        private static string BuildProcessedSequence(int intervalSeconds)
+        {
+            return "P:InterpolatedValue:" +
+                intervalSeconds.ToString(CultureInfo.InvariantCulture);
+        }
+
+        private static Type FindLoadedType(string fullName)
+        {
+            Type direct = Type.GetType(fullName + ", DeltaV.Historian.Data", false);
+            if (direct != null)
+                return direct;
+            Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            int index;
+            for (index = 0; index < assemblies.Length; index++)
+            {
+                Type found = assemblies[index].GetType(fullName, false, true);
+                if (found != null)
+                    return found;
+            }
+            return null;
+        }
+
+        private static bool HasArchiveStatusFlag(object value, int flag)
+        {
+            if (value == null)
+                return false;
+            try
+            {
+                int numeric = Convert.ToInt32(value, CultureInfo.InvariantCulture);
+                return (numeric & flag) != 0;
+            }
+            catch
+            {
+                return value.ToString().IndexOf(
+                    "AggregateValueInvalid",
+                    StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+        }
+
+        private static int ToInt32(object value, int defaultValue)
+        {
+            if (value == null)
+                return defaultValue;
+            try { return Convert.ToInt32(value, CultureInfo.InvariantCulture); }
+            catch { return defaultValue; }
         }
 
         private static void SetHistorianAbsoluteTime(object timeSpan, string methodName, DateTime localTime)
@@ -601,6 +646,35 @@ namespace DeltaVHistoryCLI
             else
                 throw new Exception(methodName + "() expects unsupported time type: " + effectiveType.FullName);
             method.Invoke(timeSpan, new object[] { converted });
+        }
+
+        private static void SetHistorianResampleInterval(object timeSpan, TimeSpan interval)
+        {
+            MethodInfo[] methods = timeSpan.GetType().GetMethods(
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            int index;
+            for (index = 0; index < methods.Length; index++)
+            {
+                if (!String.Equals(
+                    methods[index].Name,
+                    "setResampleInterval",
+                    StringComparison.OrdinalIgnoreCase))
+                    continue;
+                ParameterInfo[] parameters = methods[index].GetParameters();
+                if (parameters.Length != 1)
+                    continue;
+                Type parameterType = parameters[0].ParameterType.IsByRef ?
+                    parameters[0].ParameterType.GetElementType() :
+                    parameters[0].ParameterType;
+                if (parameterType == typeof(TimeSpan))
+                {
+                    methods[index].Invoke(timeSpan, new object[] { interval });
+                    return;
+                }
+            }
+            throw new MissingMethodException(
+                timeSpan.GetType().FullName,
+                "setResampleInterval(TimeSpan)");
         }
 
         private static object EnumOrNumber(Type type, string preferredName, int fallbackValue)
@@ -648,10 +722,12 @@ namespace DeltaVHistoryCLI
                 _log(message);
         }
 
-        private class RawHistorySegment
+        private class MemberAccessor
         {
-            public readonly List<HistorySample> Rows = new List<HistorySample>();
-            public bool Truncated;
+            public PropertyInfo Property;
+            public FieldInfo Field;
+            public MethodInfo Getter;
         }
+
     }
 }
