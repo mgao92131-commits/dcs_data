@@ -33,6 +33,7 @@ type receiverConfig struct {
 	WriteTimeout         time.Duration
 	Inbox                string
 	Archive              string
+	ArchivePending       string
 	Staging              string
 	Rejected             string
 	Logs                 string
@@ -109,7 +110,7 @@ func main() {
 		log.Fatal("change [Server] ApiKey in receiver.ini before starting the Receiver")
 	}
 
-	for _, directory := range []string{config.Inbox, config.Archive, config.Staging, config.Rejected, config.Logs} {
+	for _, directory := range []string{config.Inbox, config.Archive, config.ArchivePending, config.Staging, config.Rejected, config.Logs} {
 		if err := os.MkdirAll(directory, 0750); err != nil {
 			log.Fatal(err)
 		}
@@ -246,20 +247,36 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		} else if found {
-			receiveStarted := time.Now()
-			actualHash, bodyBytes, err := hashBody(r.Body, s.config.MaxBodyBytes)
-			receiveElapsed := time.Since(receiveStarted)
-			if errors.Is(err, errBodyTooLarge) {
-				writeError(w, http.StatusRequestEntityTooLarge, err.Error())
-				return
+			s.hashAndAckExisting(w, r, headers, ack, started)
+			return
+		}
+	} else if s.importer != nil && s.importer.pool != nil {
+		lookupTimeout := s.config.ImportTimeout
+		if lookupTimeout <= 0 {
+			lookupTimeout = 45 * time.Second
+		}
+		lookupContext, cancel := context.WithTimeout(r.Context(), lookupTimeout)
+		found, err := s.importer.findImportedBatch(
+			lookupContext,
+			headers.BatchID,
+			headers.SHA256,
+			headers.Rows)
+		cancel()
+		if err != nil {
+			if errors.Is(err, errBatchConflict) {
+				writeError(w, http.StatusConflict, err.Error())
+			} else {
+				writeError(w, http.StatusServiceUnavailable, "PostgreSQL idempotency lookup failed")
 			}
-			if err != nil || bodyBytes == 0 || !strings.EqualFold(actualHash, headers.SHA256) {
-				writeError(w, http.StatusBadRequest, "retry body does not match existing batch")
-				return
-			}
-			s.logBatchTiming(headers, bodyBytes, receiveElapsed, 0, nil, time.Since(started))
-			s.logger.Printf("idempotent ACK batch=%s rows=%d", headers.BatchID, headers.Rows)
-			writeJSON(w, http.StatusOK, ack)
+			return
+		}
+		if found {
+			s.hashAndAckExisting(
+				w,
+				r,
+				headers,
+				makeAck(headers, "database"),
+				started)
 			return
 		}
 	}
@@ -357,8 +374,27 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		s.commitMu.Lock()
 		batch, importErr := s.importer.importPreparedBatch(r.Context(), batch)
-		if importErr == nil {
-			importErr = s.importer.moveToArchive(tempDir, headers.BatchID)
+		if importErr == nil && !batch.AlreadyCommitted {
+			if archiveErr := s.importer.moveToArchive(tempDir, headers.BatchID); archiveErr != nil {
+				s.logger.Printf(
+					"WARNING: PostgreSQL committed batch=%s but archive move failed: %v",
+					headers.BatchID,
+					archiveErr)
+				if pendingErr := s.moveToArchivePending(tempDir, headers.BatchID); pendingErr != nil {
+					s.logger.Printf(
+						"WARNING: archive_pending move failed batch=%s; staging retained: %v",
+						headers.BatchID,
+						pendingErr)
+				} else {
+					s.logger.Printf(
+						"WARNING: PostgreSQL committed batch=%s; payload moved to archive_pending",
+						headers.BatchID)
+				}
+			}
+		} else if importErr == nil && batch.AlreadyCommitted {
+			s.logger.Printf(
+				"idempotent database commit observed while importing batch=%s; archive move skipped",
+				headers.BatchID)
 		}
 		s.commitMu.Unlock()
 		if importErr != nil {
@@ -377,7 +413,9 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "PostgreSQL commit failed")
 			return
 		}
-		keepTemp = true
+		if !batch.AlreadyCommitted {
+			keepTemp = true
+		}
 		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, batch.Timings, time.Since(started))
 		s.logger.Printf(
 			"committed PostgreSQL batch=%s collector=%s rows=%d bytes=%d elapsed=%s",
@@ -403,6 +441,46 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 		bodyBytes,
 		time.Since(started).Round(time.Millisecond))
 	writeJSON(w, http.StatusOK, ack)
+}
+
+func (s *receiverServer) hashAndAckExisting(
+	w http.ResponseWriter,
+	r *http.Request,
+	headers batchHeaders,
+	ack ackResponse,
+	started time.Time,
+) {
+	receiveStarted := time.Now()
+	actualHash, bodyBytes, err := hashBody(r.Body, s.config.MaxBodyBytes)
+	receiveElapsed := time.Since(receiveStarted)
+	if errors.Is(err, errBodyTooLarge) {
+		writeError(w, http.StatusRequestEntityTooLarge, err.Error())
+		return
+	}
+	if err != nil || bodyBytes == 0 || !strings.EqualFold(actualHash, headers.SHA256) {
+		writeError(w, http.StatusBadRequest, "retry body does not match existing batch")
+		return
+	}
+	s.logBatchTiming(headers, bodyBytes, receiveElapsed, 0, nil, time.Since(started))
+	s.logger.Printf(
+		"idempotent ACK batch=%s rows=%d commit_level=%s",
+		headers.BatchID,
+		headers.Rows,
+		ack.CommitLevel)
+	writeJSON(w, http.StatusOK, ack)
+}
+
+func (s *receiverServer) moveToArchivePending(source, batchID string) error {
+	if s.config.ArchivePending == "" {
+		return errors.New("archive pending directory is not configured")
+	}
+	if err := os.MkdirAll(s.config.ArchivePending, 0750); err != nil {
+		return err
+	}
+	destination := filepath.Join(
+		s.config.ArchivePending,
+		batchID+"_"+strconv.FormatInt(time.Now().UnixNano(), 10))
+	return os.Rename(source, destination)
 }
 
 func (s *receiverServer) logBatchTiming(
@@ -769,6 +847,7 @@ func loadReceiverConfig(path, baseDir string) (receiverConfig, error) {
 		WriteTimeout:         time.Duration(writeTimeoutSeconds) * time.Second,
 		Inbox:                resolvePath(baseDir, valueOr(values, "Files.Inbox", "inbox")),
 		Archive:              resolvePath(baseDir, valueOr(values, "Files.Archive", "archive")),
+		ArchivePending:       resolvePath(baseDir, valueOr(values, "Files.ArchivePending", "archive_pending")),
 		Staging:              resolvePath(baseDir, valueOr(values, "Files.Staging", "staging")),
 		Rejected:             resolvePath(baseDir, valueOr(values, "Files.Rejected", "rejected")),
 		Logs:                 resolvePath(baseDir, valueOr(values, "Files.Logs", "logs")),

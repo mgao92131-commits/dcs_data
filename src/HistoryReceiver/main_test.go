@@ -158,6 +158,37 @@ func TestArchivedBatchRemainsIdempotent(t *testing.T) {
 	}
 }
 
+func TestMoveToArchiveDoesNotCreateDuplicateDirectory(t *testing.T) {
+	root := t.TempDir()
+	archive := filepath.Join(root, "archive")
+	source := filepath.Join(root, "staging")
+	batchID := "already_archived"
+	if err := os.MkdirAll(filepath.Join(archive, batchID), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(source, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "data.csv"), []byte("payload"), 0640); err != nil {
+		t.Fatal(err)
+	}
+
+	importer := &batchImporter{archive: archive}
+	if err := importer.moveToArchive(source, batchID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(source); !os.IsNotExist(err) {
+		t.Fatalf("duplicate source was not removed: %v", err)
+	}
+	entries, err := os.ReadDir(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != batchID {
+		t.Fatalf("expected one archive directory, got %v", entries)
+	}
+}
+
 func TestReceiverTimeoutDefaultsAreOrdered(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "receiver.ini")
@@ -265,15 +296,16 @@ func newTestReceiver(t *testing.T) (*receiverServer, string) {
 	t.Helper()
 	root := t.TempDir()
 	config := receiverConfig{
-		APIKey:       "test-secret",
-		MaxBodyBytes: 1024 * 1024,
-		Inbox:        filepath.Join(root, "inbox"),
-		Archive:      filepath.Join(root, "archive"),
-		Staging:      filepath.Join(root, "staging"),
-		Rejected:     filepath.Join(root, "rejected"),
-		Logs:         filepath.Join(root, "logs"),
+		APIKey:         "test-secret",
+		MaxBodyBytes:   1024 * 1024,
+		Inbox:          filepath.Join(root, "inbox"),
+		Archive:        filepath.Join(root, "archive"),
+		ArchivePending: filepath.Join(root, "archive_pending"),
+		Staging:        filepath.Join(root, "staging"),
+		Rejected:       filepath.Join(root, "rejected"),
+		Logs:           filepath.Join(root, "logs"),
 	}
-	for _, directory := range []string{config.Inbox, config.Archive, config.Staging, config.Rejected, config.Logs} {
+	for _, directory := range []string{config.Inbox, config.Archive, config.ArchivePending, config.Staging, config.Rejected, config.Logs} {
 		if err := os.MkdirAll(directory, 0750); err != nil {
 			t.Fatal(err)
 		}

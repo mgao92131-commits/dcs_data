@@ -26,7 +26,8 @@ Reliability behavior:
   Pending batches are retried oldest-first for BacklogDrainSeconds. The
   default safety limit is 50 batches or 100 MiB. When the limit is reached,
   state.ini records CollectionPaused=true and the continuous host remains
-  alive without reading more Historian data. After the Receiver recovers and
+  alive without reading more Historian data. The paused state retries only the
+  pending drain every PendingRetrySeconds. After the Receiver recovers and
   pending drains, collection resumes automatically.
 
   Each physical window reuses one Historian TimeSpan for serial Processed tag

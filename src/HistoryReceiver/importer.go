@@ -57,12 +57,13 @@ type importTimings struct {
 }
 
 type importBatch struct {
-	BatchID     string
-	CollectorID string
-	SHA256      string
-	Rows        int
-	Data        []importRow
-	Timings     *importTimings
+	BatchID          string
+	CollectorID      string
+	SHA256           string
+	Rows             int
+	Data             []importRow
+	Timings          *importTimings
+	AlreadyCommitted bool
 }
 
 const historySamplesUpsertSQL = `INSERT INTO history_samples
@@ -170,7 +171,7 @@ func (i *batchImporter) importOnce(ctx context.Context) (int, int, error) {
 		}
 		if err == nil {
 			batchCtx, cancel := context.WithTimeout(ctx, i.importTimeout)
-			err = i.importBatch(batchCtx, batch)
+			err = i.importBatch(batchCtx, &batch)
 			cancel()
 		}
 		if err == nil {
@@ -221,7 +222,7 @@ func (i *batchImporter) importPreparedBatch(ctx context.Context, batch importBat
 		batch.Timings = &importTimings{}
 	}
 	batchCtx, cancel := context.WithTimeout(ctx, i.importTimeout)
-	err := i.importBatch(batchCtx, batch)
+	err := i.importBatch(batchCtx, &batch)
 	cancel()
 	if err != nil {
 		return batch, err
@@ -358,7 +359,40 @@ func parseImportRows(source io.Reader, collectorID string, timezone *time.Locati
 	return rows, nil
 }
 
-func (i *batchImporter) importBatch(ctx context.Context, batch importBatch) error {
+func (i *batchImporter) findImportedBatch(
+	ctx context.Context,
+	batchID string,
+	sha256Text string,
+	rows int,
+) (bool, error) {
+	if i == nil || i.pool == nil {
+		return false, errors.New("PostgreSQL importer is unavailable")
+	}
+	var existingHash string
+	var existingRows int
+	err := i.pool.QueryRow(
+		ctx,
+		"SELECT sha256, row_count FROM imported_batches WHERE batch_id=$1",
+		batchID).Scan(&existingHash, &existingRows)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !strings.EqualFold(strings.TrimSpace(existingHash), sha256Text) || existingRows != rows {
+		return true, errBatchConflict
+	}
+	return true, nil
+}
+
+func (i *batchImporter) importBatch(ctx context.Context, batch *importBatch) error {
+	if i == nil || i.pool == nil {
+		return errors.New("PostgreSQL importer is unavailable")
+	}
+	if batch == nil {
+		return errors.New("import batch is nil")
+	}
 	var existingHash string
 	var existingRows int
 	err := i.pool.QueryRow(
@@ -367,6 +401,7 @@ func (i *batchImporter) importBatch(ctx context.Context, batch importBatch) erro
 		batch.BatchID).Scan(&existingHash, &existingRows)
 	if err == nil {
 		if strings.EqualFold(strings.TrimSpace(existingHash), batch.SHA256) && existingRows == batch.Rows {
+			batch.AlreadyCommitted = true
 			return nil
 		}
 		return errBatchConflict
@@ -467,8 +502,14 @@ func (i *batchImporter) importBatch(ctx context.Context, batch importBatch) erro
 
 func (i *batchImporter) moveToArchive(source, batchID string) error {
 	destination := filepath.Join(i.archive, batchID)
-	if _, err := os.Stat(destination); err == nil {
-		destination += "_duplicate_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if info, err := os.Stat(destination); err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("archive destination exists but is not a directory: %s", destination)
+		}
+		if err := os.RemoveAll(source); err != nil {
+			return fmt.Errorf("remove duplicate archive source: %w", err)
+		}
+		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}

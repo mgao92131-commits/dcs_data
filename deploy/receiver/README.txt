@@ -26,5 +26,10 @@ The receiver hashes, stages, validates, and converts a normal HTTP CSV body in
 one pass. Synchronous PostgreSQL import reuses those parsed rows; restart
 recovery uses the durable staged CSV.
 
-The receiver stores runtime inbox/archive/staging/rejected/logs beside the
+In synchronous mode, PostgreSQL COMMIT is the ACK boundary. If archive moving
+fails after COMMIT, the receiver returns database ACK and retains the payload
+under archive_pending for maintenance. An already committed retry verifies
+only the body hash and does not create another archive directory.
+
+The receiver stores runtime inbox/archive/archive_pending/staging/rejected/logs beside the
 executable. These directories and receiver.ini are not release artifacts.

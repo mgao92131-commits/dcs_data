@@ -38,7 +38,8 @@ Receiver binaries, or database files.
 - Receiver failures retain durable pending batches and retry them in oldest-first
   drain mode for `[Receiver] BacklogDrainSeconds`.
 - Collection pauses at the pending safety limit instead of reading more
-  Historian data; the continuous host stays alive and retries the drain.
+  Historian data; the continuous host stays alive and retries the drain every
+  `[Receiver] PendingRetrySeconds`.
 - The continuous schedule is fixed start-to-start, and the default overlap is
   60 seconds.
 - Each collection window reuses one configured Historian TimeSpan across the
@@ -46,6 +47,10 @@ Receiver binaries, or database files.
   de-duplication after Core normalization.
 - Receiver CSV staging computes SHA-256, validates/converts rows, and writes
   staging in one HTTP-body pass; synchronous database import reuses those rows.
+- Synchronous database retries query `imported_batches`, hash the body only,
+  and return database ACK without re-parsing or creating duplicate archives.
+- PostgreSQL COMMIT is the synchronous ACK boundary; archive failures are
+  logged and retained under `archive_pending` without returning a false 503.
 - Pending files are sent by stream with HTTP KeepAlive, and PostgreSQL skips
   no-op overlap updates using conditional UPSERT predicates.
 - Batch timing logs include Historian read, encoding, send, ACK wait, total,

@@ -49,6 +49,32 @@ namespace DeltaVHistoryCLI
                 Assert(futureWait == 300000 && overdueWait == 0,
                     "fixed start-to-start schedule delay");
 
+                string timingRoot = Path.Combine(
+                    Path.GetTempPath(),
+                    "HistorySyncTimingSelfTest_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(timingRoot);
+                try
+                {
+                    string timingConfig = Path.Combine(timingRoot, "config.ini");
+                    File.WriteAllText(
+                        timingConfig,
+                        "[Sync]\nIntervalMinutes=5\n[Receiver]\nPendingRetrySeconds=30\n");
+                    int pendingRetryMilliseconds = (int)InvokePrivate(
+                        typeof(SyncProgram),
+                        "ReadPendingRetryMilliseconds",
+                        new object[] {
+                            new string[] { "run", "--config", timingConfig },
+                            timingRoot
+                        });
+                    Assert(pendingRetryMilliseconds == 30000,
+                        "paused pending retry schedule");
+                }
+                finally
+                {
+                    try { Directory.Delete(timingRoot, true); }
+                    catch { }
+                }
+
                 TimeSpan slice = (TimeSpan)InvokePrivate(
                     typeof(SyncProgram),
                     "CalculateEffectiveSlice",

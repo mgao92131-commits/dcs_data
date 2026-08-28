@@ -48,6 +48,7 @@ func TestSynchronousCommitEndToEnd(t *testing.T) {
 		MaxBodyBytes:      1024 * 1024,
 		Inbox:             filepath.Join(root, "inbox"),
 		Archive:           filepath.Join(root, "archive"),
+		ArchivePending:    filepath.Join(root, "archive_pending"),
 		Staging:           filepath.Join(root, "staging"),
 		Rejected:          filepath.Join(root, "rejected"),
 		PostgresEnabled:   true,
@@ -57,7 +58,7 @@ func TestSynchronousCommitEndToEnd(t *testing.T) {
 		ImportBatchSize:   500,
 		MaxBatchesPerPass: 20,
 	}
-	for _, directory := range []string{config.Inbox, config.Archive, config.Staging, config.Rejected} {
+	for _, directory := range []string{config.Inbox, config.Archive, config.ArchivePending, config.Staging, config.Rejected} {
 		if err := os.MkdirAll(directory, 0750); err != nil {
 			t.Fatal(err)
 		}
@@ -76,12 +77,13 @@ func TestSynchronousCommitEndToEnd(t *testing.T) {
 	defer httpServer.Close()
 
 	batchID := "integration_" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	failureBatchID := batchID + "_archive_failure"
 	body := integrationCSV(time.Now().UTC().Truncate(time.Microsecond))
 	defer func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
-		_, _ = pool.Exec(cleanupCtx, "DELETE FROM history_samples WHERE batch_id=$1", batchID)
-		_, _ = pool.Exec(cleanupCtx, "DELETE FROM imported_batches WHERE batch_id=$1", batchID)
+		_, _ = pool.Exec(cleanupCtx, "DELETE FROM history_samples WHERE batch_id IN ($1, $2)", batchID, failureBatchID)
+		_, _ = pool.Exec(cleanupCtx, "DELETE FROM imported_batches WHERE batch_id IN ($1, $2)", batchID, failureBatchID)
 	}()
 
 	endpoint := httpServer.URL + "/api/history/batch"
@@ -120,6 +122,48 @@ func TestSynchronousCommitEndToEnd(t *testing.T) {
 	}
 	if !ack.OK || !ack.Committed || ack.CommitLevel != "database" {
 		t.Fatalf("unexpected retry ACK: %+v", ack)
+	}
+	archiveEntries, err := os.ReadDir(filepath.Join(root, "archive"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archiveEntries) != 1 || archiveEntries[0].Name() != batchID {
+		t.Fatalf("idempotent retry created duplicate archive entries: %v", archiveEntries)
+	}
+
+	archiveBlocker := filepath.Join(root, "archive-blocker")
+	if err := os.WriteFile(archiveBlocker, []byte("not a directory"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	importer.archive = archiveBlocker
+	status, responseBody = postIntegrationBatch(t, endpoint, failureBatchID, body)
+	if status != http.StatusOK {
+		t.Fatalf("archive failure must not turn a committed batch into 503: status=%d body=%s", status, responseBody)
+	}
+	if err := json.Unmarshal(responseBody, &ack); err != nil {
+		t.Fatal(err)
+	}
+	if !ack.OK || !ack.Committed || ack.CommitLevel != "database" {
+		t.Fatalf("unexpected ACK after archive failure: %+v", ack)
+	}
+	pendingEntries, err := os.ReadDir(filepath.Join(root, "archive_pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pendingEntries) != 1 {
+		t.Fatalf("expected one archive_pending batch, got %d", len(pendingEntries))
+	}
+
+	status, responseBody = postIntegrationBatch(t, endpoint, failureBatchID, body)
+	if status != http.StatusOK {
+		t.Fatalf("database fast retry after archive failure failed: status=%d body=%s", status, responseBody)
+	}
+	pendingEntries, err = os.ReadDir(filepath.Join(root, "archive_pending"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pendingEntries) != 1 {
+		t.Fatalf("database fast retry created another archive_pending copy: %d", len(pendingEntries))
 	}
 
 }
@@ -177,7 +221,7 @@ func TestBulkImport49600Rows(t *testing.T) {
 		SHA256: strings.Repeat("a", 64), Rows: rowCount, Data: rows,
 	}
 	started := time.Now()
-	if err := importer.importBatch(ctx, insertBatch); err != nil {
+	if err := importer.importBatch(ctx, &insertBatch); err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("bulk insert rows=%d elapsed=%s", rowCount, time.Since(started).Round(time.Millisecond))
@@ -194,7 +238,7 @@ func TestBulkImport49600Rows(t *testing.T) {
 		BatchID: noopBatchID, CollectorID: collectorID,
 		SHA256: strings.Repeat("c", 64), Rows: rowCount, Data: rows,
 	}
-	if err := importer.importBatch(ctx, noopBatch); err != nil {
+	if err := importer.importBatch(ctx, &noopBatch); err != nil {
 		t.Fatal(err)
 	}
 	var afterReceivedAt time.Time
@@ -218,7 +262,7 @@ func TestBulkImport49600Rows(t *testing.T) {
 		SHA256: strings.Repeat("b", 64), Rows: rowCount, Data: rows,
 	}
 	started = time.Now()
-	if err := importer.importBatch(ctx, updateBatch); err != nil {
+	if err := importer.importBatch(ctx, &updateBatch); err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("bulk update rows=%d elapsed=%s", rowCount, time.Since(started).Round(time.Millisecond))

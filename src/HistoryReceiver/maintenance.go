@@ -31,6 +31,9 @@ func runMaintenancePass(config receiverConfig, logger *log.Logger, now time.Time
 	if entries, err := os.ReadDir(config.Rejected); err == nil && len(entries) > 0 {
 		logger.Printf("WARNING: rejected batches require attention count=%d", len(entries))
 	}
+	if entries, err := os.ReadDir(config.ArchivePending); err == nil && len(entries) > 0 {
+		logger.Printf("WARNING: archive_pending batches require attention count=%d", len(entries))
+	}
 }
 
 func removeOldEntries(root string, cutoff time.Time, directories bool) int {

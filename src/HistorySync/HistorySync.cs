@@ -143,7 +143,7 @@ namespace DeltaVHistoryCLI
 
     class SyncProgram
     {
-        private const string Version = "3.2-send-performance";
+        private const string Version = "3.2.1-reliability";
         private const int CollectionPausedExitCode = 45;
         private const string MutexName = "Global\\DeltaVHistorySync";
         private const string ContinuousStopEventName =
@@ -274,6 +274,7 @@ namespace DeltaVHistoryCLI
                 {
                     int intervalMilliseconds = ReadRunIntervalMilliseconds(args, baseDirectory);
                     DateTime nextStart = DateTime.Now;
+                    bool retryMode = false;
                     Console.WriteLine("HistorySync continuous host started. Press Ctrl+C to stop.");
                     while (WaitHandle.WaitAny(stopHandles, 0, false) == WaitHandle.WaitTimeout)
                     {
@@ -291,7 +292,23 @@ namespace DeltaVHistoryCLI
                             "Sync cycle exit code=" +
                             result.ToString(CultureInfo.InvariantCulture));
 
-                        nextStart = nextStart.AddMilliseconds(intervalMilliseconds);
+                        bool collectionPaused = result == CollectionPausedExitCode ||
+                            IsCollectionPaused(args, baseDirectory);
+                        if (collectionPaused)
+                        {
+                            retryMode = true;
+                            nextStart = DateTime.Now.AddMilliseconds(
+                                ReadPendingRetryMilliseconds(args, baseDirectory));
+                        }
+                        else if (retryMode)
+                        {
+                            retryMode = false;
+                            nextStart = DateTime.Now.AddMilliseconds(intervalMilliseconds);
+                        }
+                        else
+                        {
+                            nextStart = nextStart.AddMilliseconds(intervalMilliseconds);
+                        }
                         intervalMilliseconds = ReadRunIntervalMilliseconds(args, baseDirectory);
                         if (WaitHandle.WaitAny(
                             stopHandles,
@@ -311,17 +328,52 @@ namespace DeltaVHistoryCLI
 
         private static int ReadRunIntervalMilliseconds(string[] args, string baseDirectory)
         {
-            string configText = FindOption(args, "--config");
-            string configPath = ResolvePath(
-                baseDirectory,
-                configText == null ? "config.ini" : configText);
-            IniConfig config = IniConfig.Load(configPath);
+            IniConfig config = LoadContinuousConfig(args, baseDirectory);
             int minutes = ParsePositiveInt(
                 config.Get("Sync", "IntervalMinutes", null),
                 "[Sync] IntervalMinutes");
             if (minutes > 1440)
                 throw new Exception("[Sync] IntervalMinutes cannot exceed 1440.");
             return checked(minutes * 60 * 1000);
+        }
+
+        private static int ReadPendingRetryMilliseconds(string[] args, string baseDirectory)
+        {
+            IniConfig config = LoadContinuousConfig(args, baseDirectory);
+            int seconds = ParsePositiveInt(
+                config.Get("Receiver", "PendingRetrySeconds", "30"),
+                "[Receiver] PendingRetrySeconds");
+            if (seconds > 86400)
+                throw new Exception("[Receiver] PendingRetrySeconds cannot exceed 86400.");
+            return checked(seconds * 1000);
+        }
+
+        private static bool IsCollectionPaused(string[] args, string baseDirectory)
+        {
+            try
+            {
+                IniConfig config = LoadContinuousConfig(args, baseDirectory);
+                string statePath = ResolvePath(
+                    baseDirectory,
+                    config.Get("Files", "State", "state.ini"));
+                if (!File.Exists(statePath))
+                    return false;
+                SyncState state = new SyncStateStore(statePath).LoadOrCreate(DateTime.Now);
+                return state.CollectionPaused;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static IniConfig LoadContinuousConfig(string[] args, string baseDirectory)
+        {
+            string configText = FindOption(args, "--config");
+            string configPath = ResolvePath(
+                baseDirectory,
+                configText == null ? "config.ini" : configText);
+            return IniConfig.Load(configPath);
         }
 
         private static int CalculateWaitMilliseconds(DateTime nextStart, DateTime now)

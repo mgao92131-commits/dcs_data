@@ -56,7 +56,8 @@ The sender drains the oldest pending batches continuously until the configured
 allowed while a transient failure leaves pending space available. Once the
 pending batch/byte safety limit is reached, or a healthy Receiver cannot drain
 the backlog within its budget, the state records `CollectionPaused=true` and
-the cycle does not read more Historian data. The continuous host remains alive.
+the cycle does not read more Historian data. The continuous host remains alive
+and retries only the pending drain on the shorter `PendingRetrySeconds` cycle.
 
 After a successful drain, the state clears `CollectionPaused` and collection
 resumes from the durable Historian checkpoint. The default pending limits are
@@ -75,9 +76,16 @@ parse, COPY, upsert, commit, and total timings.
 
 The Receiver hashes, stages, validates, and converts the incoming CSV while
 reading the HTTP body. Synchronous database ACK reuses those parsed rows
-instead of reopening the CSV; durable inbox recovery reparses the staged CSV
-when needed. PostgreSQL uses conditional `IS DISTINCT FROM` updates so an
-overlap retry with identical values does not create an UPDATE/WAL record.
+instead of reopening the CSV; a synchronous retry first checks
+`imported_batches`, hashes the body only, and returns a database ACK without
+parsing or creating a duplicate archive. Durable inbox recovery reparses the
+staged CSV when needed. PostgreSQL uses conditional `IS DISTINCT FROM` updates
+so an overlap retry with identical values does not create an UPDATE/WAL record.
+
+In synchronous mode, PostgreSQL COMMIT is the ACK boundary. Archive movement
+is auxiliary: if it fails after COMMIT, the Receiver logs a warning, moves the
+payload to `archive_pending` when possible, and still returns
+`commit_level=database`.
 
 Pending files are hashed once and then sent from a FileStream with HTTP
 KeepAlive enabled. The wire CSV, Receiver, PostgreSQL, spool, and ACK formats
