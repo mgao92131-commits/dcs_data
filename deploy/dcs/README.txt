@@ -21,6 +21,17 @@ Setup:
 5. Run scripts\status.cmd, then start-historysync.cmd in the package root for
    hidden background collection. Run stop-historysync.cmd to stop it.
 
+Reliability behavior:
+
+  Pending batches are retried oldest-first for BacklogDrainSeconds. The
+  default safety limit is 50 batches or 100 MiB. When the limit is reached,
+  state.ini records CollectionPaused=true and the continuous host remains
+  alive without reading more Historian data. After the Receiver recovers and
+  pending drains, collection resumes automatically.
+
+  Each physical window reuses one Historian TimeSpan for serial Processed tag
+  reads. Pending data is hashed once and sent from a stream over KeepAlive.
+
 Commands:
 
   start-historysync.cmd

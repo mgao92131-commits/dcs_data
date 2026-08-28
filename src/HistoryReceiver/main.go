@@ -5,13 +5,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"hash"
 	"io"
 	"log"
 	"net"
@@ -32,6 +30,7 @@ type receiverConfig struct {
 	Listen               string
 	APIKey               string
 	MaxBodyBytes         int64
+	WriteTimeout         time.Duration
 	Inbox                string
 	Archive              string
 	Staging              string
@@ -44,6 +43,7 @@ type receiverConfig struct {
 	SynchronousCommit bool
 	PostgresURL       string
 	PostgresTimezone  string
+	PostgresLocation  *time.Location
 	ImportInterval    time.Duration
 	ImportTimeout     time.Duration
 	ImportBatchSize   int
@@ -81,6 +81,10 @@ type ackResponse struct {
 type errorResponse struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error"`
+}
+
+func durationMilliseconds(value time.Duration) int64 {
+	return int64(value / time.Millisecond)
 }
 
 var safeID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,180}$`)
@@ -169,7 +173,7 @@ func main() {
 		Handler:           server.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      config.WriteTimeout,
 		IdleTimeout:       60 * time.Second,
 	}
 
@@ -242,7 +246,9 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		} else if found {
+			receiveStarted := time.Now()
 			actualHash, bodyBytes, err := hashBody(r.Body, s.config.MaxBodyBytes)
+			receiveElapsed := time.Since(receiveStarted)
 			if errors.Is(err, errBodyTooLarge) {
 				writeError(w, http.StatusRequestEntityTooLarge, err.Error())
 				return
@@ -251,6 +257,7 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusBadRequest, "retry body does not match existing batch")
 				return
 			}
+			s.logBatchTiming(headers, bodyBytes, receiveElapsed, 0, nil, time.Since(started))
 			s.logger.Printf("idempotent ACK batch=%s rows=%d", headers.BatchID, headers.Rows)
 			writeJSON(w, http.StatusOK, ack)
 			return
@@ -272,30 +279,56 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	dataPath := filepath.Join(tempDir, "data.csv")
-	actualHash, bodyBytes, err := saveBody(dataPath, r.Body, s.config.MaxBodyBytes)
+	staged, err := stageAndParseBody(
+		dataPath,
+		r.Body,
+		s.config.MaxBodyBytes,
+		headers.CollectorID,
+		s.config.PostgresLocation)
 	if err != nil {
+		s.logBatchTiming(
+			headers,
+			staged.BodyBytes,
+			staged.Receive,
+			0,
+			staged.timings(),
+			time.Since(started))
 		if errors.Is(err, errBodyTooLarge) {
 			writeError(w, http.StatusRequestEntityTooLarge, err.Error())
-		} else {
-			writeError(w, http.StatusBadRequest, err.Error())
+			return
 		}
+		if staged.ActualHash == "" && !errors.Is(err, errInvalidBatch) {
+			writeError(w, http.StatusInternalServerError, "cannot stage batch body")
+			return
+		}
+		if !strings.EqualFold(staged.ActualHash, headers.SHA256) {
+			s.reject(tempDir, headers.BatchID, "sha256")
+			keepTemp = true
+			writeError(w, http.StatusBadRequest, "SHA-256 mismatch")
+			return
+		}
+		if errors.Is(err, errInvalidBatch) {
+			s.reject(tempDir, headers.BatchID, "csv")
+			keepTemp = true
+			writeError(w, http.StatusBadRequest, "invalid CSV: "+err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "cannot stage batch body")
 		return
 	}
+	actualHash := staged.ActualHash
+	bodyBytes := staged.BodyBytes
 	if !strings.EqualFold(actualHash, headers.SHA256) {
+		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, staged.timings(), time.Since(started))
 		s.reject(tempDir, headers.BatchID, "sha256")
 		keepTemp = true
 		writeError(w, http.StatusBadRequest, "SHA-256 mismatch")
 		return
 	}
 
-	rows, err := validateCSV(dataPath)
-	if err != nil {
-		s.reject(tempDir, headers.BatchID, "csv")
-		keepTemp = true
-		writeError(w, http.StatusBadRequest, "invalid CSV: "+err.Error())
-		return
-	}
+	rows := len(staged.Rows)
 	if rows != headers.Rows {
+		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, staged.timings(), time.Since(started))
 		s.reject(tempDir, headers.BatchID, "rows")
 		keepTemp = true
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("row count mismatch: expected %d, got %d", headers.Rows, rows))
@@ -303,22 +336,33 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := writeReceiverMeta(filepath.Join(tempDir, "meta.ini"), headers, bodyBytes); err != nil {
+		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, staged.timings(), time.Since(started))
 		writeError(w, http.StatusInternalServerError, "cannot write batch metadata")
 		return
 	}
 
 	if s.config.SynchronousCommit {
 		if s.importer == nil {
+			s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, staged.timings(), time.Since(started))
 			writeError(w, http.StatusServiceUnavailable, "database importer is unavailable")
 			return
 		}
+		batch := importBatch{
+			BatchID:     headers.BatchID,
+			CollectorID: headers.CollectorID,
+			SHA256:      actualHash,
+			Rows:        rows,
+			Data:        staged.Rows,
+			Timings:     staged.timings(),
+		}
 		s.commitMu.Lock()
-		batch, importErr := s.importer.importDirectory(r.Context(), tempDir)
+		batch, importErr := s.importer.importPreparedBatch(r.Context(), batch)
 		if importErr == nil {
 			importErr = s.importer.moveToArchive(tempDir, headers.BatchID)
 		}
 		s.commitMu.Unlock()
 		if importErr != nil {
+			s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, batch.Timings, time.Since(started))
 			s.logger.Printf("synchronous import failed batch=%s error=%v", headers.BatchID, importErr)
 			if errors.Is(importErr, errInvalidBatch) {
 				s.reject(tempDir, headers.BatchID, "invalid")
@@ -334,6 +378,7 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		keepTemp = true
+		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, batch.Timings, time.Since(started))
 		s.logger.Printf(
 			"committed PostgreSQL batch=%s collector=%s rows=%d bytes=%d elapsed=%s",
 			batch.BatchID, headers.CollectorID, rows, bodyBytes,
@@ -344,10 +389,12 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 
 	ack, err := s.commit(tempDir, headers)
 	if err != nil {
+		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, staged.timings(), time.Since(started))
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 	keepTemp = true
+	s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, staged.timings(), time.Since(started))
 	s.logger.Printf(
 		"committed batch=%s collector=%s rows=%d bytes=%d elapsed=%s",
 		headers.BatchID,
@@ -356,6 +403,43 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 		bodyBytes,
 		time.Since(started).Round(time.Millisecond))
 	writeJSON(w, http.StatusOK, ack)
+}
+
+func (s *receiverServer) logBatchTiming(
+	headers batchHeaders,
+	bodyBytes int64,
+	receive time.Duration,
+	validate time.Duration,
+	timings *importTimings,
+	total time.Duration,
+) {
+	if s.logger == nil {
+		return
+	}
+	parseMs := int64(0)
+	copyMs := int64(0)
+	upsertMs := int64(0)
+	commitMs := int64(0)
+	if timings != nil {
+		parseMs = durationMilliseconds(timings.Parse)
+		copyMs = durationMilliseconds(timings.Copy)
+		upsertMs = durationMilliseconds(timings.Upsert)
+		commitMs = durationMilliseconds(timings.Commit)
+	}
+	totalMs := durationMilliseconds(total)
+	s.logger.Printf(
+		"batch timing batch_id=%s rows=%d bytes=%d elapsed=%dms ReceiveMs=%d ValidateMs=%d ParseMs=%d CopyMs=%d UpsertMs=%d CommitMs=%d TotalMs=%d",
+		headers.BatchID,
+		headers.Rows,
+		bodyBytes,
+		totalMs,
+		durationMilliseconds(receive),
+		durationMilliseconds(validate),
+		parseMs,
+		copyMs,
+		upsertMs,
+		commitMs,
+		totalMs)
 }
 
 func (s *receiverServer) commit(tempDir string, headers batchHeaders) (ackResponse, error) {
@@ -455,6 +539,101 @@ func parseBatchHeaders(r *http.Request) (batchHeaders, error) {
 
 var errBodyTooLarge = errors.New("request body is too large")
 
+type stagedBatch struct {
+	ActualHash string
+	BodyBytes  int64
+	Rows       []importRow
+	Receive    time.Duration
+	Parse      time.Duration
+}
+
+func (b stagedBatch) timings() *importTimings {
+	return &importTimings{Parse: b.Parse}
+}
+
+type stagingReader struct {
+	source      io.Reader
+	sink        io.Writer
+	Bytes       int64
+	ReadElapsed time.Duration
+	SourceError error
+	SinkError   error
+}
+
+func (r *stagingReader) Read(buffer []byte) (int, error) {
+	started := time.Now()
+	count, readErr := r.source.Read(buffer)
+	r.ReadElapsed += time.Since(started)
+	if count > 0 {
+		written, writeErr := r.sink.Write(buffer[:count])
+		r.Bytes += int64(written)
+		if writeErr != nil {
+			r.SinkError = writeErr
+			return written, writeErr
+		}
+		if written != count {
+			r.SinkError = io.ErrShortWrite
+			return written, io.ErrShortWrite
+		}
+	}
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		r.SourceError = readErr
+	}
+	return count, readErr
+}
+
+func stageAndParseBody(
+	path string,
+	body io.Reader,
+	maximum int64,
+	collectorID string,
+	timezone *time.Location,
+) (stagedBatch, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0640)
+	if err != nil {
+		return stagedBatch{}, err
+	}
+	digest := sha256.New()
+	reader := &stagingReader{
+		source: io.LimitReader(body, maximum+1),
+		sink:   io.MultiWriter(file, digest),
+	}
+	parseStarted := time.Now()
+	rows, parseErr := parseImportRows(reader, collectorID, timezone)
+	if parseErr != nil {
+		_, drainErr := io.Copy(io.Discard, reader)
+		if drainErr != nil && reader.SourceError == nil && reader.SinkError == nil {
+			parseErr = drainErr
+		}
+	}
+	parseElapsed := time.Since(parseStarted)
+	if reader.SourceError != nil {
+		parseErr = reader.SourceError
+	}
+	if reader.SinkError != nil {
+		parseErr = reader.SinkError
+	}
+	if parseErr == nil && reader.Bytes > maximum {
+		parseErr = errBodyTooLarge
+	}
+	if syncErr := file.Sync(); parseErr == nil && syncErr != nil {
+		parseErr = syncErr
+	}
+	if closeErr := file.Close(); parseErr == nil && closeErr != nil {
+		parseErr = closeErr
+	}
+	if reader.Bytes > maximum {
+		parseErr = errBodyTooLarge
+	}
+	return stagedBatch{
+		ActualHash: hex.EncodeToString(digest.Sum(nil)),
+		BodyBytes:  reader.Bytes,
+		Rows:       rows,
+		Receive:    reader.ReadElapsed,
+		Parse:      parseElapsed,
+	}, parseErr
+}
+
 func hashBody(body io.Reader, maximum int64) (string, int64, error) {
 	digest := sha256.New()
 	written, err := io.Copy(digest, io.LimitReader(body, maximum+1))
@@ -462,63 +641,6 @@ func hashBody(body io.Reader, maximum int64) (string, int64, error) {
 		err = errBodyTooLarge
 	}
 	return hex.EncodeToString(digest.Sum(nil)), written, err
-}
-
-func saveBody(path string, body io.Reader, maximum int64) (string, int64, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0640)
-	if err != nil {
-		return "", 0, err
-	}
-	var digest hash.Hash = sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(file, digest), io.LimitReader(body, maximum+1))
-	if copyErr == nil && written > maximum {
-		copyErr = errBodyTooLarge
-	}
-	if syncErr := file.Sync(); copyErr == nil && syncErr != nil {
-		copyErr = syncErr
-	}
-	if closeErr := file.Close(); copyErr == nil && closeErr != nil {
-		copyErr = closeErr
-	}
-	if copyErr != nil {
-		return "", written, copyErr
-	}
-	return hex.EncodeToString(digest.Sum(nil)), written, nil
-}
-
-func validateCSV(path string) (int, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	defer file.Close()
-
-	reader := csv.NewReader(bufio.NewReader(file))
-	reader.FieldsPerRecord = 7
-	header, err := reader.Read()
-	if err != nil {
-		return 0, err
-	}
-	header[0] = strings.TrimPrefix(header[0], "\ufeff")
-	expected := []string{"Tag", "Timestamp", "Value", "DataType", "Flags", "SequenceNo", "ArchiveStatus"}
-	for i := range expected {
-		if header[i] != expected[i] {
-			return 0, errors.New("unexpected CSV header")
-		}
-	}
-
-	rows := 0
-	for {
-		_, err := reader.Read()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return 0, err
-		}
-		rows++
-	}
-	return rows, nil
 }
 
 func writeReceiverMeta(path string, h batchHeaders, bodyBytes int64) error {
@@ -593,6 +715,10 @@ func loadReceiverConfig(path, baseDir string) (receiverConfig, error) {
 	if err != nil || maximum <= 0 {
 		return receiverConfig{}, errors.New("invalid [Server] MaxBodyBytes")
 	}
+	writeTimeoutSeconds, err := strconv.Atoi(valueOr(values, "Server.WriteTimeoutSeconds", "60"))
+	if err != nil || writeTimeoutSeconds <= 0 {
+		return receiverConfig{}, errors.New("invalid [Server] WriteTimeoutSeconds")
+	}
 	postgresEnabled, err := parseBool(valueOr(values, "PostgreSQL.Enabled", "false"))
 	if err != nil {
 		return receiverConfig{}, fmt.Errorf("invalid [PostgreSQL] Enabled: %w", err)
@@ -603,6 +729,11 @@ func loadReceiverConfig(path, baseDir string) (receiverConfig, error) {
 	}
 	if synchronousCommit && !postgresEnabled {
 		return receiverConfig{}, errors.New("SynchronousCommit requires PostgreSQL Enabled=true")
+	}
+	postgresTimezone := valueOr(values, "PostgreSQL.Timezone", "Asia/Shanghai")
+	postgresLocation, err := time.LoadLocation(postgresTimezone)
+	if err != nil {
+		return receiverConfig{}, fmt.Errorf("invalid PostgreSQL timezone %q: %w", postgresTimezone, err)
 	}
 	intervalSeconds, err := strconv.Atoi(valueOr(values, "PostgreSQL.ImportIntervalSeconds", "30"))
 	if err != nil || intervalSeconds <= 0 {
@@ -620,9 +751,12 @@ func loadReceiverConfig(path, baseDir string) (receiverConfig, error) {
 	if err != nil || logRetentionDays <= 0 {
 		return receiverConfig{}, errors.New("invalid [Maintenance] LogRetentionDays")
 	}
-	importTimeoutSeconds, err := strconv.Atoi(valueOr(values, "PostgreSQL.ImportTimeoutSeconds", "120"))
+	importTimeoutSeconds, err := strconv.Atoi(valueOr(values, "PostgreSQL.ImportTimeoutSeconds", "45"))
 	if err != nil || importTimeoutSeconds <= 0 {
 		return receiverConfig{}, errors.New("invalid [PostgreSQL] ImportTimeoutSeconds")
+	}
+	if synchronousCommit && importTimeoutSeconds >= writeTimeoutSeconds {
+		return receiverConfig{}, errors.New("[PostgreSQL] ImportTimeoutSeconds must be less than [Server] WriteTimeoutSeconds")
 	}
 	importBatchSize, err := strconv.Atoi(valueOr(values, "PostgreSQL.ImportBatchSize", "500"))
 	if err != nil || importBatchSize <= 0 || importBatchSize > 5000 {
@@ -632,6 +766,7 @@ func loadReceiverConfig(path, baseDir string) (receiverConfig, error) {
 		Listen:               valueOr(values, "Server.Listen", "0.0.0.0:8080"),
 		APIKey:               values["Server.ApiKey"],
 		MaxBodyBytes:         maximum,
+		WriteTimeout:         time.Duration(writeTimeoutSeconds) * time.Second,
 		Inbox:                resolvePath(baseDir, valueOr(values, "Files.Inbox", "inbox")),
 		Archive:              resolvePath(baseDir, valueOr(values, "Files.Archive", "archive")),
 		Staging:              resolvePath(baseDir, valueOr(values, "Files.Staging", "staging")),
@@ -641,7 +776,8 @@ func loadReceiverConfig(path, baseDir string) (receiverConfig, error) {
 		LogRetentionDays:     logRetentionDays,
 		PostgresEnabled:      postgresEnabled,
 		SynchronousCommit:    synchronousCommit,
-		PostgresTimezone:     valueOr(values, "PostgreSQL.Timezone", "Asia/Shanghai"),
+		PostgresTimezone:     postgresTimezone,
+		PostgresLocation:     postgresLocation,
 		ImportInterval:       time.Duration(intervalSeconds) * time.Second,
 		ImportTimeout:        time.Duration(importTimeoutSeconds) * time.Second,
 		ImportBatchSize:      importBatchSize,

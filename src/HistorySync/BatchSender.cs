@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Net;
@@ -9,21 +10,31 @@ using System.Text.RegularExpressions;
 
 namespace DeltaVHistoryCLI
 {
+    class BatchSendTimings
+    {
+        public long SendMilliseconds;
+        public long AckWaitMilliseconds;
+        public long TotalMilliseconds;
+    }
+
     class BatchSendException : Exception
     {
         public readonly int StatusCode;
         public readonly bool Permanent;
         public readonly bool AuthenticationFailure;
+        public readonly BatchSendTimings Timings;
 
         public BatchSendException(
             string message,
             int statusCode,
             bool permanent,
-            bool authenticationFailure) : base(message)
+            bool authenticationFailure,
+            BatchSendTimings timings) : base(message)
         {
             StatusCode = statusCode;
             Permanent = permanent;
             AuthenticationFailure = authenticationFailure;
+            Timings = timings;
         }
     }
 
@@ -34,6 +45,9 @@ namespace DeltaVHistoryCLI
         public string CommitLevel;
         public DateTime RangeStart;
         public DateTime RangeEnd;
+        public int Rows;
+        public long PayloadBytes;
+        public BatchSendTimings Timings;
     }
 
     delegate void BatchAcknowledged(BatchReceipt receipt);
@@ -50,10 +64,11 @@ namespace DeltaVHistoryCLI
         private string _url;
         private string _apiKey;
         private int _timeoutMilliseconds;
-        private int _maxBatches;
+        private long _backlogDrainMilliseconds;
         private string _ackMode;
         private string _spoolDirectory;
         private SyncLogger _log;
+        private BatchSendTimings _lastTimings;
 
         public BatchSender(
             IniConfig config,
@@ -62,8 +77,9 @@ namespace DeltaVHistoryCLI
         {
             _url = config.Get("Receiver", "Url", "");
             _apiKey = config.Get("Receiver", "ApiKey", "");
-            _timeoutMilliseconds = config.GetInt("Receiver", "TimeoutSeconds", 15) * 1000;
-            _maxBatches = config.GetInt("Receiver", "MaxBatchesPerRun", 20);
+            _timeoutMilliseconds = checked(config.GetInt("Receiver", "TimeoutSeconds", 75) * 1000);
+            int drainSeconds = config.GetInt("Receiver", "BacklogDrainSeconds", 60);
+            _backlogDrainMilliseconds = checked((long)drainSeconds * 1000L);
             _ackMode = config.Get("Receiver", "AckMode", "inbox").ToLowerInvariant();
             _spoolDirectory = spoolDirectory;
             _log = log;
@@ -74,8 +90,13 @@ namespace DeltaVHistoryCLI
                 throw new Exception("[Receiver] ApiKey is required when Sender is enabled.");
             if (_ackMode != "inbox" && _ackMode != "database")
                 throw new Exception("[Receiver] AckMode must be inbox or database.");
-            if (_timeoutMilliseconds <= 0 || _maxBatches <= 0)
-                throw new Exception("Receiver timeout and MaxBatchesPerRun must be positive.");
+            if (_timeoutMilliseconds <= 0 || drainSeconds <= 0)
+                throw new Exception("Receiver timeout and BacklogDrainSeconds must be positive.");
+        }
+
+        public BatchSendTimings LastTimings
+        {
+            get { return _lastTimings; }
         }
 
         public BatchReceipt Send(HistoryBatch batch, byte[] data)
@@ -84,21 +105,26 @@ namespace DeltaVHistoryCLI
                 throw new ArgumentNullException("batch");
             if (data == null)
                 throw new ArgumentNullException("data");
-            string actualHash = BatchEncoder.ComputeSha256(data);
-            if (!String.IsNullOrEmpty(batch.Sha256) &&
-                !String.Equals(batch.Sha256, actualHash, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException("In-memory batch SHA-256 mismatch.");
+            string actualHash = batch.Sha256;
+            if (String.IsNullOrEmpty(actualHash))
+                actualHash = BatchEncoder.ComputeSha256(data);
+            else
+                ValidateSha256(actualHash);
             batch.Sha256 = actualHash;
-            return SendPayload(
-                batch.BatchId,
-                batch.CollectorId,
-                batch.Mode,
-                batch.Server,
-                FormatTime(batch.RangeStart),
-                FormatTime(batch.RangeEnd),
-                batch.Samples.Count,
-                actualHash,
-                data);
+            using (MemoryStream input = new MemoryStream(data, false))
+            {
+                return SendPayload(
+                    batch.BatchId,
+                    batch.CollectorId,
+                    batch.Mode,
+                    batch.Server,
+                    FormatTime(batch.RangeStart),
+                    FormatTime(batch.RangeEnd),
+                    batch.Samples.Count,
+                    actualHash,
+                    input,
+                    data.Length);
+            }
         }
 
         public int SendPending()
@@ -117,12 +143,19 @@ namespace DeltaVHistoryCLI
 
             List<PendingBatch> batches = GetPendingBatches(pendingRoot);
 
-            int limit = batches.Count < _maxBatches ? batches.Count : _maxBatches;
+            Stopwatch drainClock = Stopwatch.StartNew();
             int sent = 0;
-            int i;
-            for (i = 0; i < limit; i++)
+            while (batches.Count > 0)
             {
-                string batchDirectory = batches[i].Directory;
+                if (sent > 0 && drainClock.ElapsedMilliseconds >= _backlogDrainMilliseconds)
+                {
+                    _log.Write(
+                        "Sender drain time limit reached seconds=" +
+                        (_backlogDrainMilliseconds / 1000L).ToString(CultureInfo.InvariantCulture));
+                    break;
+                }
+
+                string batchDirectory = batches[0].Directory;
                 string batchName = Path.GetFileName(batchDirectory);
                 try
                 {
@@ -131,7 +164,14 @@ namespace DeltaVHistoryCLI
                         acknowledged(receipt);
                     Directory.Delete(batchDirectory, true);
                     sent++;
-                    _log.Write("Removed acknowledged outbox batch=" + batchName);
+                    _log.Write(
+                        "Removed acknowledged outbox batch=" + batchName +
+                        " rows=" + receipt.Rows.ToString(CultureInfo.InvariantCulture) +
+                        " bytes=" + receipt.PayloadBytes.ToString(CultureInfo.InvariantCulture) +
+                        " SendMs=" + receipt.Timings.SendMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                        " AckWaitMs=" + receipt.Timings.AckWaitMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                        " TotalMs=" + receipt.Timings.TotalMilliseconds.ToString(CultureInfo.InvariantCulture));
+                    batches.RemoveAt(0);
                 }
                 catch (InvalidDataException ex)
                 {
@@ -165,8 +205,13 @@ namespace DeltaVHistoryCLI
                 }
             }
 
-            _log.Write("Sender completed sent=" + sent.ToString() + " remaining=" +
-                (Directory.GetDirectories(pendingRoot).Length).ToString());
+            PendingStats remaining = new SpoolStore(_spoolDirectory).GetPendingStats();
+            _log.Write(
+                "Sender completed drain=true sent=" +
+                sent.ToString(CultureInfo.InvariantCulture) +
+                " pendingBatches=" + remaining.Batches.ToString(CultureInfo.InvariantCulture) +
+                " pendingBytes=" + remaining.Bytes.ToString(CultureInfo.InvariantCulture) +
+                " elapsedMs=" + drainClock.ElapsedMilliseconds.ToString(CultureInfo.InvariantCulture));
             return 0;
         }
 
@@ -243,10 +288,6 @@ namespace DeltaVHistoryCLI
             if (!String.Equals(batchId, Path.GetFileName(batchDirectory), StringComparison.Ordinal))
                 throw new InvalidDataException("BatchId does not match its directory name.");
 
-            string actualHash = ComputeSha256(dataPath);
-            if (!String.Equals(expectedHash, actualHash, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException("Local data.csv SHA-256 does not match meta.ini.");
-
             ValidateHeader(batchId);
             ValidateHeader(collectorId);
             ValidateHeader(mode);
@@ -254,17 +295,31 @@ namespace DeltaVHistoryCLI
             ValidateHeader(start);
             ValidateHeader(end);
 
-            byte[] data = File.ReadAllBytes(dataPath);
-            return SendPayload(
-                batchId,
-                collectorId,
-                mode,
-                server,
-                start,
-                end,
-                expectedRows,
-                actualHash,
-                data);
+            using (FileStream input = new FileStream(
+                dataPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                65536,
+                FileOptions.SequentialScan))
+            {
+                long payloadBytes = input.Length;
+                string actualHash = ComputeSha256(input);
+                if (!String.Equals(expectedHash, actualHash, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("Local data.csv SHA-256 does not match meta.ini.");
+                input.Position = 0;
+                return SendPayload(
+                    batchId,
+                    collectorId,
+                    mode,
+                    server,
+                    start,
+                    end,
+                    expectedRows,
+                    actualHash,
+                    input,
+                    payloadBytes);
+            }
         }
 
         private BatchReceipt SendPayload(
@@ -276,82 +331,127 @@ namespace DeltaVHistoryCLI
             string end,
             int expectedRows,
             string actualHash,
-            byte[] data)
+            Stream data,
+            long payloadBytes)
         {
-            ValidateHeader(batchId);
-            ValidateHeader(collectorId);
-            ValidateHeader(mode);
-            ValidateHeader(server);
-            ValidateHeader(start);
-            ValidateHeader(end);
-
-            _log.Write("Sending batch=" + batchId + " rows=" + expectedRows.ToString());
-
-            HttpWebRequest request = (HttpWebRequest)WebRequest.Create(_url);
-            request.Method = "POST";
-            request.ContentType = "text/csv; charset=utf-8";
-            request.Timeout = _timeoutMilliseconds;
-            request.ReadWriteTimeout = _timeoutMilliseconds;
-            request.KeepAlive = false;
-            request.Headers[HttpRequestHeader.Authorization] = "Bearer " + _apiKey;
-            request.Headers["X-Collector-Id"] = collectorId;
-            request.Headers["X-Batch-Id"] = batchId;
-            request.Headers["X-Batch-Mode"] = mode;
-            request.Headers["X-Historian-Server"] = server;
-            request.Headers["X-Range-Start"] = start;
-            request.Headers["X-Range-End"] = end;
-            request.Headers["X-Row-Count"] = expectedRows.ToString(CultureInfo.InvariantCulture);
-            request.Headers["X-Content-SHA256"] = actualHash;
-
-            request.ContentLength = data.Length;
-
-            using (Stream output = request.GetRequestStream())
-            {
-                output.Write(data, 0, data.Length);
-                output.Flush();
-            }
-
-            string responseText;
-            HttpStatusCode status;
+            if (data == null)
+                throw new ArgumentNullException("data");
+            if (payloadBytes < 0)
+                throw new ArgumentOutOfRangeException("payloadBytes");
+            BatchSendTimings timings = new BatchSendTimings();
+            Stopwatch totalClock = Stopwatch.StartNew();
             try
             {
-                using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+                ValidateHeader(batchId);
+                ValidateHeader(collectorId);
+                ValidateHeader(mode);
+                ValidateHeader(server);
+                ValidateHeader(start);
+                ValidateHeader(end);
+
+                _log.Write("Sending batch=" + batchId + " rows=" + expectedRows.ToString(CultureInfo.InvariantCulture));
+
+                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(_url);
+                request.Method = "POST";
+                request.ContentType = "text/csv; charset=utf-8";
+                request.Timeout = _timeoutMilliseconds;
+                request.ReadWriteTimeout = _timeoutMilliseconds;
+                request.KeepAlive = true;
+                request.ServicePoint.Expect100Continue = false;
+                request.Headers[HttpRequestHeader.Authorization] = "Bearer " + _apiKey;
+                request.Headers["X-Collector-Id"] = collectorId;
+                request.Headers["X-Batch-Id"] = batchId;
+                request.Headers["X-Batch-Mode"] = mode;
+                request.Headers["X-Historian-Server"] = server;
+                request.Headers["X-Range-Start"] = start;
+                request.Headers["X-Range-End"] = end;
+                request.Headers["X-Row-Count"] = expectedRows.ToString(CultureInfo.InvariantCulture);
+                request.Headers["X-Content-SHA256"] = actualHash;
+                request.ContentLength = payloadBytes;
+
+                Stopwatch sendClock = Stopwatch.StartNew();
+                try
                 {
-                    status = response.StatusCode;
-                    using (StreamReader reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
-                        responseText = reader.ReadToEnd();
+                    using (Stream output = request.GetRequestStream())
+                    {
+                        CopyPayload(data, output, payloadBytes);
+                    }
+                }
+                finally
+                {
+                    sendClock.Stop();
+                    timings.SendMilliseconds = sendClock.ElapsedMilliseconds;
+                }
+
+                string responseText;
+                HttpStatusCode status;
+                Stopwatch ackClock = Stopwatch.StartNew();
+                try
+                {
+                    try
+                    {
+                        using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+                        {
+                            status = response.StatusCode;
+                            using (StreamReader reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+                                responseText = reader.ReadToEnd();
+                        }
+                    }
+                    catch (WebException ex)
+                    {
+                        HttpWebResponse response = ex.Response as HttpWebResponse;
+                        if (response == null)
+                            throw new Exception("Receiver connection failed: " + ex.Message);
+                        using (response)
+                        using (StreamReader reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+                            responseText = reader.ReadToEnd();
+                        int statusCode = (int)response.StatusCode;
+                        bool permanent = statusCode == 400 || statusCode == 409 || statusCode == 413;
+                        bool authentication = statusCode == 401 || statusCode == 403;
+                        throw new BatchSendException(
+                            "Receiver HTTP " + statusCode.ToString(CultureInfo.InvariantCulture) + ": " + responseText,
+                            statusCode,
+                            permanent,
+                            authentication,
+                            timings);
+                    }
+
+                    if (status != HttpStatusCode.OK)
+                        throw new Exception("Unexpected Receiver HTTP status: " + ((int)status).ToString(CultureInfo.InvariantCulture));
+
+                    string commitLevel = ValidateAck(responseText, batchId, actualHash, expectedRows);
+                    ackClock.Stop();
+                    timings.AckWaitMilliseconds = ackClock.ElapsedMilliseconds;
+                    timings.TotalMilliseconds = totalClock.ElapsedMilliseconds;
+                    BatchReceipt receipt = new BatchReceipt();
+                    receipt.BatchId = batchId;
+                    receipt.Mode = mode;
+                    receipt.CommitLevel = commitLevel;
+                    receipt.RangeStart = ParseTime(start);
+                    receipt.RangeEnd = ParseTime(end);
+                    receipt.Rows = expectedRows;
+                    receipt.PayloadBytes = payloadBytes;
+                    receipt.Timings = timings;
+                    _log.Write(
+                        "ACK batch=" + batchId +
+                        " rows=" + expectedRows.ToString(CultureInfo.InvariantCulture) +
+                        " SendMs=" + timings.SendMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                        " AckWaitMs=" + timings.AckWaitMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                        " TotalMs=" + timings.TotalMilliseconds.ToString(CultureInfo.InvariantCulture));
+                    return receipt;
+                }
+                finally
+                {
+                    ackClock.Stop();
+                    timings.AckWaitMilliseconds = ackClock.ElapsedMilliseconds;
                 }
             }
-            catch (WebException ex)
+            finally
             {
-                HttpWebResponse response = ex.Response as HttpWebResponse;
-                if (response == null)
-                    throw new Exception("Receiver connection failed: " + ex.Message);
-                using (response)
-                using (StreamReader reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
-                    responseText = reader.ReadToEnd();
-                int statusCode = (int)response.StatusCode;
-                bool permanent = statusCode == 400 || statusCode == 409 || statusCode == 413;
-                bool authentication = statusCode == 401 || statusCode == 403;
-                throw new BatchSendException(
-                    "Receiver HTTP " + statusCode.ToString() + ": " + responseText,
-                    statusCode,
-                    permanent,
-                    authentication);
+                totalClock.Stop();
+                timings.TotalMilliseconds = totalClock.ElapsedMilliseconds;
+                _lastTimings = timings;
             }
-
-            if (status != HttpStatusCode.OK)
-                throw new Exception("Unexpected Receiver HTTP status: " + ((int)status).ToString());
-
-            string commitLevel = ValidateAck(responseText, batchId, actualHash, expectedRows);
-            _log.Write("ACK batch=" + batchId + " rows=" + expectedRows.ToString());
-            BatchReceipt receipt = new BatchReceipt();
-            receipt.BatchId = batchId;
-            receipt.Mode = mode;
-            receipt.CommitLevel = commitLevel;
-            receipt.RangeStart = ParseTime(start);
-            receipt.RangeEnd = ParseTime(end);
-            return receipt;
         }
 
         private static string FormatTime(DateTime value)
@@ -447,10 +547,15 @@ namespace DeltaVHistoryCLI
                 throw new InvalidDataException("Batch metadata contains an invalid HTTP header value.");
         }
 
-        private static string ComputeSha256(string path)
+        private static void ValidateSha256(string value)
+        {
+            if (!Regex.IsMatch(value, "^[0-9a-fA-F]{64}$"))
+                throw new InvalidDataException("Batch SHA-256 must contain 64 hexadecimal characters.");
+        }
+
+        private static string ComputeSha256(Stream stream)
         {
             using (SHA256 sha = SHA256.Create())
-            using (FileStream stream = File.OpenRead(path))
             {
                 byte[] hash = sha.ComputeHash(stream);
                 StringBuilder text = new StringBuilder(hash.Length * 2);
@@ -459,6 +564,26 @@ namespace DeltaVHistoryCLI
                     text.Append(hash[i].ToString("x2", CultureInfo.InvariantCulture));
                 return text.ToString();
             }
+        }
+
+        private static void CopyPayload(Stream input, Stream output, long payloadBytes)
+        {
+            byte[] buffer = new byte[65536];
+            long remaining = payloadBytes;
+            while (remaining > 0)
+            {
+                int requested = remaining > buffer.Length
+                    ? buffer.Length
+                    : (int)remaining;
+                int read = input.Read(buffer, 0, requested);
+                if (read <= 0)
+                    throw new InvalidDataException("Payload stream ended before Content-Length.");
+                output.Write(buffer, 0, read);
+                remaining -= read;
+            }
+            if (input.Read(buffer, 0, 1) != 0)
+                throw new InvalidDataException("Payload stream is longer than Content-Length.");
+            output.Flush();
         }
     }
 }

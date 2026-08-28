@@ -10,6 +10,8 @@ namespace DeltaVHistoryCLI
         public DateTime LastCollectedEnd;
         public DateTime LastAcceptedEnd;
         public DateTime LastCommittedEnd;
+        public bool CollectionPaused;
+        public string PauseReason;
 
         public SyncState Copy()
         {
@@ -17,6 +19,8 @@ namespace DeltaVHistoryCLI
             copy.LastCollectedEnd = LastCollectedEnd;
             copy.LastAcceptedEnd = LastAcceptedEnd;
             copy.LastCommittedEnd = LastCommittedEnd;
+            copy.CollectionPaused = CollectionPaused;
+            copy.PauseReason = PauseReason;
             return copy;
         }
     }
@@ -59,6 +63,9 @@ namespace DeltaVHistoryCLI
             state.LastCommittedEnd = Parse(
                 config.Get("ContinuousSync", "LastCommittedEnd", ""),
                 "LastCommittedEnd");
+            state.CollectionPaused = config.GetBool(
+                "ContinuousSync", "CollectionPaused", false);
+            state.PauseReason = config.Get("ContinuousSync", "PauseReason", "");
             Validate(state);
             return state;
         }
@@ -85,6 +92,9 @@ namespace DeltaVHistoryCLI
                     writer.WriteLine("LastCollectedEnd=" + Format(state.LastCollectedEnd));
                     writer.WriteLine("LastAcceptedEnd=" + Format(state.LastAcceptedEnd));
                     writer.WriteLine("LastCommittedEnd=" + Format(state.LastCommittedEnd));
+                    writer.WriteLine("CollectionPaused=" +
+                        (state.CollectionPaused ? "true" : "false"));
+                    writer.WriteLine("PauseReason=" + SafeReason(state.PauseReason));
                     writer.Flush();
                     stream.Flush();
                 }
@@ -154,6 +164,13 @@ namespace DeltaVHistoryCLI
         private static string Format(DateTime value)
         {
             return value.ToString("yyyy-MM-dd HH:mm:ss.fffffff", CultureInfo.InvariantCulture);
+        }
+
+        private static string SafeReason(string value)
+        {
+            if (String.IsNullOrEmpty(value))
+                return "";
+            return value.Replace('\r', ' ').Replace('\n', ' ');
         }
     }
 }

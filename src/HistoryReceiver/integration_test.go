@@ -146,6 +146,7 @@ func TestBulkImport49600Rows(t *testing.T) {
 	testID := strconv.FormatInt(time.Now().UnixNano(), 10)
 	collectorID := "DCS-BULK-" + testID
 	firstBatchID := "bulk_insert_" + testID
+	noopBatchID := "bulk_noop_" + testID
 	updateBatchID := "bulk_update_" + testID
 	rows := make([]importRow, rowCount)
 	startTime := time.Date(2026, 8, 28, 0, 0, 0, 0, time.UTC)
@@ -167,8 +168,8 @@ func TestBulkImport49600Rows(t *testing.T) {
 	defer func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cleanupCancel()
-		_, _ = pool.Exec(cleanupCtx, "DELETE FROM history_samples WHERE batch_id IN ($1, $2)", firstBatchID, updateBatchID)
-		_, _ = pool.Exec(cleanupCtx, "DELETE FROM imported_batches WHERE batch_id IN ($1, $2)", firstBatchID, updateBatchID)
+		_, _ = pool.Exec(cleanupCtx, "DELETE FROM history_samples WHERE batch_id IN ($1, $2, $3)", firstBatchID, noopBatchID, updateBatchID)
+		_, _ = pool.Exec(cleanupCtx, "DELETE FROM imported_batches WHERE batch_id IN ($1, $2, $3)", firstBatchID, noopBatchID, updateBatchID)
 	}()
 
 	insertBatch := importBatch{
@@ -180,6 +181,32 @@ func TestBulkImport49600Rows(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("bulk insert rows=%d elapsed=%s", rowCount, time.Since(started).Round(time.Millisecond))
+
+	var beforeReceivedAt time.Time
+	var beforeBatchID string
+	if err := pool.QueryRow(ctx,
+		"SELECT received_at, batch_id FROM history_samples WHERE sample_key=$1",
+		rows[0].SampleKey).Scan(&beforeReceivedAt, &beforeBatchID); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	noopBatch := importBatch{
+		BatchID: noopBatchID, CollectorID: collectorID,
+		SHA256: strings.Repeat("c", 64), Rows: rowCount, Data: rows,
+	}
+	if err := importer.importBatch(ctx, noopBatch); err != nil {
+		t.Fatal(err)
+	}
+	var afterReceivedAt time.Time
+	var afterBatchID string
+	if err := pool.QueryRow(ctx,
+		"SELECT received_at, batch_id FROM history_samples WHERE sample_key=$1",
+		rows[0].SampleKey).Scan(&afterReceivedAt, &afterBatchID); err != nil {
+		t.Fatal(err)
+	}
+	if !afterReceivedAt.Equal(beforeReceivedAt) || afterBatchID != beforeBatchID {
+		t.Fatalf("identical overlap unexpectedly updated row: before=%s/%s after=%s/%s", beforeReceivedAt, beforeBatchID, afterReceivedAt, afterBatchID)
+	}
 
 	for index := range rows {
 		value := float64(index)/10 + 1

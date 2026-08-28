@@ -143,7 +143,8 @@ namespace DeltaVHistoryCLI
 
     class SyncProgram
     {
-        private const string Version = "3.0-processed";
+        private const string Version = "3.2-send-performance";
+        private const int CollectionPausedExitCode = 45;
         private const string MutexName = "Global\\DeltaVHistorySync";
         private const string ContinuousStopEventName =
             "Local\\DcsDataHistorySyncStop";
@@ -176,7 +177,7 @@ namespace DeltaVHistoryCLI
             }
 
             int attempt;
-            for (attempt = 0; attempt < 600; attempt++)
+            for (attempt = 0; attempt < 900; attempt++)
             {
                 Thread.Sleep(100);
                 try
@@ -192,7 +193,7 @@ namespace DeltaVHistoryCLI
                     return 0;
                 }
             }
-            Console.WriteLine("HistorySync stop timed out after 60 seconds.");
+            Console.WriteLine("HistorySync stop timed out after 90 seconds.");
             return 32;
         }
 
@@ -271,7 +272,8 @@ namespace DeltaVHistoryCLI
                 Console.CancelKeyPress += handler;
                 try
                 {
-                    ReadRunIntervalMilliseconds(args, baseDirectory);
+                    int intervalMilliseconds = ReadRunIntervalMilliseconds(args, baseDirectory);
+                    DateTime nextStart = DateTime.Now;
                     Console.WriteLine("HistorySync continuous host started. Press Ctrl+C to stop.");
                     while (WaitHandle.WaitAny(stopHandles, 0, false) == WaitHandle.WaitTimeout)
                     {
@@ -288,9 +290,12 @@ namespace DeltaVHistoryCLI
                         Console.WriteLine(
                             "Sync cycle exit code=" +
                             result.ToString(CultureInfo.InvariantCulture));
+
+                        nextStart = nextStart.AddMilliseconds(intervalMilliseconds);
+                        intervalMilliseconds = ReadRunIntervalMilliseconds(args, baseDirectory);
                         if (WaitHandle.WaitAny(
                             stopHandles,
-                            ReadRunIntervalMilliseconds(args, baseDirectory),
+                            CalculateWaitMilliseconds(nextStart, DateTime.Now),
                             false) != WaitHandle.WaitTimeout)
                             break;
                     }
@@ -317,6 +322,16 @@ namespace DeltaVHistoryCLI
             if (minutes > 1440)
                 throw new Exception("[Sync] IntervalMinutes cannot exceed 1440.");
             return checked(minutes * 60 * 1000);
+        }
+
+        private static int CalculateWaitMilliseconds(DateTime nextStart, DateTime now)
+        {
+            double milliseconds = (nextStart - now).TotalMilliseconds;
+            if (milliseconds <= 0)
+                return 0;
+            if (milliseconds >= Int32.MaxValue)
+                return Int32.MaxValue;
+            return (int)Math.Ceiling(milliseconds);
         }
 
         private static int Run(string[] args, string baseDirectory)
@@ -399,17 +414,65 @@ namespace DeltaVHistoryCLI
                     : null;
                 int senderCode = 0;
                 bool directSendAllowed = false;
+                PendingStats pendingStats = new SpoolStore(options.SpoolDirectory).GetPendingStats();
                 if (sender != null)
                 {
                     senderCode = sender.SendPending(acknowledged);
-                    directSendAllowed = senderCode == 0 &&
-                        Directory.GetDirectories(
-                            Path.Combine(options.SpoolDirectory, "pending")).Length == 0;
+                    pendingStats = new SpoolStore(options.SpoolDirectory).GetPendingStats();
+                    log.Write(
+                        "SpoolState PendingBatches=" +
+                        pendingStats.Batches.ToString(CultureInfo.InvariantCulture) +
+                        " PendingBytes=" +
+                        pendingStats.Bytes.ToString(CultureInfo.InvariantCulture));
                     if (senderCode == 42)
                     {
-                        log.Write("Collection paused because Receiver authentication failed.");
-                        return 42;
+                        return PauseCollection(
+                            options,
+                            state,
+                            stateStore,
+                            log,
+                            "Receiver authentication failed",
+                            pendingStats,
+                            42);
                     }
+                    if (pendingStats.Batches > 0 && senderCode == 0)
+                    {
+                        return PauseCollection(
+                            options,
+                            state,
+                            stateStore,
+                            log,
+                            "pending drain incomplete senderCode=" +
+                            senderCode.ToString(CultureInfo.InvariantCulture),
+                            pendingStats,
+                            CollectionPausedExitCode);
+                    }
+                    if (pendingStats.Batches > 0)
+                    {
+                        log.Write(
+                            "Pending retained after transient send failure; collection may continue until capacity. senderCode=" +
+                            senderCode.ToString(CultureInfo.InvariantCulture));
+                        if (!PendingCapacityReached(options, pendingStats))
+                            ClearCollectionPaused(state, stateStore, log);
+                    }
+                    directSendAllowed = senderCode == 0;
+                    if (pendingStats.Batches == 0)
+                        ClearCollectionPaused(state, stateStore, log);
+                }
+                else if (command == "sync" && state != null && state.CollectionPaused)
+                {
+                    if (pendingStats.Batches > 0)
+                    {
+                        return PauseCollection(
+                            options,
+                            state,
+                            stateStore,
+                            log,
+                            "pending outbox requires a Receiver drain",
+                            pendingStats,
+                            CollectionPausedExitCode);
+                    }
+                    ClearCollectionPaused(state, stateStore, log);
                 }
 
                 if (command != "send")
@@ -429,8 +492,14 @@ namespace DeltaVHistoryCLI
 
                 if (command == "sync" && HasBlockingContinuousFailures(options.SpoolDirectory))
                 {
-                    log.Write("Collection paused because failed or quarantined continuous batches require attention.");
-                    return 44;
+                    return PauseCollection(
+                        options,
+                        state,
+                        stateStore,
+                        log,
+                        "failed or quarantined continuous batches require attention",
+                        pendingStats,
+                        44);
                 }
 
                 try
@@ -438,6 +507,20 @@ namespace DeltaVHistoryCLI
                     new SpoolStore(options.SpoolDirectory).EnsurePendingCapacity(
                         options.MaxPendingBatches,
                         options.MaxPendingBytes);
+                }
+                catch (PendingCapacityException ex)
+                {
+                    PendingStats capacityStats = new PendingStats();
+                    capacityStats.Batches = ex.PendingBatches;
+                    capacityStats.Bytes = ex.PendingBytes;
+                    return PauseCollection(
+                        options,
+                        state,
+                        stateStore,
+                        log,
+                        "pending capacity reached",
+                        capacityStats,
+                        CollectionPausedExitCode);
                 }
                 catch (IOException ex)
                 {
@@ -496,9 +579,9 @@ namespace DeltaVHistoryCLI
                 config.Get("Spool", "MaxBatchBytes", "20971520"),
                 "[Spool] MaxBatchBytes");
             options.MinWindowSeconds = config.GetInt("Sync", "MinWindowSeconds", 10);
-            options.MaxPendingBatches = config.GetInt("Spool", "MaxPendingBatches", 200);
+            options.MaxPendingBatches = config.GetInt("Spool", "MaxPendingBatches", 50);
             options.MaxPendingBytes = ParsePositiveLong(
-                config.Get("Spool", "MaxPendingBytes", "1073741824"),
+                config.Get("Spool", "MaxPendingBytes", "104857600"),
                 "[Spool] MaxPendingBytes");
             if (options.MaxBatchRows <= 0 || options.MinWindowSeconds <= 0 ||
                 options.MaxPendingBatches <= 0 || options.MaxFailedTagsPerBatch < 0)
@@ -613,20 +696,29 @@ namespace DeltaVHistoryCLI
         {
             Console.WriteLine("Historian       Not checked");
             Console.WriteLine("Receiver        " + (ReceiverOnline(config) ? "Online" : "Offline"));
+            SyncState statusState = null;
             if (File.Exists(options.StatePath))
             {
-                SyncState state = new SyncStateStore(options.StatePath).LoadOrCreate(DateTime.Now);
-                Console.WriteLine("LastCollected   " + FormatTime(state.LastCollectedEnd));
-                Console.WriteLine("LastAccepted    " + FormatTime(state.LastAcceptedEnd));
-                Console.WriteLine("LastCommitted   " + FormatTime(state.LastCommittedEnd));
+                statusState = new SyncStateStore(options.StatePath).LoadOrCreate(DateTime.Now);
+                Console.WriteLine("LastCollected   " + FormatTime(statusState.LastCollectedEnd));
+                Console.WriteLine("LastAccepted    " + FormatTime(statusState.LastAcceptedEnd));
+                Console.WriteLine("LastCommitted   " + FormatTime(statusState.LastCommittedEnd));
+                Console.WriteLine("CollectionState " +
+                    (statusState.CollectionPaused ? "CollectionPaused" : "Running"));
+                Console.WriteLine("PauseReason     " +
+                    (String.IsNullOrEmpty(statusState.PauseReason) ? "None" : statusState.PauseReason));
             }
             else
             {
                 Console.WriteLine("LastCollected   Not initialized");
                 Console.WriteLine("LastAccepted    Not initialized");
                 Console.WriteLine("LastCommitted   Not initialized");
+                Console.WriteLine("CollectionState Not initialized");
+                Console.WriteLine("PauseReason     None");
             }
-            Console.WriteLine("PendingBatches  " + CountDirectories(options.SpoolDirectory, "pending").ToString());
+            PendingStats pending = new SpoolStore(options.SpoolDirectory).GetPendingStats();
+            Console.WriteLine("PendingBatches  " + pending.Batches.ToString(CultureInfo.InvariantCulture));
+            Console.WriteLine("PendingBytes    " + pending.Bytes.ToString(CultureInfo.InvariantCulture));
             Console.WriteLine("FailedBatches   " + CountDirectories(options.SpoolDirectory, "failed").ToString());
             Console.WriteLine("Quarantined     " + CountDirectories(options.SpoolDirectory, "quarantine").ToString());
             Console.WriteLine("AckMode         " + options.AckMode);
@@ -657,6 +749,74 @@ namespace DeltaVHistoryCLI
         {
             string path = Path.Combine(spoolDirectory, name);
             return Directory.Exists(path) ? Directory.GetDirectories(path).Length : 0;
+        }
+
+        private static int PauseCollection(
+            SyncOptions options,
+            SyncState state,
+            SyncStateStore stateStore,
+            SyncLogger log,
+            string reason,
+            PendingStats pending,
+            int returnCode)
+        {
+            if (pending == null)
+                pending = new SpoolStore(options.SpoolDirectory).GetPendingStats();
+            if (state != null && stateStore != null)
+            {
+                bool changed = !state.CollectionPaused || state.PauseReason != reason;
+                if (changed)
+                {
+                    SyncState before = state.Copy();
+                    try
+                    {
+                        state.CollectionPaused = true;
+                        state.PauseReason = reason;
+                        stateStore.Save(state);
+                    }
+                    catch
+                    {
+                        state.CollectionPaused = before.CollectionPaused;
+                        state.PauseReason = before.PauseReason;
+                        throw;
+                    }
+                }
+            }
+            log.Write(
+                "CollectionPaused reason=" + reason +
+                " PendingBatches=" + pending.Batches.ToString(CultureInfo.InvariantCulture) +
+                " PendingBytes=" + pending.Bytes.ToString(CultureInfo.InvariantCulture));
+            return returnCode;
+        }
+
+        private static void ClearCollectionPaused(
+            SyncState state,
+            SyncStateStore stateStore,
+            SyncLogger log)
+        {
+            if (state == null || stateStore == null || !state.CollectionPaused)
+                return;
+            SyncState before = state.Copy();
+            try
+            {
+                state.CollectionPaused = false;
+                state.PauseReason = "";
+                stateStore.Save(state);
+            }
+            catch
+            {
+                state.CollectionPaused = before.CollectionPaused;
+                state.PauseReason = before.PauseReason;
+                throw;
+            }
+            log.Write("CollectionResumed; pending drain is no longer blocking collection.");
+        }
+
+        private static bool PendingCapacityReached(SyncOptions options, PendingStats pending)
+        {
+            return pending != null &&
+                (pending.Batches >= options.MaxPendingBatches ||
+                 pending.Bytes >= options.MaxPendingBytes);
         }
 
         private static bool HasBlockingContinuousFailures(string spoolDirectory)
@@ -829,7 +989,11 @@ namespace DeltaVHistoryCLI
         {
             string batchId = BuildBatchId(options.CollectorId);
             log.Write("Collect batch=" + batchId + " range=" + FormatTime(start) + " .. " + FormatTime(end));
-            Stopwatch stopwatch = Stopwatch.StartNew();
+            Stopwatch totalClock = Stopwatch.StartNew();
+            Stopwatch historianClock = Stopwatch.StartNew();
+            long historianReadMilliseconds = 0;
+            long encodeMilliseconds = 0;
+            BatchSendTimings sendTimings = null;
 
             try
             {
@@ -848,52 +1012,61 @@ namespace DeltaVHistoryCLI
                 int successfulTags = 0;
                 int failedTags = 0;
                 int invalidSlots = 0;
-                for (tagIndex = 0; tagIndex < tags.Count; tagIndex++)
+                List<ProcessedTagResult> processedResults = client.ReadProcessedBatch(
+                    tags,
+                    start,
+                    end,
+                    options.SamplingIntervalSeconds);
+                for (tagIndex = 0; tagIndex < processedResults.Count; tagIndex++)
                 {
-                    if (tags[tagIndex].Status != 1)
+                    ProcessedTagResult processedTag = processedResults[tagIndex];
+                    if (processedTag.Tag == null || processedTag.Tag.Status != 1)
                     {
                         invalidTags++;
                         continue;
                     }
-                    try
-                    {
-                        ProcessedHistoryResult result = client.ReadProcessed(
-                            tags[tagIndex],
-                            start,
-                            end,
-                            options.SamplingIntervalSeconds);
-                        successfulTags++;
-                        invalidSlots += result.InvalidSlots;
-
-                        Dictionary<long, bool> seenTimestamps =
-                            new Dictionary<long, bool>();
-                        int sampleIndex;
-                        for (sampleIndex = 0; sampleIndex < result.Samples.Count; sampleIndex++)
-                        {
-                            HistorySample sample = result.Samples[sampleIndex];
-                            if (sample.Timestamp < start || sample.Timestamp >= end)
-                                continue;
-                            if (seenTimestamps.ContainsKey(sample.Timestamp.Ticks))
-                                continue;
-                            seenTimestamps.Add(sample.Timestamp.Ticks, true);
-                            batch.Samples.Add(sample);
-                        }
-                    }
-                    catch (Exception ex)
+                    if (processedTag.Error != null)
                     {
                         failedTags++;
                         log.Write(
-                            "Processed tag failed tag=" + tags[tagIndex].Name +
+                            "Processed tag failed tag=" + processedTag.Tag.Name +
                             " start=" + FormatTime(start) +
                             " end=" + FormatTime(end) +
                             " intervalSeconds=" +
                             options.SamplingIntervalSeconds.ToString(CultureInfo.InvariantCulture) +
-                            " error=" + ex.Message);
+                            " error=" + processedTag.Error.Message);
                         continue;
+                    }
+
+                    ProcessedHistoryResult result = processedTag.Result;
+                    if (result == null)
+                    {
+                        failedTags++;
+                        log.Write(
+                            "Processed tag returned no result tag=" + processedTag.Tag.Name +
+                            " start=" + FormatTime(start) +
+                            " end=" + FormatTime(end) +
+                            " intervalSeconds=" +
+                            options.SamplingIntervalSeconds.ToString(CultureInfo.InvariantCulture));
+                        continue;
+                    }
+
+                    successfulTags++;
+                    invalidSlots += result.InvalidSlots;
+                    int sampleIndex;
+                    for (sampleIndex = 0; sampleIndex < result.Samples.Count; sampleIndex++)
+                    {
+                        HistorySample sample = result.Samples[sampleIndex];
+                        if (sample.Timestamp < start || sample.Timestamp >= end)
+                            continue;
+                        batch.Samples.Add(sample);
                     }
                     if (batch.Samples.Count > options.MaxBatchRows)
                         throw new BatchLimitException("Batch row limit exceeded.");
                 }
+
+                historianClock.Stop();
+                historianReadMilliseconds = historianClock.ElapsedMilliseconds;
 
                 if (successfulTags == 0)
                     throw new Exception("All valid Historian tag reads failed.");
@@ -908,28 +1081,33 @@ namespace DeltaVHistoryCLI
                 batch.FailedTags = failedTags;
                 batch.InvalidSlots = invalidSlots;
 
-                stopwatch.Stop();
                 log.Write(
                     "Batch collection completed batch=" + batchId +
                     " tags=" + tags.Count.ToString(CultureInfo.InvariantCulture) +
                     " successTags=" + successfulTags.ToString(CultureInfo.InvariantCulture) +
                     " failedTags=" + failedTags.ToString(CultureInfo.InvariantCulture) +
-                    " invalidTags=" + invalidTags.ToString(CultureInfo.InvariantCulture) +
-                    " rows=" + batch.Samples.Count.ToString(CultureInfo.InvariantCulture) +
-                    " invalidSlots=" + invalidSlots.ToString(CultureInfo.InvariantCulture) +
-                    " elapsedMs=" + stopwatch.ElapsedMilliseconds.ToString(
-                        CultureInfo.InvariantCulture));
+                     " invalidTags=" + invalidTags.ToString(CultureInfo.InvariantCulture) +
+                     " rows=" + batch.Samples.Count.ToString(CultureInfo.InvariantCulture) +
+                     " invalidSlots=" + invalidSlots.ToString(CultureInfo.InvariantCulture) +
+                     " HistorianReadMs=" + historianReadMilliseconds.ToString(
+                         CultureInfo.InvariantCulture));
 
+                Stopwatch encodeClock = Stopwatch.StartNew();
                 byte[] data = BatchEncoder.EncodeCsv(batch);
                 if (data.Length > options.MaxBatchBytes)
                     throw new BatchLimitException("Batch size limit exceeded.");
                 batch.Sha256 = BatchEncoder.ComputeSha256(data);
+                encodeClock.Stop();
+                encodeMilliseconds = encodeClock.ElapsedMilliseconds;
 
                 if (sender != null && directSendAllowed)
                 {
+                    bool remoteAckReceived = false;
                     try
                     {
                         BatchReceipt receipt = sender.Send(batch, data);
+                        remoteAckReceived = true;
+                        sendTimings = receipt.Timings;
                         AdvanceAfterCollection(
                             options,
                             state,
@@ -937,12 +1115,24 @@ namespace DeltaVHistoryCLI
                             end,
                             true,
                             String.Equals(receipt.CommitLevel, "database", StringComparison.OrdinalIgnoreCase));
-                        log.Write("Direct ACK batch=" + batchId + " rows=" + batch.Samples.Count.ToString());
+                        totalClock.Stop();
+                        LogBatchMetrics(
+                            options,
+                            state,
+                            log,
+                            batch,
+                            data.Length,
+                            totalClock,
+                            historianReadMilliseconds,
+                            encodeMilliseconds,
+                            sendTimings);
+                        log.Write("Direct ACK batch=" + batchId + " rows=" + batch.Samples.Count.ToString(CultureInfo.InvariantCulture));
                         return invalidTags == 0 ? 0 : 5;
                     }
                     catch (BatchSendException ex)
                     {
                         directSendAllowed = false;
+                        sendTimings = ex.Timings;
                         SpoolStore rejectedStore = new SpoolStore(options.SpoolDirectory);
                         if (ex.Permanent)
                         {
@@ -950,29 +1140,187 @@ namespace DeltaVHistoryCLI
                                 batch,
                                 data,
                                 "http" + ex.StatusCode.ToString(CultureInfo.InvariantCulture));
-                            AdvanceAfterCollection(options, state, stateStore, end, false, false);
+                            totalClock.Stop();
+                            LogBatchMetrics(
+                                options,
+                                state,
+                                log,
+                                batch,
+                                data.Length,
+                                totalClock,
+                                historianReadMilliseconds,
+                                encodeMilliseconds,
+                                sendTimings);
                             log.Write("Receiver permanently rejected batch=" + batchId + " error=" + ex.Message);
                             return 41;
                         }
-                        rejectedStore.EnsurePendingCapacity(
-                            options.MaxPendingBatches,
-                            options.MaxPendingBytes);
-                        rejectedStore.SavePending(batch, data);
+                        try
+                        {
+                            rejectedStore.EnsurePendingCapacity(
+                                options.MaxPendingBatches,
+                                options.MaxPendingBytes,
+                                data.Length);
+                            rejectedStore.SavePending(batch, data);
+                        }
+                        catch (PendingCapacityException capacity)
+                        {
+                            totalClock.Stop();
+                            PendingStats capacityStats = new PendingStats();
+                            capacityStats.Batches = capacity.PendingBatches;
+                            capacityStats.Bytes = capacity.PendingBytes;
+                            LogBatchMetrics(
+                                options,
+                                state,
+                                log,
+                                batch,
+                                data.Length,
+                                totalClock,
+                                historianReadMilliseconds,
+                                encodeMilliseconds,
+                                sendTimings);
+                            return PauseCollection(
+                                options,
+                                state,
+                                stateStore,
+                                log,
+                                "pending capacity reached after direct send failure",
+                                capacityStats,
+                                CollectionPausedExitCode);
+                        }
                         AdvanceAfterCollection(options, state, stateStore, end, false, false);
+                        totalClock.Stop();
+                        LogBatchMetrics(
+                            options,
+                            state,
+                            log,
+                            batch,
+                            data.Length,
+                            totalClock,
+                            historianReadMilliseconds,
+                            encodeMilliseconds,
+                            sendTimings);
+                        int failureCode = ex.AuthenticationFailure
+                            ? 42
+                            : (invalidTags == 0 ? 0 : 5);
+                        if (ex.AuthenticationFailure)
+                            PauseCollection(
+                                options,
+                                state,
+                                stateStore,
+                                log,
+                                "Receiver authentication failed after direct send failure",
+                                new SpoolStore(options.SpoolDirectory).GetPendingStats(),
+                                failureCode);
                         log.Write("Direct send failed; saved to outbox batch=" + batchId + " error=" + ex.Message);
-                        return ex.AuthenticationFailure ? 42 : 0;
+                        return failureCode;
                     }
                     catch (Exception ex)
                     {
                         directSendAllowed = false;
+                        if (remoteAckReceived)
+                        {
+                            sendTimings = sender.LastTimings;
+                            totalClock.Stop();
+                            LogBatchMetrics(
+                                options,
+                                state,
+                                log,
+                                batch,
+                                data.Length,
+                                totalClock,
+                                historianReadMilliseconds,
+                                encodeMilliseconds,
+                                sendTimings);
+                            log.Write(
+                                "Remote ACK received but checkpoint update failed; batch will be retried from Historian batch=" +
+                                batchId + " error=" + ex.Message);
+                            return 20;
+                        }
                         log.Write("Direct send failed; switching to outbox batch=" + batchId + " error=" + ex.Message);
+                        sendTimings = sender.LastTimings;
+                        try
+                        {
+                            SpoolStore rejectedStore = new SpoolStore(options.SpoolDirectory);
+                            rejectedStore.EnsurePendingCapacity(
+                                options.MaxPendingBatches,
+                                options.MaxPendingBytes,
+                                data.Length);
+                            rejectedStore.SavePending(batch, data);
+                        }
+                        catch (PendingCapacityException capacity)
+                        {
+                            totalClock.Stop();
+                            PendingStats capacityStats = new PendingStats();
+                            capacityStats.Batches = capacity.PendingBatches;
+                            capacityStats.Bytes = capacity.PendingBytes;
+                            LogBatchMetrics(
+                                options,
+                                state,
+                                log,
+                                batch,
+                                data.Length,
+                                totalClock,
+                                historianReadMilliseconds,
+                                encodeMilliseconds,
+                                sendTimings);
+                            return PauseCollection(
+                                options,
+                                state,
+                                stateStore,
+                                log,
+                                "pending capacity reached after direct send failure",
+                                capacityStats,
+                                CollectionPausedExitCode);
+                        }
+                        AdvanceAfterCollection(options, state, stateStore, end, false, false);
+                        totalClock.Stop();
+                        LogBatchMetrics(
+                            options,
+                            state,
+                            log,
+                            batch,
+                            data.Length,
+                            totalClock,
+                            historianReadMilliseconds,
+                            encodeMilliseconds,
+                            sendTimings);
+                        return invalidTags == 0 ? 0 : 5;
                     }
                 }
 
                 SpoolStore spool = new SpoolStore(options.SpoolDirectory);
-                spool.EnsurePendingCapacity(
-                    options.MaxPendingBatches,
-                    options.MaxPendingBytes);
+                try
+                {
+                    spool.EnsurePendingCapacity(
+                        options.MaxPendingBatches,
+                        options.MaxPendingBytes,
+                        data.Length);
+                }
+                catch (PendingCapacityException capacity)
+                {
+                    totalClock.Stop();
+                    PendingStats capacityStats = new PendingStats();
+                    capacityStats.Batches = capacity.PendingBatches;
+                    capacityStats.Bytes = capacity.PendingBytes;
+                    LogBatchMetrics(
+                        options,
+                        state,
+                        log,
+                        batch,
+                        data.Length,
+                        totalClock,
+                        historianReadMilliseconds,
+                        encodeMilliseconds,
+                        sendTimings);
+                    return PauseCollection(
+                        options,
+                        state,
+                        stateStore,
+                        log,
+                        "pending capacity reached",
+                        capacityStats,
+                        CollectionPausedExitCode);
+                }
                 spool.SavePending(batch, data);
                 AdvanceAfterCollection(
                     options,
@@ -981,13 +1329,39 @@ namespace DeltaVHistoryCLI
                     end,
                     false,
                     false);
-                log.Write("Pending batch=" + batchId + " rows=" + batch.Samples.Count.ToString() + " sha256=" + batch.Sha256);
+                totalClock.Stop();
+                LogBatchMetrics(
+                    options,
+                    state,
+                    log,
+                    batch,
+                    data.Length,
+                    totalClock,
+                    historianReadMilliseconds,
+                    encodeMilliseconds,
+                    sendTimings);
+                log.Write("Pending batch=" + batchId + " rows=" + batch.Samples.Count.ToString(CultureInfo.InvariantCulture) + " sha256=" + batch.Sha256);
                 return invalidTags == 0 ? 0 : 5;
             }
             catch (BatchLimitException ex)
             {
                 log.Write("Batch limit batch=" + batchId + " error=" + ex.Message);
                 return 21;
+            }
+            catch (PendingCapacityException ex)
+            {
+                totalClock.Stop();
+                PendingStats capacityStats = new PendingStats();
+                capacityStats.Batches = ex.PendingBatches;
+                capacityStats.Bytes = ex.PendingBytes;
+                return PauseCollection(
+                    options,
+                    state,
+                    stateStore,
+                    log,
+                    "pending capacity reached",
+                    capacityStats,
+                    CollectionPausedExitCode);
             }
             catch (IOException ex)
             {
@@ -999,6 +1373,45 @@ namespace DeltaVHistoryCLI
                 log.Write("Batch failed=" + batchId + " error=" + ex.Message);
                 return 20;
             }
+        }
+
+        private static void LogBatchMetrics(
+            SyncOptions options,
+            SyncState state,
+            SyncLogger log,
+            HistoryBatch batch,
+            int bytes,
+            Stopwatch totalClock,
+            long historianReadMilliseconds,
+            long encodeMilliseconds,
+            BatchSendTimings sendTimings)
+        {
+            PendingStats pending = new SpoolStore(options.SpoolDirectory).GetPendingStats();
+            long sendMilliseconds = sendTimings == null ? 0 : sendTimings.SendMilliseconds;
+            long ackWaitMilliseconds = sendTimings == null ? 0 : sendTimings.AckWaitMilliseconds;
+            long syncLagSeconds = 0;
+            if (options.Command == "sync" && state != null)
+            {
+                DateTime checkpoint = options.AckMode == "database"
+                    ? state.LastCommittedEnd
+                    : state.LastAcceptedEnd;
+                double lag = (options.End - checkpoint).TotalSeconds;
+                if (lag > 0)
+                    syncLagSeconds = (long)lag;
+            }
+            log.Write(
+                "BatchMetrics batch_id=" + batch.BatchId +
+                " rows=" + batch.Samples.Count.ToString(CultureInfo.InvariantCulture) +
+                " bytes=" + bytes.ToString(CultureInfo.InvariantCulture) +
+                " elapsed=" + totalClock.ElapsedMilliseconds.ToString(CultureInfo.InvariantCulture) + "ms" +
+                " HistorianReadMs=" + historianReadMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                " EncodeMs=" + encodeMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                " SendMs=" + sendMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                " AckWaitMs=" + ackWaitMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                " TotalMs=" + totalClock.ElapsedMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                " PendingBatches=" + pending.Batches.ToString(CultureInfo.InvariantCulture) +
+                " PendingBytes=" + pending.Bytes.ToString(CultureInfo.InvariantCulture) +
+                " SyncLagSeconds=" + syncLagSeconds.ToString(CultureInfo.InvariantCulture));
         }
 
         private static int CollectWindow(
@@ -1014,6 +1427,35 @@ namespace DeltaVHistoryCLI
             SyncStateStore stateStore,
             ref int created)
         {
+            if (!directSendAllowed)
+            {
+                try
+                {
+                    new SpoolStore(options.SpoolDirectory).EnsurePendingCapacity(
+                        options.MaxPendingBatches,
+                        options.MaxPendingBytes);
+                }
+                catch (PendingCapacityException ex)
+                {
+                    PendingStats capacityStats = new PendingStats();
+                    capacityStats.Batches = ex.PendingBatches;
+                    capacityStats.Bytes = ex.PendingBytes;
+                    return PauseCollection(
+                        options,
+                        state,
+                        stateStore,
+                        log,
+                        "pending capacity reached before Historian read",
+                        capacityStats,
+                        CollectionPausedExitCode);
+                }
+                catch (IOException ex)
+                {
+                    log.Write("Outbox unavailable before Historian read: " + ex.Message);
+                    return 43;
+                }
+            }
+
             int result = CreateBatch(
                 options,
                 start,

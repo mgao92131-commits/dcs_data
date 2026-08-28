@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -157,6 +158,109 @@ func TestArchivedBatchRemainsIdempotent(t *testing.T) {
 	}
 }
 
+func TestReceiverTimeoutDefaultsAreOrdered(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "receiver.ini")
+	content := strings.Join([]string{
+		"[Server]",
+		"Listen=127.0.0.1:8080",
+		"ApiKey=test-secret",
+		"MaxBodyBytes=1024",
+		"WriteTimeoutSeconds=60",
+		"",
+		"[PostgreSQL]",
+		"Enabled=false",
+		"SynchronousCommit=false",
+		"",
+	}, "\n")
+	if err := os.WriteFile(configPath, []byte(content), 0640); err != nil {
+		t.Fatal(err)
+	}
+	config, err := loadReceiverConfig(configPath, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.WriteTimeout != 60*time.Second || config.ImportTimeout != 45*time.Second {
+		t.Fatalf("unexpected timeout defaults: write=%s import=%s", config.WriteTimeout, config.ImportTimeout)
+	}
+}
+
+func TestReceiverRejectsImportTimeoutAtWriteTimeout(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "receiver.ini")
+	content := strings.Join([]string{
+		"[Server]",
+		"Listen=127.0.0.1:8080",
+		"ApiKey=test-secret",
+		"MaxBodyBytes=1024",
+		"WriteTimeoutSeconds=60",
+		"",
+		"[PostgreSQL]",
+		"Enabled=true",
+		"SynchronousCommit=true",
+		"Host=127.0.0.1",
+		"Port=5432",
+		"Database=test",
+		"User=test",
+		"Password=test",
+		"ImportTimeoutSeconds=60",
+		"",
+	}, "\n")
+	if err := os.WriteFile(configPath, []byte(content), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadReceiverConfig(configPath, root); err == nil ||
+		!strings.Contains(err.Error(), "must be less than") {
+		t.Fatalf("expected timeout ordering error, got %v", err)
+	}
+}
+
+func TestStageAndParseBodyHashesAndParsesInOnePass(t *testing.T) {
+	root := t.TempDir()
+	body := testCSV()
+	path := filepath.Join(root, "data.csv")
+	reader := &countingReader{source: bytes.NewReader(body)}
+	staged, err := stageAndParseBody(
+		path,
+		reader,
+		int64(len(body)),
+		"DCS-APP-01",
+		time.FixedZone("Asia/Shanghai", 8*60*60))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staged.BodyBytes != int64(len(body)) || reader.bytes != int64(len(body)) {
+		t.Fatalf("body was not fully staged: staged=%d read=%d", staged.BodyBytes, reader.bytes)
+	}
+	if staged.ActualHash != hashBytes(body) || len(staged.Rows) != 2 {
+		t.Fatalf("unexpected staged result: hash=%s rows=%d", staged.ActualHash, len(staged.Rows))
+	}
+	if staged.Rows[0].Tag != "TAG/A" || staged.Rows[0].ValueDouble == nil {
+		t.Fatalf("CSV conversion did not produce import rows: %+v", staged.Rows)
+	}
+	stored, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(stored, body) {
+		t.Fatal("staging file differs from the received body")
+	}
+}
+
+func TestStageAndParseBodyEnforcesMaximum(t *testing.T) {
+	root := t.TempDir()
+	body := testCSV()
+	_, err := stageAndParseBody(
+		filepath.Join(root, "data.csv"),
+		bytes.NewReader(body),
+		int64(len(body)-1),
+		"DCS-APP-01",
+		time.FixedZone("Asia/Shanghai", 8*60*60))
+	if err != errBodyTooLarge {
+		t.Fatalf("expected body-too-large error, got %v", err)
+	}
+}
+
 func newTestReceiver(t *testing.T) (*receiverServer, string) {
 	t.Helper()
 	root := t.TempDir()
@@ -211,4 +315,15 @@ func testCSV() []byte {
 func hashBytes(data []byte) string {
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:])
+}
+
+type countingReader struct {
+	source *bytes.Reader
+	bytes  int64
+}
+
+func (r *countingReader) Read(buffer []byte) (int, error) {
+	count, err := r.source.Read(buffer)
+	r.bytes += int64(count)
+	return count, err
 }

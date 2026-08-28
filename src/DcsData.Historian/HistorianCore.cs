@@ -36,6 +36,13 @@ namespace DeltaVHistoryCLI
         public readonly List<HistorySample> Samples = new List<HistorySample>();
     }
 
+    public class ProcessedTagResult
+    {
+        public TagResult Tag;
+        public ProcessedHistoryResult Result;
+        public Exception Error;
+    }
+
     public static class HistorySampleSet
     {
         public static List<HistorySample> Normalize(List<HistorySample> rows)
@@ -201,19 +208,44 @@ namespace DeltaVHistoryCLI
             DateTime end,
             int intervalSeconds)
         {
+            if (tag == null)
+                throw new ArgumentNullException("tag");
+
+            List<TagResult> tags = new List<TagResult>();
+            tags.Add(tag);
+            List<ProcessedTagResult> results = ReadProcessedBatch(
+                tags,
+                start,
+                end,
+                intervalSeconds);
+            if (results.Count != 1)
+                throw new Exception("Historian returned an unexpected tag result count.");
+            if (results[0].Error != null)
+                throw results[0].Error;
+            return results[0].Result;
+        }
+
+        public List<ProcessedTagResult> ReadProcessedBatch(
+            List<TagResult> tags,
+            DateTime start,
+            DateTime end,
+            int intervalSeconds)
+        {
             EnsureConnected();
             if (_readProcessed == null)
                 throw new MissingMethodException(
                     _connection.GetType().FullName,
                     "readProcessed");
-            if (tag == null)
-                throw new ArgumentNullException("tag");
-            if (tag.Status != 1)
-                throw new ArgumentException("Tag is not valid.", "tag");
+            if (tags == null)
+                throw new ArgumentNullException("tags");
             if (start >= end)
                 throw new ArgumentException("Start time must be earlier than end time.");
             if (intervalSeconds <= 0)
                 throw new ArgumentOutOfRangeException("intervalSeconds");
+
+            List<ProcessedTagResult> results = new List<ProcessedTagResult>();
+            if (tags.Count == 0)
+                return results;
 
             int timeSpanHandle = -1;
             try
@@ -231,69 +263,117 @@ namespace DeltaVHistoryCLI
                 ArrayList aggregates = new ArrayList();
                 aggregates.Add(_interpolatedAggregate);
 
-                object processed = _readProcessed.Invoke(
-                    _connection,
-                    new object[]
-                    {
-                        timeSpanHandle,
-                        tag.Handle,
-                        _processedSampleType,
-                        aggregates
-                    });
-                if (processed == null)
-                    throw new Exception("readProcessed() returned null.");
-
-                ProcessedHistoryResult readResult = new ProcessedHistoryResult();
-                readResult.Aggregate = "InterpolatedValue";
-                readResult.IntervalSeconds = intervalSeconds;
-                readResult.ReturnedSlots = ToInt32(
-                    GetMemberValue(processed, "nSamples"), 0);
-
-                IEnumerable aggregateResults = GetMemberValue(processed, "dataSamples") as IEnumerable;
-                if (aggregateResults == null)
-                    throw new Exception("ProcessedHistorySamples.dataSamples is not enumerable.");
-
-                int aggregateCount = 0;
-                foreach (object aggregateResult in aggregateResults)
+                int tagIndex;
+                for (tagIndex = 0; tagIndex < tags.Count; tagIndex++)
                 {
-                    aggregateCount++;
-                    if (aggregateCount > 1)
-                        throw new Exception("readProcessed() returned more than one aggregate result.");
-                    IEnumerable samples = aggregateResult as IEnumerable;
-                    if (samples == null)
-                        throw new Exception("Processed aggregate result is not enumerable.");
-                    foreach (object point in samples)
+                    TagResult tag = tags[tagIndex];
+                    ProcessedTagResult tagResult = new ProcessedTagResult();
+                    tagResult.Tag = tag;
+                    if (tag == null)
                     {
-                        if (point == null)
-                            continue;
-                        object archiveStatus = GetMemberValue(point, "archiveStatus");
-                        if (HasArchiveStatusFlag(archiveStatus, 16))
+                        tagResult.Error = new ArgumentNullException("tag");
+                    }
+                    else if (tag.Status != 1)
+                    {
+                        tagResult.Error = new ArgumentException("Tag is not valid.", "tag");
+                    }
+                    else
+                    {
+                        try
                         {
-                            readResult.InvalidSlots++;
-                            continue;
+                            tagResult.Result = ReadProcessedWithTimeSpan(
+                                tag,
+                                timeSpanHandle,
+                                intervalSeconds,
+                                aggregates);
                         }
-                        HistorySample sample = BuildHistorySample(tag.Name, point);
-                        if (sample != null)
+                        catch (Exception ex)
                         {
-                            sample.Timestamp = ToCollectorLocalTime(sample.Timestamp);
-                            sample.SequenceNo = BuildProcessedSequence(intervalSeconds);
-                            readResult.Samples.Add(sample);
+                            tagResult.Error = UnwrapInvocationException(ex);
                         }
                     }
+                    results.Add(tagResult);
                 }
-                if (aggregateCount != 1)
-                    throw new Exception("readProcessed() did not return the requested aggregate.");
-
-                List<HistorySample> normalized = HistorySampleSet.Normalize(readResult.Samples);
-                readResult.Samples.Clear();
-                readResult.Samples.AddRange(normalized);
-                return readResult;
+                return results;
             }
             finally
             {
                 if (timeSpanHandle >= 0)
                     TryInvoke(_readInterface, "releaseTimeSpan", new object[] { timeSpanHandle });
             }
+        }
+
+        private ProcessedHistoryResult ReadProcessedWithTimeSpan(
+            TagResult tag,
+            int timeSpanHandle,
+            int intervalSeconds,
+            ArrayList aggregates)
+        {
+            object processed = _readProcessed.Invoke(
+                _connection,
+                new object[]
+                {
+                    timeSpanHandle,
+                    tag.Handle,
+                    _processedSampleType,
+                    aggregates
+                });
+            if (processed == null)
+                throw new Exception("readProcessed() returned null.");
+
+            ProcessedHistoryResult readResult = new ProcessedHistoryResult();
+            readResult.Aggregate = "InterpolatedValue";
+            readResult.IntervalSeconds = intervalSeconds;
+            readResult.ReturnedSlots = ToInt32(
+                GetMemberValue(processed, "nSamples"), 0);
+
+            IEnumerable aggregateResults = GetMemberValue(processed, "dataSamples") as IEnumerable;
+            if (aggregateResults == null)
+                throw new Exception("ProcessedHistorySamples.dataSamples is not enumerable.");
+
+            int aggregateCount = 0;
+            foreach (object aggregateResult in aggregateResults)
+            {
+                aggregateCount++;
+                if (aggregateCount > 1)
+                    throw new Exception("readProcessed() returned more than one aggregate result.");
+                IEnumerable samples = aggregateResult as IEnumerable;
+                if (samples == null)
+                    throw new Exception("Processed aggregate result is not enumerable.");
+                foreach (object point in samples)
+                {
+                    if (point == null)
+                        continue;
+                    object archiveStatus = GetMemberValue(point, "archiveStatus");
+                    if (HasArchiveStatusFlag(archiveStatus, 16))
+                    {
+                        readResult.InvalidSlots++;
+                        continue;
+                    }
+                    HistorySample sample = BuildHistorySample(tag.Name, point);
+                    if (sample != null)
+                    {
+                        sample.Timestamp = ToCollectorLocalTime(sample.Timestamp);
+                        sample.SequenceNo = BuildProcessedSequence(intervalSeconds);
+                        readResult.Samples.Add(sample);
+                    }
+                }
+            }
+            if (aggregateCount != 1)
+                throw new Exception("readProcessed() did not return the requested aggregate.");
+
+            List<HistorySample> normalized = HistorySampleSet.Normalize(readResult.Samples);
+            readResult.Samples.Clear();
+            readResult.Samples.AddRange(normalized);
+            return readResult;
+        }
+
+        private static Exception UnwrapInvocationException(Exception exception)
+        {
+            TargetInvocationException invocation = exception as TargetInvocationException;
+            if (invocation != null && invocation.InnerException != null)
+                return invocation.InnerException;
+            return exception;
         }
 
         public void Dispose()

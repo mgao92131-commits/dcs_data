@@ -19,5 +19,12 @@ Deployment:
 4. Start HistoryReceiver.exe --config receiver.ini.
 5. Verify GET http://192.168.1.10:8080/healthz reports database_ok=true.
 
+For synchronous database ACK, keep ImportTimeoutSeconds below the 60-second
+WriteTimeoutSeconds setting; the DCS example waits up to 75 seconds for ACK.
+
+The receiver hashes, stages, validates, and converts a normal HTTP CSV body in
+one pass. Synchronous PostgreSQL import reuses those parsed rows; restart
+recovery uses the durable staged CSV.
+
 The receiver stores runtime inbox/archive/staging/rejected/logs beside the
 executable. These directories and receiver.ini are not release artifacts.

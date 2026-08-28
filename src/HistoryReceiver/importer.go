@@ -49,18 +49,51 @@ type importRow struct {
 	ArchiveStatus string
 }
 
+type importTimings struct {
+	Parse  time.Duration
+	Copy   time.Duration
+	Upsert time.Duration
+	Commit time.Duration
+}
+
 type importBatch struct {
 	BatchID     string
 	CollectorID string
 	SHA256      string
 	Rows        int
 	Data        []importRow
+	Timings     *importTimings
 }
 
+const historySamplesUpsertSQL = `INSERT INTO history_samples
+	 (sample_key, collector_id, tag, sample_time, value_double, value_text,
+	  data_type, flags, sequence_no, archive_status, batch_id)
+	 SELECT sample_key, collector_id, tag, sample_time::timestamp, value_double,
+	  value_text, data_type, flags, sequence_no, archive_status, batch_id
+	 FROM (
+	  SELECT DISTINCT ON (sample_key) *
+	  FROM history_samples_stage
+	  ORDER BY sample_key, row_order DESC
+	 ) AS staged
+	 ON CONFLICT (sample_key) DO UPDATE SET
+	  value_double=EXCLUDED.value_double, value_text=EXCLUDED.value_text,
+	  data_type=EXCLUDED.data_type, flags=EXCLUDED.flags,
+	  archive_status=EXCLUDED.archive_status, batch_id=EXCLUDED.batch_id,
+	  received_at=CURRENT_TIMESTAMP
+	 WHERE history_samples.value_double IS DISTINCT FROM EXCLUDED.value_double
+	    OR history_samples.value_text IS DISTINCT FROM EXCLUDED.value_text
+	    OR history_samples.data_type IS DISTINCT FROM EXCLUDED.data_type
+	    OR history_samples.flags IS DISTINCT FROM EXCLUDED.flags
+	    OR history_samples.archive_status IS DISTINCT FROM EXCLUDED.archive_status`
+
 func newBatchImporter(config receiverConfig, pool *pgxpool.Pool, logger *log.Logger) (*batchImporter, error) {
-	location, err := time.LoadLocation(config.PostgresTimezone)
-	if err != nil {
-		return nil, fmt.Errorf("invalid PostgreSQL timezone %q: %w", config.PostgresTimezone, err)
+	location := config.PostgresLocation
+	if location == nil {
+		var err error
+		location, err = time.LoadLocation(config.PostgresTimezone)
+		if err != nil {
+			return nil, fmt.Errorf("invalid PostgreSQL timezone %q: %w", config.PostgresTimezone, err)
+		}
 	}
 	if err := os.MkdirAll(config.Archive, 0750); err != nil {
 		return nil, err
@@ -123,6 +156,7 @@ func (i *batchImporter) importOnce(ctx context.Context) (int, int, error) {
 	imported := 0
 	failed := 0
 	for _, name := range directories {
+		started := time.Now()
 		batchDir := filepath.Join(i.inbox, name)
 		batch, err := i.loadBatch(batchDir)
 		if err != nil && errors.Is(err, errInvalidBatch) {
@@ -156,7 +190,20 @@ func (i *batchImporter) importOnce(ctx context.Context) (int, int, error) {
 			continue
 		}
 		imported++
-		i.logger.Printf("imported batch=%s rows=%d", batch.BatchID, batch.Rows)
+		parseMs := int64(0)
+		copyMs := int64(0)
+		upsertMs := int64(0)
+		commitMs := int64(0)
+		if batch.Timings != nil {
+			parseMs = durationMilliseconds(batch.Timings.Parse)
+			copyMs = durationMilliseconds(batch.Timings.Copy)
+			upsertMs = durationMilliseconds(batch.Timings.Upsert)
+			commitMs = durationMilliseconds(batch.Timings.Commit)
+		}
+		totalMs := durationMilliseconds(time.Since(started))
+		i.logger.Printf(
+			"imported batch=%s rows=%d ReceiveMs=0 ValidateMs=0 ParseMs=%d CopyMs=%d UpsertMs=%d CommitMs=%d TotalMs=%d elapsed=%dms",
+			batch.BatchID, batch.Rows, parseMs, copyMs, upsertMs, commitMs, totalMs, totalMs)
 	}
 	return imported, failed, nil
 }
@@ -164,13 +211,20 @@ func (i *batchImporter) importOnce(ctx context.Context) (int, int, error) {
 func (i *batchImporter) importDirectory(ctx context.Context, directory string) (importBatch, error) {
 	batch, err := i.loadBatch(directory)
 	if err != nil {
-		return importBatch{}, err
+		return batch, err
+	}
+	return i.importPreparedBatch(ctx, batch)
+}
+
+func (i *batchImporter) importPreparedBatch(ctx context.Context, batch importBatch) (importBatch, error) {
+	if batch.Timings == nil {
+		batch.Timings = &importTimings{}
 	}
 	batchCtx, cancel := context.WithTimeout(ctx, i.importTimeout)
-	err = i.importBatch(batchCtx, batch)
+	err := i.importBatch(batchCtx, batch)
 	cancel()
 	if err != nil {
-		return importBatch{}, err
+		return batch, err
 	}
 	return batch, nil
 }
@@ -200,22 +254,21 @@ func (i *batchImporter) loadBatch(directory string) (importBatch, error) {
 	if decoded, err := hex.DecodeString(expectedHash); err != nil || len(decoded) != sha256.Size {
 		return importBatch{}, fmt.Errorf("%w: invalid Sha256 in meta.ini", errInvalidBatch)
 	}
-	actualHash, err := hashFile(dataPath)
-	if err != nil {
-		return importBatch{}, err
+	actualHash, rows, parseElapsed, err := i.readAndParseImportRows(dataPath, collectorID)
+	timings := &importTimings{Parse: parseElapsed}
+	if actualHash != "" && !strings.EqualFold(expectedHash, actualHash) {
+		err = fmt.Errorf("%w: data.csv SHA-256 does not match meta.ini", errInvalidBatch)
 	}
-	if !strings.EqualFold(expectedHash, actualHash) {
-		return importBatch{}, fmt.Errorf("%w: data.csv SHA-256 does not match meta.ini", errInvalidBatch)
-	}
-
-	rows, err := i.readImportRows(dataPath, collectorID)
 	if err != nil {
-		return importBatch{}, err
+		return importBatch{Timings: timings}, err
 	}
 	if len(rows) != expectedRows {
-		return importBatch{}, fmt.Errorf("%w: row count mismatch: expected %d, got %d", errInvalidBatch, expectedRows, len(rows))
+		return importBatch{Timings: timings}, fmt.Errorf("%w: row count mismatch: expected %d, got %d", errInvalidBatch, expectedRows, len(rows))
 	}
-	return importBatch{BatchID: batchID, CollectorID: collectorID, SHA256: expectedHash, Rows: expectedRows, Data: rows}, nil
+	return importBatch{
+		BatchID: batchID, CollectorID: collectorID, SHA256: expectedHash,
+		Rows: expectedRows, Data: rows, Timings: timings,
+	}, nil
 }
 
 func (i *batchImporter) readImportRows(path, collectorID string) ([]importRow, error) {
@@ -224,8 +277,34 @@ func (i *batchImporter) readImportRows(path, collectorID string) ([]importRow, e
 		return nil, err
 	}
 	defer file.Close()
+	return parseImportRows(file, collectorID, i.timezone)
+}
 
-	reader := csv.NewReader(file)
+func (i *batchImporter) readAndParseImportRows(path, collectorID string) (string, []importRow, time.Duration, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", nil, 0, err
+	}
+	defer file.Close()
+
+	digest := sha256.New()
+	tee := io.TeeReader(file, digest)
+	started := time.Now()
+	rows, parseErr := parseImportRows(tee, collectorID, i.timezone)
+	if parseErr != nil {
+		_, drainErr := io.Copy(io.Discard, tee)
+		if drainErr != nil {
+			parseErr = fmt.Errorf("%w: cannot finish reading data.csv: %v", errInvalidBatch, drainErr)
+		}
+	}
+	return hex.EncodeToString(digest.Sum(nil)), rows, time.Since(started), parseErr
+}
+
+func parseImportRows(source io.Reader, collectorID string, timezone *time.Location) ([]importRow, error) {
+	if timezone == nil {
+		timezone = time.Local
+	}
+	reader := csv.NewReader(source)
 	reader.FieldsPerRecord = 7
 	header, err := reader.Read()
 	if err != nil {
@@ -256,7 +335,7 @@ func (i *batchImporter) readImportRows(path, collectorID string) ([]importRow, e
 		if tag == "" {
 			return nil, fmt.Errorf("%w: CSV line %d: Tag is empty", errInvalidBatch, line)
 		}
-		parsedTime, err := time.ParseInLocation("2006-01-02 15:04:05", timestamp, i.timezone)
+		parsedTime, err := time.ParseInLocation("2006-01-02 15:04:05", timestamp, timezone)
 		if err != nil {
 			return nil, fmt.Errorf("%w: CSV line %d: invalid Timestamp %q", errInvalidBatch, line, timestamp)
 		}
@@ -302,6 +381,7 @@ func (i *batchImporter) importBatch(ctx context.Context, batch importBatch) erro
 	}
 	defer tx.Rollback(ctx)
 
+	copyStarted := time.Now()
 	_, err = tx.Exec(ctx, `CREATE TEMP TABLE history_samples_stage (
 		row_order bigint NOT NULL,
 		sample_key text NOT NULL,
@@ -317,6 +397,9 @@ func (i *batchImporter) importBatch(ctx context.Context, batch importBatch) erro
 		batch_id text NOT NULL
 	) ON COMMIT DROP`)
 	if err != nil {
+		if batch.Timings != nil {
+			batch.Timings.Copy = time.Since(copyStarted)
+		}
 		return err
 	}
 
@@ -338,31 +421,26 @@ func (i *batchImporter) importBatch(ctx context.Context, batch importBatch) erro
 		},
 		pgx.CopyFromRows(copyRows))
 	if err != nil {
+		if batch.Timings != nil {
+			batch.Timings.Copy = time.Since(copyStarted)
+		}
 		return err
+	}
+	if batch.Timings != nil {
+		batch.Timings.Copy = time.Since(copyStarted)
 	}
 	if copied != int64(len(batch.Data)) {
 		return fmt.Errorf("staging COPY row count mismatch: expected %d, got %d", len(batch.Data), copied)
 	}
 
-	_, err = tx.Exec(ctx, `INSERT INTO history_samples
-		 (sample_key, collector_id, tag, sample_time, value_double, value_text,
-		  data_type, flags, sequence_no, archive_status, batch_id)
-		 SELECT sample_key, collector_id, tag, sample_time::timestamp, value_double,
-		  value_text, data_type, flags, sequence_no, archive_status, batch_id
-		 FROM (
-		  SELECT DISTINCT ON (sample_key) *
-		  FROM history_samples_stage
-		  ORDER BY sample_key, row_order DESC
-		 ) AS staged
-		 ON CONFLICT (sample_key) DO UPDATE SET
-		  value_double=EXCLUDED.value_double, value_text=EXCLUDED.value_text,
-		  data_type=EXCLUDED.data_type, flags=EXCLUDED.flags,
-		  archive_status=EXCLUDED.archive_status, batch_id=EXCLUDED.batch_id,
-		  received_at=CURRENT_TIMESTAMP`)
+	upsertStarted := time.Now()
+	_, err = tx.Exec(ctx, historySamplesUpsertSQL)
 	if err != nil {
+		if batch.Timings != nil {
+			batch.Timings.Upsert = time.Since(upsertStarted)
+		}
 		return err
 	}
-
 	_, err = tx.Exec(
 		ctx,
 		`INSERT INTO imported_batches (batch_id, sha256, row_count)
@@ -371,9 +449,20 @@ func (i *batchImporter) importBatch(ctx context.Context, batch importBatch) erro
 		batch.SHA256,
 		batch.Rows)
 	if err != nil {
+		if batch.Timings != nil {
+			batch.Timings.Upsert = time.Since(upsertStarted)
+		}
 		return err
 	}
-	return tx.Commit(ctx)
+	if batch.Timings != nil {
+		batch.Timings.Upsert = time.Since(upsertStarted)
+	}
+	commitStarted := time.Now()
+	err = tx.Commit(ctx)
+	if batch.Timings != nil {
+		batch.Timings.Commit = time.Since(commitStarted)
+	}
+	return err
 }
 
 func (i *batchImporter) moveToArchive(source, batchID string) error {
@@ -414,17 +503,4 @@ func sampleKey(collectorID, tag, timestamp, sequenceNo, valueText string) string
 		sortableTime += "0"
 	}
 	return groupText[:16] + sortableTime + digestText[:27]
-}
-
-func hashFile(path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-	digest := sha256.New()
-	if _, err := io.Copy(digest, file); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(digest.Sum(nil)), nil
 }

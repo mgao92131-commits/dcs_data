@@ -89,6 +89,24 @@ func TestProcessedSampleKeyIsOrderedByTimestamp(t *testing.T) {
 	}
 }
 
+func TestHistorySamplesUpsertSkipsUnchangedRows(t *testing.T) {
+	for _, field := range []string{
+		"value_double",
+		"value_text",
+		"data_type",
+		"flags",
+		"archive_status",
+	} {
+		needle := "history_samples." + field + " IS DISTINCT FROM EXCLUDED." + field
+		if !strings.Contains(historySamplesUpsertSQL, needle) {
+			t.Fatalf("conditional UPSERT is missing comparison for %s", field)
+		}
+	}
+	if !strings.Contains(historySamplesUpsertSQL, "ON CONFLICT (sample_key) DO UPDATE SET") {
+		t.Fatal("conditional UPSERT lost its conflict handler")
+	}
+}
+
 func TestLoadBatchRejectsChangedCSV(t *testing.T) {
 	root := t.TempDir()
 	batchID := "test_batch_001"

@@ -12,6 +12,42 @@ namespace DeltaVHistoryCLI
         public BatchLimitException(string message) : base(message) { }
     }
 
+    class PendingCapacityException : IOException
+    {
+        public readonly int PendingBatches;
+        public readonly long PendingBytes;
+        public readonly int MaxPendingBatches;
+        public readonly long MaxPendingBytes;
+        public readonly long AdditionalBytes;
+
+        public PendingCapacityException(
+            int pendingBatches,
+            long pendingBytes,
+            int maxPendingBatches,
+            long maxPendingBytes,
+            long additionalBytes)
+            : base(
+                "Pending outbox capacity reached. batches=" +
+                pendingBatches.ToString(CultureInfo.InvariantCulture) +
+                " bytes=" + pendingBytes.ToString(CultureInfo.InvariantCulture) +
+                " maxBatches=" + maxPendingBatches.ToString(CultureInfo.InvariantCulture) +
+                " maxBytes=" + maxPendingBytes.ToString(CultureInfo.InvariantCulture) +
+                " additionalBytes=" + additionalBytes.ToString(CultureInfo.InvariantCulture))
+        {
+            PendingBatches = pendingBatches;
+            PendingBytes = pendingBytes;
+            MaxPendingBatches = maxPendingBatches;
+            MaxPendingBytes = maxPendingBytes;
+            AdditionalBytes = additionalBytes;
+        }
+    }
+
+    class PendingStats
+    {
+        public int Batches;
+        public long Bytes;
+    }
+
     class HistoryBatch
     {
         public string BatchId;
@@ -107,7 +143,7 @@ namespace DeltaVHistoryCLI
                 batch.BatchId + "_" + SafeName(reason) + "_" + Guid.NewGuid().ToString("N"));
         }
 
-        public void EnsurePendingCapacity(int maxBatches, long maxBytes)
+        public PendingStats GetPendingStats()
         {
             string pendingRoot = Path.Combine(_spoolDirectory, "pending");
             Directory.CreateDirectory(pendingRoot);
@@ -118,12 +154,41 @@ namespace DeltaVHistoryCLI
             {
                 string dataPath = Path.Combine(directories[i], "data.csv");
                 if (File.Exists(dataPath))
-                    bytes += new FileInfo(dataPath).Length;
+                {
+                    long length = new FileInfo(dataPath).Length;
+                    if (length > Int64.MaxValue - bytes)
+                        bytes = Int64.MaxValue;
+                    else
+                        bytes += length;
+                }
             }
-            if (directories.Length >= maxBatches || bytes >= maxBytes)
-                throw new IOException(
-                    "Pending outbox capacity reached. batches=" + directories.Length.ToString() +
-                    " bytes=" + bytes.ToString(CultureInfo.InvariantCulture));
+            PendingStats stats = new PendingStats();
+            stats.Batches = directories.Length;
+            stats.Bytes = bytes;
+            return stats;
+        }
+
+        public void EnsurePendingCapacity(int maxBatches, long maxBytes)
+        {
+            EnsurePendingCapacity(maxBatches, maxBytes, 0);
+        }
+
+        public void EnsurePendingCapacity(int maxBatches, long maxBytes, long additionalBytes)
+        {
+            if (maxBatches <= 0 || maxBytes <= 0 || additionalBytes < 0)
+                throw new ArgumentOutOfRangeException("maxBatches");
+
+            PendingStats stats = GetPendingStats();
+            bool batchLimit = stats.Batches >= maxBatches;
+            bool byteLimit = stats.Bytes >= maxBytes ||
+                additionalBytes > maxBytes - stats.Bytes;
+            if (batchLimit || byteLimit)
+                throw new PendingCapacityException(
+                    stats.Batches,
+                    stats.Bytes,
+                    maxBatches,
+                    maxBytes,
+                    additionalBytes);
         }
 
         private void Save(HistoryBatch batch, byte[] data, string area, string directoryName)

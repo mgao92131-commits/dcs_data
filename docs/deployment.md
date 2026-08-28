@@ -40,6 +40,22 @@ diagnostics. None of these scripts installs a system component.
 `MaxWindowMinutes` remains 30. All retained tags are read with
 `InterpolatedValue` at `[Sampling] IntervalSeconds=10`.
 
+The reliability defaults are `OverlapSeconds=60`, `MaxPendingBatches=50`,
+`MaxPendingBytes=104857600`, `BacklogDrainSeconds=60`, and a 75-second DCS
+sender timeout. On a transient Receiver failure, pending data is retained in
+oldest-first order. If the pending safety limit is reached, the state records
+`CollectionPaused=true`; the continuous host stays running and does not read
+more Historian data until the backlog can drain.
+
+For synchronous PostgreSQL ACK, keep the timeout hierarchy aligned:
+`ImportTimeoutSeconds=45`, `WriteTimeoutSeconds=60`, and DCS
+`TimeoutSeconds=75`.
+
+The current sender/receiver path also reuses one Historian TimeSpan per window,
+parses the incoming CSV during HTTP staging, skips no-op PostgreSQL overlap
+updates, and streams pending files over KeepAlive connections. The durable
+staging/inbox files remain available for restart recovery.
+
 ## Upgrade
 
 Preserve `config`, `state`, `spool`, and `logs`, then replace only `bin` and
