@@ -36,17 +36,19 @@ type batchImporter struct {
 
 var errBatchConflict = errors.New("batch_id already exists with different content")
 var errInvalidBatch = errors.New("invalid batch")
+var errImportCopySourceNotReady = errors.New("import COPY source Values called before Next")
 
 type importRow struct {
-	SampleKey     string
-	Tag           string
-	TimeText      string
-	ValueText     string
-	ValueDouble   *float64
-	DataType      string
-	Flags         string
-	SequenceNo    string
-	ArchiveStatus string
+	SampleKey      string
+	Tag            string
+	SampleTime     time.Time
+	ValueText      string
+	ValueDouble    float64
+	HasValueDouble bool
+	DataType       string
+	Flags          string
+	SequenceNo     string
+	ArchiveStatus  string
 }
 
 type importTimings struct {
@@ -66,16 +68,67 @@ type importBatch struct {
 	AlreadyCommitted bool
 }
 
+// importCopySource exposes one typed import row at a time to pgx. The values
+// slice is reused because pgx encodes it before asking the source for the next
+// row; this avoids retaining one interface slice per row for a large batch.
+type importCopySource struct {
+	rows        []importRow
+	collectorID string
+	batchID     string
+	index       int
+	values      []interface{}
+}
+
+func newImportCopySource(batch *importBatch) *importCopySource {
+	return &importCopySource{
+		rows:        batch.Data,
+		collectorID: batch.CollectorID,
+		batchID:     batch.BatchID,
+		values:      make([]interface{}, 11),
+	}
+}
+
+func (s *importCopySource) Next() bool {
+	if s.index >= len(s.rows) {
+		return false
+	}
+	s.index++
+	return true
+}
+
+func (s *importCopySource) Values() ([]interface{}, error) {
+	if s.index == 0 || s.index > len(s.rows) {
+		return nil, errImportCopySourceNotReady
+	}
+	row := s.rows[s.index-1]
+	s.values[0] = row.SampleKey
+	s.values[1] = s.collectorID
+	s.values[2] = row.Tag
+	s.values[3] = row.SampleTime
+	if row.HasValueDouble {
+		s.values[4] = row.ValueDouble
+	} else {
+		s.values[4] = nil
+	}
+	s.values[5] = row.ValueText
+	s.values[6] = row.DataType
+	s.values[7] = row.Flags
+	s.values[8] = row.SequenceNo
+	s.values[9] = row.ArchiveStatus
+	s.values[10] = s.batchID
+	return s.values, nil
+}
+
+func (s *importCopySource) Err() error {
+	return nil
+}
+
 const historySamplesUpsertSQL = `INSERT INTO history_samples
 	 (sample_key, collector_id, tag, sample_time, value_double, value_text,
 	  data_type, flags, sequence_no, archive_status, batch_id)
-	 SELECT sample_key, collector_id, tag, sample_time::timestamp, value_double,
+	 SELECT sample_key, collector_id, tag, sample_time, value_double,
 	  value_text, data_type, flags, sequence_no, archive_status, batch_id
-	 FROM (
-	  SELECT DISTINCT ON (sample_key) *
-	  FROM history_samples_stage
-	  ORDER BY sample_key, row_order DESC
-	 ) AS staged
+	 FROM history_samples_stage
 	 ON CONFLICT (sample_key) DO UPDATE SET
 	  value_double=EXCLUDED.value_double, value_text=EXCLUDED.value_text,
 	  data_type=EXCLUDED.data_type, flags=EXCLUDED.flags,
@@ -86,6 +139,20 @@ const historySamplesUpsertSQL = `INSERT INTO history_samples
 	    OR history_samples.data_type IS DISTINCT FROM EXCLUDED.data_type
 	    OR history_samples.flags IS DISTINCT FROM EXCLUDED.flags
 	    OR history_samples.archive_status IS DISTINCT FROM EXCLUDED.archive_status`
+
+const historySamplesStageDDL = `CREATE TEMP TABLE history_samples_stage (
+	sample_key text PRIMARY KEY,
+	collector_id text NOT NULL,
+	tag text NOT NULL,
+	sample_time timestamp NOT NULL,
+	value_double double precision,
+	value_text text NOT NULL,
+	data_type text NOT NULL,
+	flags text NOT NULL,
+	sequence_no text NOT NULL,
+	archive_status text NOT NULL,
+	batch_id text NOT NULL
+) ON COMMIT DROP`
 
 func newBatchImporter(config receiverConfig, pool *pgxpool.Pool, logger *log.Logger) (*batchImporter, error) {
 	location := config.PostgresLocation
@@ -255,7 +322,7 @@ func (i *batchImporter) loadBatch(directory string) (importBatch, error) {
 	if decoded, err := hex.DecodeString(expectedHash); err != nil || len(decoded) != sha256.Size {
 		return importBatch{}, fmt.Errorf("%w: invalid Sha256 in meta.ini", errInvalidBatch)
 	}
-	actualHash, rows, parseElapsed, err := i.readAndParseImportRows(dataPath, collectorID)
+	actualHash, rows, parseElapsed, err := i.readAndParseImportRows(dataPath, collectorID, expectedRows)
 	timings := &importTimings{Parse: parseElapsed}
 	if actualHash != "" && !strings.EqualFold(expectedHash, actualHash) {
 		err = fmt.Errorf("%w: data.csv SHA-256 does not match meta.ini", errInvalidBatch)
@@ -281,7 +348,7 @@ func (i *batchImporter) readImportRows(path, collectorID string) ([]importRow, e
 	return parseImportRows(file, collectorID, i.timezone)
 }
 
-func (i *batchImporter) readAndParseImportRows(path, collectorID string) (string, []importRow, time.Duration, error) {
+func (i *batchImporter) readAndParseImportRows(path, collectorID string, expectedRows ...int) (string, []importRow, time.Duration, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", nil, 0, err
@@ -291,7 +358,11 @@ func (i *batchImporter) readAndParseImportRows(path, collectorID string) (string
 	digest := sha256.New()
 	tee := io.TeeReader(file, digest)
 	started := time.Now()
-	rows, parseErr := parseImportRows(tee, collectorID, i.timezone)
+	capacity := 0
+	if len(expectedRows) > 0 {
+		capacity = expectedRows[0]
+	}
+	rows, parseErr := parseImportRowsWithCapacity(tee, collectorID, i.timezone, capacity)
 	if parseErr != nil {
 		_, drainErr := io.Copy(io.Discard, tee)
 		if drainErr != nil {
@@ -302,6 +373,17 @@ func (i *batchImporter) readAndParseImportRows(path, collectorID string) (string
 }
 
 func parseImportRows(source io.Reader, collectorID string, timezone *time.Location) ([]importRow, error) {
+	return parseImportRowsWithCapacity(source, collectorID, timezone, 0)
+}
+
+const maxPreallocatedImportRows = 500000
+
+func parseImportRowsWithCapacity(
+	source io.Reader,
+	collectorID string,
+	timezone *time.Location,
+	expectedRows int,
+) ([]importRow, error) {
 	if timezone == nil {
 		timezone = time.Local
 	}
@@ -319,7 +401,11 @@ func parseImportRows(source io.Reader, collectorID string, timezone *time.Locati
 		}
 	}
 
-	var rows []importRow
+	capacity := expectedRows
+	if capacity < 0 || capacity > maxPreallocatedImportRows {
+		capacity = 0
+	}
+	rows := make([]importRow, 0, capacity)
 	line := 1
 	for {
 		record, err := reader.Read()
@@ -340,20 +426,30 @@ func parseImportRows(source io.Reader, collectorID string, timezone *time.Locati
 		if err != nil {
 			return nil, fmt.Errorf("%w: CSV line %d: invalid Timestamp %q", errInvalidBatch, line, timestamp)
 		}
-		var valueDouble *float64
+		valueDouble := 0.0
+		hasValueDouble := false
 		if value, parseErr := strconv.ParseFloat(strings.TrimSpace(valueText), 64); parseErr == nil {
-			valueDouble = &value
+			valueDouble = value
+			hasValueDouble = true
 		}
+		// PostgreSQL timestamp (without time zone) stores the wall-clock value.
+		// Keep the parsed components while using UTC so the pgx timestamp codec
+		// cannot shift the value when it normalizes the time.Time location.
+		sampleTime := time.Date(
+			parsedTime.Year(), parsedTime.Month(), parsedTime.Day(),
+			parsedTime.Hour(), parsedTime.Minute(), parsedTime.Second(),
+			(parsedTime.Nanosecond()/1000)*1000, time.UTC)
 		rows = append(rows, importRow{
-			SampleKey:     sampleKey(collectorID, tag, timestamp, strings.TrimSpace(record[5]), valueText),
-			Tag:           tag,
-			TimeText:      parsedTime.Format("2006-01-02 15:04:05.000000"),
-			ValueText:     valueText,
-			ValueDouble:   valueDouble,
-			DataType:      strings.TrimSpace(record[3]),
-			Flags:         strings.TrimSpace(record[4]),
-			SequenceNo:    strings.TrimSpace(record[5]),
-			ArchiveStatus: strings.TrimSpace(record[6]),
+			SampleKey:      sampleKey(collectorID, tag, timestamp, strings.TrimSpace(record[5]), valueText),
+			Tag:            tag,
+			SampleTime:     sampleTime,
+			ValueText:      valueText,
+			ValueDouble:    valueDouble,
+			HasValueDouble: hasValueDouble,
+			DataType:       strings.TrimSpace(record[3]),
+			Flags:          strings.TrimSpace(record[4]),
+			SequenceNo:     strings.TrimSpace(record[5]),
+			ArchiveStatus:  strings.TrimSpace(record[6]),
 		})
 	}
 	return rows, nil
@@ -417,20 +513,7 @@ func (i *batchImporter) importBatch(ctx context.Context, batch *importBatch) err
 	defer tx.Rollback(ctx)
 
 	copyStarted := time.Now()
-	_, err = tx.Exec(ctx, `CREATE TEMP TABLE history_samples_stage (
-		row_order bigint NOT NULL,
-		sample_key text NOT NULL,
-		collector_id text NOT NULL,
-		tag text NOT NULL,
-		sample_time text NOT NULL,
-		value_double double precision,
-		value_text text NOT NULL,
-		data_type text NOT NULL,
-		flags text NOT NULL,
-		sequence_no text NOT NULL,
-		archive_status text NOT NULL,
-		batch_id text NOT NULL
-	) ON COMMIT DROP`)
+	_, err = tx.Exec(ctx, historySamplesStageDDL)
 	if err != nil {
 		if batch.Timings != nil {
 			batch.Timings.Copy = time.Since(copyStarted)
@@ -438,23 +521,16 @@ func (i *batchImporter) importBatch(ctx context.Context, batch *importBatch) err
 		return err
 	}
 
-	copyRows := make([][]interface{}, len(batch.Data))
-	for index, row := range batch.Data {
-		copyRows[index] = []interface{}{
-			int64(index), row.SampleKey, batch.CollectorID, row.Tag, row.TimeText,
-			row.ValueDouble, row.ValueText, row.DataType, row.Flags,
-			row.SequenceNo, row.ArchiveStatus, batch.BatchID,
-		}
-	}
+	copySource := newImportCopySource(batch)
 	copied, err := tx.CopyFrom(
 		ctx,
 		pgx.Identifier{"history_samples_stage"},
 		[]string{
-			"row_order", "sample_key", "collector_id", "tag", "sample_time",
+			"sample_key", "collector_id", "tag", "sample_time",
 			"value_double", "value_text", "data_type", "flags", "sequence_no",
 			"archive_status", "batch_id",
 		},
-		pgx.CopyFromRows(copyRows))
+		copySource)
 	if err != nil {
 		if batch.Timings != nil {
 			batch.Timings.Copy = time.Since(copyStarted)

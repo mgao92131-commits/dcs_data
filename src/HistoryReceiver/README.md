@@ -72,3 +72,9 @@ GET http://192.168.1.10:8080/healthz
 数据库同步 ACK 必须包含 `commit_level=database`；未启用同步提交时为
 `commit_level=inbox`。响应包括 `database_ok` 和 `inbox_batches`。Receiver archive 默认保留 30 天，
 日志默认保留 30 天；rejected 批次只报警，不自动删除。
+archive 移动失败的已提交批次会保留在 `archive_pending`，Receiver 每小时自动
+重试恢复，每轮最多 100 个；仍失败的项目继续保留并告警。
+
+示例配置默认 `StagingDurability=full`，会将接收的 CSV 和 metadata 刷到稳定存储。
+`buffered` 仅建议用于受控性能测试；同步模式下 PostgreSQL COMMIT 仍是 ACK 边界，
+但未提交的 staging 文件可能在掉电后丢失。

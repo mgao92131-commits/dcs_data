@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -211,8 +212,92 @@ func TestReceiverTimeoutDefaultsAreOrdered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.WriteTimeout != 60*time.Second || config.ImportTimeout != 45*time.Second {
-		t.Fatalf("unexpected timeout defaults: write=%s import=%s", config.WriteTimeout, config.ImportTimeout)
+	if config.WriteTimeout != 60*time.Second || config.ImportTimeout != 45*time.Second ||
+		config.StagingDurability != stagingDurabilityFull {
+		t.Fatalf("unexpected defaults: write=%s import=%s staging_durability=%s", config.WriteTimeout, config.ImportTimeout, config.StagingDurability)
+	}
+}
+
+func TestReceiverRejectsInvalidStagingDurability(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "receiver.ini")
+	content := strings.Join([]string{
+		"[Server]",
+		"Listen=127.0.0.1:8080",
+		"ApiKey=test-secret",
+		"MaxBodyBytes=1024",
+		"",
+		"[Files]",
+		"StagingDurability=off",
+		"",
+		"[PostgreSQL]",
+		"Enabled=false",
+		"SynchronousCommit=false",
+		"",
+	}, "\n")
+	if err := os.WriteFile(configPath, []byte(content), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadReceiverConfig(configPath, root); err == nil ||
+		!strings.Contains(err.Error(), "StagingDurability") {
+		t.Fatalf("expected staging durability validation error, got %v", err)
+	}
+}
+
+func TestMaintenanceRetriesArchivePending(t *testing.T) {
+	root := t.TempDir()
+	config := receiverConfig{
+		Archive:              filepath.Join(root, "archive"),
+		ArchivePending:       filepath.Join(root, "archive_pending"),
+		Logs:                 filepath.Join(root, "logs"),
+		Rejected:             filepath.Join(root, "rejected"),
+		ArchiveRetentionDays: 30,
+		LogRetentionDays:     30,
+	}
+	for _, directory := range []string{config.Archive, config.ArchivePending, config.Logs, config.Rejected} {
+		if err := os.MkdirAll(directory, 0750); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	batchID := "pending_batch_with_underscores"
+	pendingDir := filepath.Join(config.ArchivePending, batchID+"_123456789")
+	if err := os.Mkdir(pendingDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	meta := "[Batch]\nBatchId=" + batchID + "\nCollectorId=DCS-APP-01\nRows=0\nSha256=" + strings.Repeat("a", 64) + "\n"
+	if err := os.WriteFile(filepath.Join(pendingDir, "meta.ini"), []byte(meta), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pendingDir, "data.csv"), []byte("payload"), 0640); err != nil {
+		t.Fatal(err)
+	}
+
+	runMaintenancePass(config, log.New(io.Discard, "", 0), time.Now())
+	if _, err := os.Stat(pendingDir); !os.IsNotExist(err) {
+		t.Fatalf("recovered archive_pending directory still exists: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(config.Archive, batchID)); err != nil {
+		t.Fatalf("recovered archive batch is missing: %v", err)
+	}
+
+	failedID := "pending_batch_that_stays"
+	failedDir := filepath.Join(config.ArchivePending, failedID+"_987654321")
+	if err := os.Mkdir(failedDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	failedMeta := "[Batch]\nBatchId=" + failedID + "\n"
+	if err := os.WriteFile(filepath.Join(failedDir, "meta.ini"), []byte(failedMeta), 0640); err != nil {
+		t.Fatal(err)
+	}
+	archiveBlocker := filepath.Join(root, "archive-blocker")
+	if err := os.WriteFile(archiveBlocker, []byte("not a directory"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	config.Archive = archiveBlocker
+	runMaintenancePass(config, log.New(io.Discard, "", 0), time.Now())
+	if _, err := os.Stat(failedDir); err != nil {
+		t.Fatalf("failed archive_pending entry must remain for a later retry: %v", err)
 	}
 }
 
@@ -266,7 +351,7 @@ func TestStageAndParseBodyHashesAndParsesInOnePass(t *testing.T) {
 	if staged.ActualHash != hashBytes(body) || len(staged.Rows) != 2 {
 		t.Fatalf("unexpected staged result: hash=%s rows=%d", staged.ActualHash, len(staged.Rows))
 	}
-	if staged.Rows[0].Tag != "TAG/A" || staged.Rows[0].ValueDouble == nil {
+	if staged.Rows[0].Tag != "TAG/A" || !staged.Rows[0].HasValueDouble {
 		t.Fatalf("CSV conversion did not produce import rows: %+v", staged.Rows)
 	}
 	stored, err := os.ReadFile(path)
@@ -289,6 +374,69 @@ func TestStageAndParseBodyEnforcesMaximum(t *testing.T) {
 		time.FixedZone("Asia/Shanghai", 8*60*60))
 	if err != errBodyTooLarge {
 		t.Fatalf("expected body-too-large error, got %v", err)
+	}
+}
+
+func TestStageAndParseBodySupportsBufferedDurability(t *testing.T) {
+	root := t.TempDir()
+	body := testCSV()
+	staged, err := stageAndParseBodyWithConfig(
+		filepath.Join(root, "data.csv"),
+		bytes.NewReader(body),
+		int64(len(body)),
+		"DCS-APP-01",
+		time.FixedZone("Asia/Shanghai", 8*60*60),
+		2,
+		stagingDurabilityBuffered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(staged.Rows) != 2 || cap(staged.Rows) != 2 {
+		t.Fatalf("buffered staging did not use expected row capacity: len=%d cap=%d", len(staged.Rows), cap(staged.Rows))
+	}
+	if staged.ActualHash != hashBytes(body) {
+		t.Fatalf("buffered staging produced wrong hash: %s", staged.ActualHash)
+	}
+}
+
+func TestRetryArchivePendingIsLimitedPerPass(t *testing.T) {
+	root := t.TempDir()
+	config := receiverConfig{
+		Archive:        filepath.Join(root, "archive"),
+		ArchivePending: filepath.Join(root, "archive_pending"),
+	}
+	if err := os.MkdirAll(config.Archive, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(config.ArchivePending, 0750); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < maxArchivePendingRetries+1; index++ {
+		batchID := fmt.Sprintf("pending_%03d", index)
+		pendingDir := filepath.Join(config.ArchivePending, batchID+"_retry")
+		if err := os.Mkdir(pendingDir, 0750); err != nil {
+			t.Fatal(err)
+		}
+		meta := "[Batch]\nBatchId=" + batchID + "\n"
+		if err := os.WriteFile(filepath.Join(pendingDir, "meta.ini"), []byte(meta), 0640); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	recovered, failed := retryArchivePending(config, log.New(io.Discard, "", 0))
+	if recovered != maxArchivePendingRetries || failed != 0 {
+		t.Fatalf("unexpected archive_pending retry result: recovered=%d failed=%d", recovered, failed)
+	}
+	pendingEntries, err := os.ReadDir(config.ArchivePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archiveEntries, err := os.ReadDir(config.Archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pendingEntries) != 1 || len(archiveEntries) != maxArchivePendingRetries {
+		t.Fatalf("archive_pending retry exceeded per-pass limit: pending=%d archive=%d", len(pendingEntries), len(archiveEntries))
 	}
 }
 

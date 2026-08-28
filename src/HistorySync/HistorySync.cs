@@ -1,11 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Text;
 using System.Threading;
-using System.Diagnostics;
 
 namespace DeltaVHistoryCLI
 {
@@ -107,6 +107,8 @@ namespace DeltaVHistoryCLI
         public int MaxFailedTagsPerBatch;
         public int MaxBatchRows;
         public long MaxBatchBytes;
+        public int TargetBatchRows;
+        public long TargetBatchBytes;
     }
 
     class SyncLogger : IDisposable
@@ -143,11 +145,168 @@ namespace DeltaVHistoryCLI
 
     class SyncProgram
     {
-        private const string Version = "3.2.1-reliability";
+        private const string Version = "3.3-performance";
         private const int CollectionPausedExitCode = 45;
         private const string MutexName = "Global\\DeltaVHistorySync";
         private const string ContinuousStopEventName =
             "Local\\DcsDataHistorySyncStop";
+
+        private sealed class ContinuousHistorianSession : IDisposable
+        {
+            private HistorianClient _client;
+            private List<TagResult> _tags;
+            private string _server;
+            private string _singleTag;
+            private string _tagsPath;
+            private DateTime _tagsLastWriteTimeUtc;
+            private long _tagsLength;
+            private bool _hasTagsFileSignature;
+            private SyncLogger _log;
+            private double _bytesPerRowEstimate = 256.0;
+
+            public HistorianClient Client
+            {
+                get { return _client; }
+            }
+
+            public List<TagResult> Tags
+            {
+                get { return _tags; }
+            }
+
+            public double BytesPerRowEstimate
+            {
+                get { return _bytesPerRowEstimate; }
+                set { _bytesPerRowEstimate = value; }
+            }
+
+            public bool RequiresResolve(SyncOptions options)
+            {
+                if (_client == null || _tags == null)
+                    return true;
+                if (!String.Equals(_server, options.Server, StringComparison.OrdinalIgnoreCase))
+                    return true;
+                if (!String.Equals(_singleTag, options.SingleTag, StringComparison.Ordinal))
+                    return true;
+                if (!String.IsNullOrEmpty(options.SingleTag))
+                    return false;
+
+                FileInfo tagsFile;
+                try
+                {
+                    if (!File.Exists(options.TagsFile))
+                        return true;
+                    tagsFile = new FileInfo(options.TagsFile);
+                }
+                catch
+                {
+                    return true;
+                }
+                return !_hasTagsFileSignature ||
+                    !String.Equals(_tagsPath, options.TagsFile, StringComparison.OrdinalIgnoreCase) ||
+                    _tagsLastWriteTimeUtc != tagsFile.LastWriteTimeUtc ||
+                    _tagsLength != tagsFile.Length;
+            }
+
+            public void Prepare(
+                SyncOptions options,
+                List<string> tagNames,
+                SyncLogger log,
+                out long connectMilliseconds,
+                out long resolveMilliseconds)
+            {
+                connectMilliseconds = 0;
+                resolveMilliseconds = 0;
+                _log = log;
+
+                bool reconnect = _client == null ||
+                    !String.Equals(_server, options.Server, StringComparison.OrdinalIgnoreCase);
+                if (reconnect)
+                {
+                    DisposeClient();
+                    Stopwatch connectClock = Stopwatch.StartNew();
+                    _client = ConnectHistorian(
+                        options,
+                        delegate(string message)
+                        {
+                            if (_log != null)
+                                _log.Write("Historian " + message);
+                        },
+                        log);
+                    connectClock.Stop();
+                    connectMilliseconds = connectClock.ElapsedMilliseconds;
+                    _server = options.Server;
+                    _tags = null;
+                    _hasTagsFileSignature = false;
+                }
+
+                if (!RequiresResolve(options))
+                    return;
+                if (tagNames == null)
+                    tagNames = LoadSyncTags(options);
+
+                Stopwatch resolveClock = Stopwatch.StartNew();
+                try
+                {
+                    _tags = _client.ResolveTags(tagNames);
+                    CaptureTagsFileSignature(options);
+                }
+                catch
+                {
+                    Invalidate();
+                    throw;
+                }
+                finally
+                {
+                    resolveClock.Stop();
+                    resolveMilliseconds = resolveClock.ElapsedMilliseconds;
+                }
+            }
+
+            public void Invalidate()
+            {
+                DisposeClient();
+                _tags = null;
+                _hasTagsFileSignature = false;
+            }
+
+            public void Dispose()
+            {
+                Invalidate();
+                _log = null;
+            }
+
+            private void CaptureTagsFileSignature(SyncOptions options)
+            {
+                _singleTag = options.SingleTag;
+                _tagsPath = options.TagsFile;
+                _hasTagsFileSignature = false;
+                if (!String.IsNullOrEmpty(options.SingleTag))
+                    return;
+                try
+                {
+                    if (!File.Exists(options.TagsFile))
+                        return;
+                    FileInfo tagsFile = new FileInfo(options.TagsFile);
+                    _tagsLastWriteTimeUtc = tagsFile.LastWriteTimeUtc;
+                    _tagsLength = tagsFile.Length;
+                    _hasTagsFileSignature = true;
+                }
+                catch
+                {
+                }
+            }
+
+            private void DisposeClient()
+            {
+                if (_client != null)
+                {
+                    try { _client.Dispose(); }
+                    catch { }
+                    _client = null;
+                }
+            }
+        }
 
         static int Main(string[] args)
         {
@@ -253,6 +412,7 @@ namespace DeltaVHistoryCLI
             string[] syncArgs = new string[args.Length];
             Array.Copy(args, syncArgs, args.Length);
             syncArgs[0] = "sync";
+            ContinuousHistorianSession historianSession = new ContinuousHistorianSession();
 
             bool eventCreated;
             using (ManualResetEvent consoleStop = new ManualResetEvent(false))
@@ -281,10 +441,11 @@ namespace DeltaVHistoryCLI
                         int result;
                         try
                         {
-                            result = Run(syncArgs, baseDirectory);
+                            result = Run(syncArgs, baseDirectory, historianSession);
                         }
                         catch (Exception ex)
                         {
+                            historianSession.Invalidate();
                             result = 99;
                             Console.WriteLine("Sync cycle failed: " + ex.Message);
                         }
@@ -294,21 +455,16 @@ namespace DeltaVHistoryCLI
 
                         bool collectionPaused = result == CollectionPausedExitCode ||
                             IsCollectionPaused(args, baseDirectory);
-                        if (collectionPaused)
-                        {
-                            retryMode = true;
-                            nextStart = DateTime.Now.AddMilliseconds(
-                                ReadPendingRetryMilliseconds(args, baseDirectory));
-                        }
-                        else if (retryMode)
-                        {
-                            retryMode = false;
-                            nextStart = DateTime.Now.AddMilliseconds(intervalMilliseconds);
-                        }
-                        else
-                        {
-                            nextStart = nextStart.AddMilliseconds(intervalMilliseconds);
-                        }
+                        int pendingRetryMilliseconds = collectionPaused
+                            ? ReadPendingRetryMilliseconds(args, baseDirectory)
+                            : 0;
+                        nextStart = CalculateNextContinuousStart(
+                            nextStart,
+                            DateTime.Now,
+                            intervalMilliseconds,
+                            pendingRetryMilliseconds,
+                            collectionPaused,
+                            ref retryMode);
                         intervalMilliseconds = ReadRunIntervalMilliseconds(args, baseDirectory);
                         if (WaitHandle.WaitAny(
                             stopHandles,
@@ -321,6 +477,7 @@ namespace DeltaVHistoryCLI
                 }
                 finally
                 {
+                    historianSession.Dispose();
                     Console.CancelKeyPress -= handler;
                 }
             }
@@ -346,6 +503,27 @@ namespace DeltaVHistoryCLI
             if (seconds > 86400)
                 throw new Exception("[Receiver] PendingRetrySeconds cannot exceed 86400.");
             return checked(seconds * 1000);
+        }
+
+        private static DateTime CalculateNextContinuousStart(
+            DateTime previousNextStart,
+            DateTime now,
+            int intervalMilliseconds,
+            int pendingRetryMilliseconds,
+            bool collectionPaused,
+            ref bool retryMode)
+        {
+            if (collectionPaused)
+            {
+                retryMode = true;
+                return now.AddMilliseconds(pendingRetryMilliseconds);
+            }
+            if (retryMode)
+            {
+                retryMode = false;
+                return now.AddMilliseconds(intervalMilliseconds);
+            }
+            return previousNextStart.AddMilliseconds(intervalMilliseconds);
         }
 
         private static bool IsCollectionPaused(string[] args, string baseDirectory)
@@ -387,6 +565,14 @@ namespace DeltaVHistoryCLI
         }
 
         private static int Run(string[] args, string baseDirectory)
+        {
+            return Run(args, baseDirectory, null);
+        }
+
+        private static int Run(
+            string[] args,
+            string baseDirectory,
+            ContinuousHistorianSession historianSession)
         {
             if (args.Length == 0 || HasArg(args, "--help") || HasArg(args, "-h") || HasArg(args, "/?"))
             {
@@ -586,7 +772,8 @@ namespace DeltaVHistoryCLI
                     sender,
                     directSendAllowed,
                     state,
-                    stateStore);
+                    stateStore,
+                    historianSession);
                 if (collectionCode != 0 && collectionCode != 5)
                     return collectionCode;
                 return senderCode == 0 ? collectionCode : senderCode;
@@ -630,12 +817,23 @@ namespace DeltaVHistoryCLI
             options.MaxBatchBytes = ParsePositiveLong(
                 config.Get("Spool", "MaxBatchBytes", "20971520"),
                 "[Spool] MaxBatchBytes");
+            string targetRowsText = config.Get("Spool", "TargetBatchRows", null);
+            options.TargetBatchRows = targetRowsText == null
+                ? Math.Min(25000, options.MaxBatchRows)
+                : config.GetInt("Spool", "TargetBatchRows", 25000);
+            string targetBytesText = config.Get("Spool", "TargetBatchBytes", null);
+            options.TargetBatchBytes = targetBytesText == null
+                ? Math.Min(10485760L, options.MaxBatchBytes)
+                : ParsePositiveLong(targetBytesText, "[Spool] TargetBatchBytes");
             options.MinWindowSeconds = config.GetInt("Sync", "MinWindowSeconds", 10);
             options.MaxPendingBatches = config.GetInt("Spool", "MaxPendingBatches", 50);
             options.MaxPendingBytes = ParsePositiveLong(
                 config.Get("Spool", "MaxPendingBytes", "104857600"),
                 "[Spool] MaxPendingBytes");
-            if (options.MaxBatchRows <= 0 || options.MinWindowSeconds <= 0 ||
+            if (options.MaxBatchRows <= 0 || options.TargetBatchRows <= 0 ||
+                options.TargetBatchRows > options.MaxBatchRows ||
+                options.TargetBatchBytes > options.MaxBatchBytes ||
+                options.MinWindowSeconds <= 0 ||
                 options.MaxPendingBatches <= 0 || options.MaxFailedTagsPerBatch < 0)
                 throw new Exception("Invalid batch, failure, or dynamic window limits.");
 
@@ -716,13 +914,24 @@ namespace DeltaVHistoryCLI
 
         private static HistorianClient ConnectHistorian(SyncOptions options, SyncLogger log)
         {
+            return ConnectHistorian(
+                options,
+                delegate(string message) { log.Write("Historian " + message); },
+                log);
+        }
+
+        private static HistorianClient ConnectHistorian(
+            SyncOptions options,
+            HistorianLog historianLog,
+            SyncLogger log)
+        {
             Exception last = null;
             int attempt;
             for (attempt = 1; attempt <= options.ConnectRetries; attempt++)
             {
                 HistorianClient client = new HistorianClient(
                     @"C:\DeltaV",
-                    delegate(string message) { log.Write("Historian " + message); });
+                    historianLog);
                 try
                 {
                     client.Connect(options.Server);
@@ -942,14 +1151,46 @@ namespace DeltaVHistoryCLI
             BatchSender sender,
             bool directSendAllowed,
             SyncState state,
-            SyncStateStore stateStore)
+            SyncStateStore stateStore,
+            ContinuousHistorianSession historianSession)
         {
             HistorianClient client = null;
+            bool ownsHistorian = historianSession == null;
+            long historianConnectMilliseconds = 0;
+            long resolveTagsMilliseconds = 0;
+            double bytesPerRowEstimate = historianSession == null
+                ? 256.0
+                : historianSession.BytesPerRowEstimate;
             try
             {
-                client = ConnectHistorian(options, log);
-                List<string> tagNames = LoadSyncTags(options);
-                List<TagResult> tags = client.ResolveTags(tagNames);
+                List<TagResult> tags;
+                if (historianSession == null)
+                {
+                    Stopwatch connectClock = Stopwatch.StartNew();
+                    client = ConnectHistorian(options, log);
+                    connectClock.Stop();
+                    historianConnectMilliseconds = connectClock.ElapsedMilliseconds;
+
+                    List<string> tagNames = LoadSyncTags(options);
+                    Stopwatch resolveClock = Stopwatch.StartNew();
+                    tags = client.ResolveTags(tagNames);
+                    resolveClock.Stop();
+                    resolveTagsMilliseconds = resolveClock.ElapsedMilliseconds;
+                }
+                else
+                {
+                    List<string> tagNames = historianSession.RequiresResolve(options)
+                        ? LoadSyncTags(options)
+                        : null;
+                    historianSession.Prepare(
+                        options,
+                        tagNames,
+                        log,
+                        out historianConnectMilliseconds,
+                        out resolveTagsMilliseconds);
+                    client = historianSession.Client;
+                    tags = historianSession.Tags;
+                }
                 int badTags = 0;
                 int tagIndex;
                 for (tagIndex = 0; tagIndex < tags.Count; tagIndex++)
@@ -971,9 +1212,13 @@ namespace DeltaVHistoryCLI
                     return badTags == 0 ? 0 : 5;
                 }
 
-                TimeSpan effectiveSlice = CalculateEffectiveSlice(
+                TimeSpan effectiveSlice = CalculateByteAwareSlice(
                     validTags,
                     options.MaxBatchRows,
+                    options.TargetBatchRows,
+                    options.MaxBatchBytes,
+                    options.TargetBatchBytes,
+                    bytesPerRowEstimate,
                     options.SamplingIntervalSeconds,
                     options.Slice);
 
@@ -981,9 +1226,13 @@ namespace DeltaVHistoryCLI
                     "Sampling=InterpolatedValue intervalSeconds=" +
                     options.SamplingIntervalSeconds.ToString(CultureInfo.InvariantCulture) +
                     " validTags=" + validTags.ToString(CultureInfo.InvariantCulture) +
-                    " maxWindowMinutes=" + options.Slice.TotalMinutes.ToString(
-                        "0.###", CultureInfo.InvariantCulture) +
-                    " effectiveWindowMinutes=" + effectiveSlice.TotalMinutes.ToString(
+                     " maxWindowMinutes=" + options.Slice.TotalMinutes.ToString(
+                         "0.###", CultureInfo.InvariantCulture) +
+                     " targetRows=" + options.TargetBatchRows.ToString(CultureInfo.InvariantCulture) +
+                     " targetBytes=" + options.TargetBatchBytes.ToString(CultureInfo.InvariantCulture) +
+                     " estimatedBytesPerRow=" + bytesPerRowEstimate.ToString(
+                         "0.###", CultureInfo.InvariantCulture) +
+                     " effectiveWindowMinutes=" + effectiveSlice.TotalMinutes.ToString(
                         "0.###", CultureInfo.InvariantCulture));
 
                 DateTime sliceStart = collectionStart;
@@ -1009,7 +1258,10 @@ namespace DeltaVHistoryCLI
                         ref directSendAllowed,
                         state,
                         stateStore,
-                        ref created);
+                        ref created,
+                        historianConnectMilliseconds,
+                        resolveTagsMilliseconds,
+                        ref bytesPerRowEstimate);
                     if (result != 0 && result != 5)
                         return result;
                     batches += created;
@@ -1022,7 +1274,11 @@ namespace DeltaVHistoryCLI
             }
             finally
             {
-                if (client != null)
+                if (historianSession != null)
+                    historianSession.BytesPerRowEstimate = bytesPerRowEstimate;
+                if (historianSession != null && client != null && client.LastReadHadErrors)
+                    historianSession.Invalidate();
+                if (ownsHistorian && client != null)
                     client.Dispose();
             }
         }
@@ -1037,7 +1293,10 @@ namespace DeltaVHistoryCLI
             BatchSender sender,
             ref bool directSendAllowed,
             SyncState state,
-            SyncStateStore stateStore)
+            SyncStateStore stateStore,
+            long historianConnectMilliseconds,
+            long resolveTagsMilliseconds,
+            ref double bytesPerRowEstimate)
         {
             string batchId = BuildBatchId(options.CollectorId);
             log.Write("Collect batch=" + batchId + " range=" + FormatTime(start) + " .. " + FormatTime(end));
@@ -1058,6 +1317,8 @@ namespace DeltaVHistoryCLI
                 batch.Server = options.Server;
                 batch.RangeStart = start;
                 batch.RangeEnd = end;
+                batch.HistorianConnectMilliseconds = historianConnectMilliseconds;
+                batch.ResolveTagsMilliseconds = resolveTagsMilliseconds;
 
                 int tagIndex;
                 int invalidTags = 0;
@@ -1119,6 +1380,14 @@ namespace DeltaVHistoryCLI
 
                 historianClock.Stop();
                 historianReadMilliseconds = historianClock.ElapsedMilliseconds;
+                HistorianPerformanceMetrics performance = client.LastPerformance;
+                batch.HistorianRpcMilliseconds = performance.RpcMilliseconds;
+                batch.SampleConvertMilliseconds = performance.SampleConvertMilliseconds;
+                batch.NormalizeMilliseconds = performance.NormalizeMilliseconds;
+                batch.ReturnedSamples = performance.ReturnedSamples;
+                batch.InvalidSamples = performance.InvalidSamples;
+                batch.NormalizeFastPathTags = performance.NormalizeFastPathTags;
+                batch.NormalizeFallbackTags = performance.NormalizeFallbackTags;
 
                 if (successfulTags == 0)
                     throw new Exception("All valid Historian tag reads failed.");
@@ -1145,10 +1414,17 @@ namespace DeltaVHistoryCLI
                          CultureInfo.InvariantCulture));
 
                 Stopwatch encodeClock = Stopwatch.StartNew();
-                byte[] data = BatchEncoder.EncodeCsv(batch);
-                if (data.Length > options.MaxBatchBytes)
+                BatchPayload payload = BatchEncoder.EncodePayload(
+                    batch,
+                    EstimatePayloadCapacity(batch.Samples.Count, bytesPerRowEstimate));
+                if (payload.Length > options.MaxBatchBytes)
                     throw new BatchLimitException("Batch size limit exceeded.");
-                batch.Sha256 = BatchEncoder.ComputeSha256(data);
+                batch.Sha256 = payload.Sha256;
+                if (batch.Samples.Count > 0)
+                {
+                    double currentBytesPerRow = (double)payload.Length / batch.Samples.Count;
+                    bytesPerRowEstimate = bytesPerRowEstimate * 0.8 + currentBytesPerRow * 0.2;
+                }
                 encodeClock.Stop();
                 encodeMilliseconds = encodeClock.ElapsedMilliseconds;
 
@@ -1157,7 +1433,7 @@ namespace DeltaVHistoryCLI
                     bool remoteAckReceived = false;
                     try
                     {
-                        BatchReceipt receipt = sender.Send(batch, data);
+                        BatchReceipt receipt = sender.Send(batch, payload);
                         remoteAckReceived = true;
                         sendTimings = receipt.Timings;
                         AdvanceAfterCollection(
@@ -1173,7 +1449,7 @@ namespace DeltaVHistoryCLI
                             state,
                             log,
                             batch,
-                            data.Length,
+                            payload.Length,
                             totalClock,
                             historianReadMilliseconds,
                             encodeMilliseconds,
@@ -1190,7 +1466,7 @@ namespace DeltaVHistoryCLI
                         {
                             rejectedStore.SaveFailed(
                                 batch,
-                                data,
+                                payload,
                                 "http" + ex.StatusCode.ToString(CultureInfo.InvariantCulture));
                             totalClock.Stop();
                             LogBatchMetrics(
@@ -1198,7 +1474,7 @@ namespace DeltaVHistoryCLI
                                 state,
                                 log,
                                 batch,
-                                data.Length,
+                                payload.Length,
                                 totalClock,
                                 historianReadMilliseconds,
                                 encodeMilliseconds,
@@ -1211,8 +1487,8 @@ namespace DeltaVHistoryCLI
                             rejectedStore.EnsurePendingCapacity(
                                 options.MaxPendingBatches,
                                 options.MaxPendingBytes,
-                                data.Length);
-                            rejectedStore.SavePending(batch, data);
+                                payload.Length);
+                            rejectedStore.SavePending(batch, payload);
                         }
                         catch (PendingCapacityException capacity)
                         {
@@ -1225,7 +1501,7 @@ namespace DeltaVHistoryCLI
                                 state,
                                 log,
                                 batch,
-                                data.Length,
+                                payload.Length,
                                 totalClock,
                                 historianReadMilliseconds,
                                 encodeMilliseconds,
@@ -1246,7 +1522,7 @@ namespace DeltaVHistoryCLI
                             state,
                             log,
                             batch,
-                            data.Length,
+                            payload.Length,
                             totalClock,
                             historianReadMilliseconds,
                             encodeMilliseconds,
@@ -1278,7 +1554,7 @@ namespace DeltaVHistoryCLI
                                 state,
                                 log,
                                 batch,
-                                data.Length,
+                                payload.Length,
                                 totalClock,
                                 historianReadMilliseconds,
                                 encodeMilliseconds,
@@ -1296,8 +1572,8 @@ namespace DeltaVHistoryCLI
                             rejectedStore.EnsurePendingCapacity(
                                 options.MaxPendingBatches,
                                 options.MaxPendingBytes,
-                                data.Length);
-                            rejectedStore.SavePending(batch, data);
+                                payload.Length);
+                            rejectedStore.SavePending(batch, payload);
                         }
                         catch (PendingCapacityException capacity)
                         {
@@ -1310,7 +1586,7 @@ namespace DeltaVHistoryCLI
                                 state,
                                 log,
                                 batch,
-                                data.Length,
+                                payload.Length,
                                 totalClock,
                                 historianReadMilliseconds,
                                 encodeMilliseconds,
@@ -1331,7 +1607,7 @@ namespace DeltaVHistoryCLI
                             state,
                             log,
                             batch,
-                            data.Length,
+                            payload.Length,
                             totalClock,
                             historianReadMilliseconds,
                             encodeMilliseconds,
@@ -1346,7 +1622,7 @@ namespace DeltaVHistoryCLI
                     spool.EnsurePendingCapacity(
                         options.MaxPendingBatches,
                         options.MaxPendingBytes,
-                        data.Length);
+                        payload.Length);
                 }
                 catch (PendingCapacityException capacity)
                 {
@@ -1359,7 +1635,7 @@ namespace DeltaVHistoryCLI
                         state,
                         log,
                         batch,
-                        data.Length,
+                        payload.Length,
                         totalClock,
                         historianReadMilliseconds,
                         encodeMilliseconds,
@@ -1373,7 +1649,7 @@ namespace DeltaVHistoryCLI
                         capacityStats,
                         CollectionPausedExitCode);
                 }
-                spool.SavePending(batch, data);
+                spool.SavePending(batch, payload);
                 AdvanceAfterCollection(
                     options,
                     state,
@@ -1387,7 +1663,7 @@ namespace DeltaVHistoryCLI
                     state,
                     log,
                     batch,
-                    data.Length,
+                    payload.Length,
                     totalClock,
                     historianReadMilliseconds,
                     encodeMilliseconds,
@@ -1441,6 +1717,11 @@ namespace DeltaVHistoryCLI
             PendingStats pending = new SpoolStore(options.SpoolDirectory).GetPendingStats();
             long sendMilliseconds = sendTimings == null ? 0 : sendTimings.SendMilliseconds;
             long ackWaitMilliseconds = sendTimings == null ? 0 : sendTimings.AckWaitMilliseconds;
+            long workingSetBytes = Process.GetCurrentProcess().WorkingSet64;
+            long gcMemoryBytes = GC.GetTotalMemory(false);
+            double rowsPerSecond = totalClock.Elapsed.TotalSeconds > 0
+                ? batch.Samples.Count / totalClock.Elapsed.TotalSeconds
+                : 0;
             long syncLagSeconds = 0;
             if (options.Command == "sync" && state != null)
             {
@@ -1462,8 +1743,22 @@ namespace DeltaVHistoryCLI
                 " AckWaitMs=" + ackWaitMilliseconds.ToString(CultureInfo.InvariantCulture) +
                 " TotalMs=" + totalClock.ElapsedMilliseconds.ToString(CultureInfo.InvariantCulture) +
                 " PendingBatches=" + pending.Batches.ToString(CultureInfo.InvariantCulture) +
-                " PendingBytes=" + pending.Bytes.ToString(CultureInfo.InvariantCulture) +
-                " SyncLagSeconds=" + syncLagSeconds.ToString(CultureInfo.InvariantCulture));
+                 " PendingBytes=" + pending.Bytes.ToString(CultureInfo.InvariantCulture) +
+                 " SyncLagSeconds=" + syncLagSeconds.ToString(CultureInfo.InvariantCulture));
+            log.Write(
+                "Performance batch_id=" + batch.BatchId +
+                " ConnectMs=" + batch.HistorianConnectMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                " ResolveTagsMs=" + batch.ResolveTagsMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                " RpcMs=" + batch.HistorianRpcMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                " ConvertMs=" + batch.SampleConvertMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                " NormalizeMs=" + batch.NormalizeMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                " ReturnedSamples=" + batch.ReturnedSamples.ToString(CultureInfo.InvariantCulture) +
+                " InvalidSamples=" + batch.InvalidSamples.ToString(CultureInfo.InvariantCulture) +
+                " NormalizeFastPathTags=" + batch.NormalizeFastPathTags.ToString(CultureInfo.InvariantCulture) +
+                " NormalizeFallbackTags=" + batch.NormalizeFallbackTags.ToString(CultureInfo.InvariantCulture) +
+                " RowsPerSec=" + rowsPerSecond.ToString("0.###", CultureInfo.InvariantCulture) +
+                " WorkingSetBytes=" + workingSetBytes.ToString(CultureInfo.InvariantCulture) +
+                " GCMemoryBytes=" + gcMemoryBytes.ToString(CultureInfo.InvariantCulture));
         }
 
         private static int CollectWindow(
@@ -1477,7 +1772,10 @@ namespace DeltaVHistoryCLI
             ref bool directSendAllowed,
             SyncState state,
             SyncStateStore stateStore,
-            ref int created)
+            ref int created,
+            long historianConnectMilliseconds,
+            long resolveTagsMilliseconds,
+            ref double bytesPerRowEstimate)
         {
             if (!directSendAllowed)
             {
@@ -1518,7 +1816,10 @@ namespace DeltaVHistoryCLI
                 sender,
                 ref directSendAllowed,
                 state,
-                stateStore);
+                stateStore,
+                historianConnectMilliseconds,
+                resolveTagsMilliseconds,
+                ref bytesPerRowEstimate);
             if (result != 21)
             {
                 if (result == 0 || result == 5)
@@ -1547,12 +1848,16 @@ namespace DeltaVHistoryCLI
                 " at " + FormatTime(middle));
             int first = CollectWindow(
                 options, start, middle, log, client, tags, sender,
-                ref directSendAllowed, state, stateStore, ref created);
+                ref directSendAllowed, state, stateStore, ref created,
+                historianConnectMilliseconds, resolveTagsMilliseconds,
+                ref bytesPerRowEstimate);
             if (first != 0 && first != 5)
                 return first;
             int second = CollectWindow(
                 options, middle, end, log, client, tags, sender,
-                ref directSendAllowed, state, stateStore, ref created);
+                ref directSendAllowed, state, stateStore, ref created,
+                historianConnectMilliseconds, resolveTagsMilliseconds,
+                ref bytesPerRowEstimate);
             if (second != 0 && second != 5)
                 return second;
             return first == 5 || second == 5 ? 5 : 0;
@@ -1917,7 +2222,50 @@ namespace DeltaVHistoryCLI
             int intervalSeconds,
             TimeSpan requestedSlice)
         {
-            int maximumSlots = maxBatchRows / validTags;
+            return CalculateByteAwareSlice(
+                validTags,
+                maxBatchRows,
+                maxBatchRows,
+                Int64.MaxValue,
+                Int64.MaxValue,
+                256.0,
+                intervalSeconds,
+                requestedSlice);
+        }
+
+        private static TimeSpan CalculateByteAwareSlice(
+            int validTags,
+            int maxBatchRows,
+            int targetBatchRows,
+            long maxBatchBytes,
+            long targetBatchBytes,
+            double estimatedBytesPerRow,
+            int intervalSeconds,
+            TimeSpan requestedSlice)
+        {
+            if (validTags <= 0)
+                throw new ArgumentOutOfRangeException("validTags");
+            if (maxBatchRows <= 0 || targetBatchRows <= 0 ||
+                maxBatchBytes <= 0 || targetBatchBytes <= 0 ||
+                intervalSeconds <= 0 || estimatedBytesPerRow <= 0)
+                throw new ArgumentOutOfRangeException("batch limits");
+            if (targetBatchRows > maxBatchRows || targetBatchBytes > maxBatchBytes)
+                throw new ArgumentException("Target batch limits cannot exceed hard batch limits.");
+            if (maxBatchRows < validTags)
+                throw new Exception(
+                    "MaxBatchRows is smaller than the number of valid Historian tags.");
+
+            int rowCapacity = Math.Min(maxBatchRows, targetBatchRows);
+            double byteRowsDouble = Math.Floor(targetBatchBytes / estimatedBytesPerRow);
+            long byteRows = byteRowsDouble >= Int64.MaxValue
+                ? Int64.MaxValue
+                : (long)byteRowsDouble;
+            if (byteRows < rowCapacity)
+                rowCapacity = byteRows > Int32.MaxValue ? Int32.MaxValue : (int)byteRows;
+            if (rowCapacity < validTags)
+                rowCapacity = validTags;
+
+            int maximumSlots = rowCapacity / validTags;
             if (maximumSlots <= 0)
                 throw new Exception(
                     "MaxBatchRows is smaller than the number of valid Historian tags.");
@@ -1928,6 +2276,19 @@ namespace DeltaVHistoryCLI
                 : capacitySlice;
             TimeSpan minimum = TimeSpan.FromSeconds(intervalSeconds);
             return result < minimum ? minimum : result;
+        }
+
+        private static int EstimatePayloadCapacity(int rows, double estimatedBytesPerRow)
+        {
+            if (rows <= 0 || estimatedBytesPerRow <= 0)
+                return 0;
+            double estimated = rows * estimatedBytesPerRow;
+            if (estimated <= 4096)
+                return 4096;
+            const int maximumInitialCapacity = 16 * 1024 * 1024;
+            if (estimated >= maximumInitialCapacity)
+                return maximumInitialCapacity;
+            return (int)Math.Ceiling(estimated);
         }
 
         private static TimeSpan ParseDuration(string text)

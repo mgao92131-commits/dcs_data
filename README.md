@@ -32,7 +32,9 @@ Receiver binaries, or database files.
 - Root-level `start-historysync.cmd` starts hidden continuous normal-user
   collection; root-level `stop-historysync.cmd` stops it gracefully.
 - `[Sync] MaxWindowMinutes=30` remains the logical maximum window.
-- Expected row capacity pre-splits large windows before Historian reads.
+- `TargetBatchRows=25000` and `TargetBatchBytes=10485760` pre-size normal
+  windows before Historian reads; `MaxBatchRows` and `MaxBatchBytes` remain
+  hard limits.
 - A small number of failed tags is logged while remaining tags continue.
 - Excessive failures reject the partial batch, so state does not advance.
 - Receiver failures retain durable pending batches and retry them in oldest-first
@@ -51,10 +53,17 @@ Receiver binaries, or database files.
   and return database ACK without re-parsing or creating duplicate archives.
 - PostgreSQL COMMIT is the synchronous ACK boundary; archive failures are
   logged and retained under `archive_pending` without returning a false 503.
-- Pending files are sent by stream with HTTP KeepAlive, and PostgreSQL skips
+- Receiver maintenance retries valid `archive_pending` entries hourly and
+  leaves failed moves in place for the next pass (at most 100 retries per
+  pass).
+- Receiver staging defaults to `StagingDurability=full`; `buffered` is an
+  explicit performance-test tradeoff for uncommitted staging files.
+- Pending files record their SHA at spool time, then are sent once from a
+  FileStream with HTTP KeepAlive; PostgreSQL skips
   no-op overlap updates using conditional UPSERT predicates.
-- Batch timing logs include Historian read, encoding, send, ACK wait, total,
-  pending size, and sync lag measurements.
+- Batch timing logs include Historian RPC, conversion, normalization, encoding,
+  send, ACK wait, total, rows/sec, working set, managed memory, pending size,
+  and sync lag measurements.
 - CSV, Receiver, PostgreSQL, spool, and ACK formats remain compatible. The
   continuous state file additionally records `CollectionPaused` and its reason.
 

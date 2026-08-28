@@ -195,17 +195,19 @@ func TestBulkImport49600Rows(t *testing.T) {
 	rows := make([]importRow, rowCount)
 	startTime := time.Date(2026, 8, 28, 0, 0, 0, 0, time.UTC)
 	for index := range rows {
-		timestamp := startTime.Add(time.Duration(index) * time.Second).Format("2006-01-02 15:04:05.000000")
+		sampleTime := startTime.Add(time.Duration(index) * time.Second)
+		timestamp := sampleTime.Format("2006-01-02 15:04:05.000000")
 		value := float64(index) / 10
 		rows[index] = importRow{
-			SampleKey:     sampleKey(collectorID, "TAG/BULK", timestamp, "P:InterpolatedValue:10", strconv.FormatFloat(value, 'f', 1, 64)),
-			Tag:           "TAG/BULK",
-			TimeText:      timestamp,
-			ValueText:     strconv.FormatFloat(value, 'f', 1, 64),
-			ValueDouble:   &value,
-			DataType:      "Float",
-			SequenceNo:    "P:InterpolatedValue:10",
-			ArchiveStatus: "Current",
+			SampleKey:      sampleKey(collectorID, "TAG/BULK", timestamp, "P:InterpolatedValue:10", strconv.FormatFloat(value, 'f', 1, 64)),
+			Tag:            "TAG/BULK",
+			SampleTime:     sampleTime,
+			ValueText:      strconv.FormatFloat(value, 'f', 1, 64),
+			ValueDouble:    value,
+			HasValueDouble: true,
+			DataType:       "Float",
+			SequenceNo:     "P:InterpolatedValue:10",
+			ArchiveStatus:  "Current",
 		}
 	}
 	importer := &batchImporter{pool: pool}
@@ -254,7 +256,8 @@ func TestBulkImport49600Rows(t *testing.T) {
 
 	for index := range rows {
 		value := float64(index)/10 + 1
-		rows[index].ValueDouble = &value
+		rows[index].ValueDouble = value
+		rows[index].HasValueDouble = true
 		rows[index].ValueText = strconv.FormatFloat(value, 'f', 1, 64)
 	}
 	updateBatch := importBatch{
@@ -275,6 +278,82 @@ func TestBulkImport49600Rows(t *testing.T) {
 	}
 	if count != rowCount {
 		t.Fatalf("expected %d updated rows, got %d", rowCount, count)
+	}
+}
+
+func TestDuplicateSampleKeysFailFast(t *testing.T) {
+	databaseURL := os.Getenv("DCS_HISTORY_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DCS_HISTORY_TEST_DATABASE_URL is not set")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ensureIntegrationSchema(t, ctx, pool)
+
+	testID := strconv.FormatInt(time.Now().UnixNano(), 10)
+	collectorID := "DCS-DUP-" + testID
+	batchID := "duplicate_key_" + testID
+	timestamp := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	key := sampleKey(collectorID, "TAG/DUP", timestamp.Format("2006-01-02 15:04:05.000000"), "", "1")
+	rows := []importRow{
+		{
+			SampleKey:      key,
+			Tag:            "TAG/DUP",
+			SampleTime:     timestamp,
+			ValueText:      "1",
+			ValueDouble:    1,
+			HasValueDouble: true,
+		},
+		{
+			SampleKey:      key,
+			Tag:            "TAG/DUP",
+			SampleTime:     timestamp,
+			ValueText:      "1",
+			ValueDouble:    1,
+			HasValueDouble: true,
+		},
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_, _ = pool.Exec(cleanupCtx, "DELETE FROM history_samples WHERE sample_key=$1", key)
+		_, _ = pool.Exec(cleanupCtx, "DELETE FROM imported_batches WHERE batch_id=$1", batchID)
+	}()
+
+	importer := &batchImporter{pool: pool}
+	err = importer.importBatch(ctx, &importBatch{
+		BatchID:     batchID,
+		CollectorID: collectorID,
+		SHA256:      strings.Repeat("d", 64),
+		Rows:        len(rows),
+		Data:        rows,
+	})
+	if err == nil {
+		t.Fatal("duplicate sample keys unexpectedly passed staging COPY")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "duplicate") {
+		t.Fatalf("expected duplicate-key COPY error, got %v", err)
+	}
+	var importedCount, sampleCount int
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM imported_batches WHERE batch_id=$1", batchID).Scan(&importedCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM history_samples WHERE sample_key=$1", key).Scan(&sampleCount); err != nil {
+		t.Fatal(err)
+	}
+	if importedCount != 0 || sampleCount != 0 {
+		t.Fatalf("duplicate batch was partially committed: imported=%d samples=%d", importedCount, sampleCount)
 	}
 }
 

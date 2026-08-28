@@ -68,6 +68,57 @@ namespace DeltaVHistoryCLI
                         });
                     Assert(pendingRetryMilliseconds == 30000,
                         "paused pending retry schedule");
+
+                    DateTime scheduleBase = new DateTime(2026, 8, 28, 10, 0, 0);
+                    object[] pausedSchedule = new object[] {
+                        scheduleBase,
+                        scheduleBase,
+                        300000,
+                        pendingRetryMilliseconds,
+                        true,
+                        false
+                    };
+                    DateTime retryStart = (DateTime)InvokePrivate(
+                        typeof(SyncProgram),
+                        "CalculateNextContinuousStart",
+                        pausedSchedule);
+                    Assert(retryStart == scheduleBase.AddSeconds(30) &&
+                        (bool)pausedSchedule[5],
+                        "paused state enters short retry mode");
+
+                    DateTime retryNow = scheduleBase.AddSeconds(31);
+                    object[] stillPausedSchedule = new object[] {
+                        retryStart,
+                        retryNow,
+                        300000,
+                        pendingRetryMilliseconds,
+                        true,
+                        pausedSchedule[5]
+                    };
+                    DateTime retryAgain = (DateTime)InvokePrivate(
+                        typeof(SyncProgram),
+                        "CalculateNextContinuousStart",
+                        stillPausedSchedule);
+                    Assert(retryAgain == retryNow.AddSeconds(30) &&
+                        (bool)stillPausedSchedule[5],
+                        "paused state keeps short retry mode");
+
+                    DateTime resumedNow = scheduleBase.AddSeconds(62);
+                    object[] resumedSchedule = new object[] {
+                        retryAgain,
+                        resumedNow,
+                        300000,
+                        pendingRetryMilliseconds,
+                        false,
+                        stillPausedSchedule[5]
+                    };
+                    DateTime resumedStart = (DateTime)InvokePrivate(
+                        typeof(SyncProgram),
+                        "CalculateNextContinuousStart",
+                        resumedSchedule);
+                    Assert(resumedStart == resumedNow.AddMinutes(5) &&
+                        !(bool)resumedSchedule[5],
+                        "successful drain exits retry mode and resumes collection");
                 }
                 finally
                 {
@@ -81,6 +132,21 @@ namespace DeltaVHistoryCLI
                     new object[] { 827, 50000, 10, TimeSpan.FromMinutes(30) });
                 Assert(slice == TimeSpan.FromMinutes(10),
                     "row-capacity pre-split");
+                TimeSpan byteLimitedSlice = (TimeSpan)InvokePrivate(
+                    typeof(SyncProgram),
+                    "CalculateByteAwareSlice",
+                    new object[] {
+                        100,
+                        50000,
+                        25000,
+                        20971520L,
+                        10240L,
+                        100.0,
+                        10,
+                        TimeSpan.FromMinutes(30)
+                    });
+                Assert(byteLimitedSlice == TimeSpan.FromSeconds(10),
+                    "byte-aware pre-split");
 
                 DateTime utc = new DateTime(
                     2026, 8, 27, 2, 0, 0, DateTimeKind.Utc);
@@ -110,6 +176,7 @@ namespace DeltaVHistoryCLI
                 SetPrivateField(fakeClient, "_processedSampleType", typeof(object));
                 SetPrivateField(fakeClient, "_interpolatedAggregate", "InterpolatedValue");
                 SetPrivateField(fakeClient, "_connectionHandle", 1);
+                fakeConnection.PointsPerRead = 1000;
                 List<TagResult> fakeTags = new List<TagResult>();
                 fakeTags.Add(new TagResult { Name = "TAG/A", Handle = 101, Status = 1 });
                 fakeTags.Add(new TagResult { Name = "TAG/B", Handle = 102, Status = 1 });
@@ -125,6 +192,81 @@ namespace DeltaVHistoryCLI
                     fakeResults[0].Result != null && fakeResults[1].Result != null &&
                     fakeResults[2].Error != null,
                     "serial Processed reads preserve per-tag results");
+                Assert(fakeClient.ProcessedPointAccessorBuildCount == 1 &&
+                    fakeResults[0].Result.Samples.Count == 1000 &&
+                    fakeResults[1].Result.Samples.Count == 1000,
+                    "Processed point accessors are reused for one point type");
+                Assert(fakeClient.LastPerformance.ReturnedSamples == 2000 &&
+                    fakeClient.LastPerformance.InvalidSamples == 0 &&
+                    fakeClient.LastPerformance.NormalizeFastPathTags == 2 &&
+                    fakeClient.LastPerformance.NormalizeFallbackTags == 0,
+                    "Processed hot-path performance counters");
+
+                fakeConnection.UseAlternatePointType = true;
+                List<TagResult> alternateTags = new List<TagResult>();
+                alternateTags.Add(new TagResult { Name = "TAG/ALTERNATE", Handle = 103, Status = 1 });
+                List<ProcessedTagResult> alternateResults = fakeClient.ReadProcessedBatch(
+                    alternateTags,
+                    new DateTime(2026, 8, 28, 10, 0, 0),
+                    new DateTime(2026, 8, 28, 10, 5, 0),
+                    10);
+                Assert(fakeClient.ProcessedPointAccessorBuildCount == 2 &&
+                    alternateResults[0].Result != null &&
+                    alternateResults[0].Result.Samples.Count == 1000 &&
+                    alternateResults[0].Result.Samples[0].Tag == "TAG/ALTERNATE",
+                    "Processed point accessors rebuild for a different point type");
+
+                List<HistorySample> unordered = new List<HistorySample>();
+                unordered.Add(new HistorySample { Timestamp = new DateTime(2026, 8, 28, 10, 0, 20) });
+                unordered.Add(new HistorySample { Timestamp = new DateTime(2026, 8, 28, 10, 0, 10) });
+                bool normalizeFastPath;
+                List<HistorySample> normalized = HistorySampleSet.NormalizeProcessed(
+                    unordered,
+                    out normalizeFastPath);
+                Assert(!normalizeFastPath && normalized[0].Timestamp < normalized[1].Timestamp,
+                    "Processed normalization fallback preserves ordering");
+
+                string sessionTagsPath = Path.Combine(
+                    Path.GetTempPath(),
+                    "HistorySyncSessionTags_" + Guid.NewGuid().ToString("N") + ".txt");
+                try
+                {
+                    File.WriteAllText(sessionTagsPath, "TAG/A\n", Encoding.Default);
+                    Type sessionType = typeof(SyncProgram).GetNestedType(
+                        "ContinuousHistorianSession",
+                        BindingFlags.NonPublic);
+                    object session = Activator.CreateInstance(sessionType, true);
+                    SetPrivateField(session, "_client", fakeClient);
+                    SetPrivateField(session, "_tags", fakeTags);
+                    SetPrivateField(session, "_server", "APP");
+                    SetPrivateField(session, "_singleTag", null);
+                    SetPrivateField(session, "_tagsPath", sessionTagsPath);
+                    FileInfo sessionTagsFile = new FileInfo(sessionTagsPath);
+                    SetPrivateField(session, "_tagsLastWriteTimeUtc", sessionTagsFile.LastWriteTimeUtc);
+                    SetPrivateField(session, "_tagsLength", sessionTagsFile.Length);
+                    SetPrivateField(session, "_hasTagsFileSignature", true);
+                    SyncOptions sessionOptions = new SyncOptions();
+                    sessionOptions.Server = "APP";
+                    sessionOptions.SingleTag = null;
+                    sessionOptions.TagsFile = sessionTagsPath;
+                    bool sessionReused = (bool)InvokeInstance(
+                        session,
+                        "RequiresResolve",
+                        new object[] { sessionOptions });
+                    File.AppendAllText(sessionTagsPath, "TAG/B\n", Encoding.Default);
+                    bool sessionReResolve = (bool)InvokeInstance(
+                        session,
+                        "RequiresResolve",
+                        new object[] { sessionOptions });
+                    Assert(!sessionReused && sessionReResolve,
+                        "Continuous session detects tags file changes");
+                    InvokeInstance(session, "Dispose", new object[0]);
+                }
+                finally
+                {
+                    try { File.Delete(sessionTagsPath); }
+                    catch { }
+                }
                 fakeClient.Dispose();
 
                 byte[] streamingInput = new byte[150000];
@@ -143,6 +285,24 @@ namespace DeltaVHistoryCLI
                 for (streamingIndex = 0; streamingIndex < streamingInput.Length; streamingIndex++)
                     Assert(streamingOutput[streamingIndex] == streamingInput[streamingIndex],
                         "streaming sender payload copy");
+
+                HistoryBatch encodedBatch = new HistoryBatch();
+                encodedBatch.Samples.Add(new HistorySample {
+                    Tag = "TAG/PAYLOAD",
+                    Timestamp = new DateTime(2026, 8, 28, 10, 0, 0),
+                    Value = "1.25",
+                    DataType = "Float",
+                    Flags = "",
+                    SequenceNo = "P:InterpolatedValue:10",
+                    ArchiveStatus = "Current"
+                });
+                BatchPayload encodedPayload = BatchEncoder.EncodePayload(encodedBatch, 4096);
+                Assert(encodedPayload.Length > 0 &&
+                    encodedPayload.Length <= encodedPayload.Buffer.Length &&
+                    encodedPayload.Sha256 == BatchEncoder.ComputeSha256(
+                        encodedPayload.Buffer,
+                        encodedPayload.Length),
+                    "bounded batch payload buffer and SHA");
 
                 RunPendingDrainSelfTest();
 
@@ -231,6 +391,16 @@ namespace DeltaVHistoryCLI
             return method.Invoke(null, args);
         }
 
+        private static object InvokeInstance(object instance, string name, object[] args)
+        {
+            MethodInfo method = instance.GetType().GetMethod(
+                name,
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (method == null)
+                throw new Exception("Instance method not found: " + name);
+            return method.Invoke(instance, args);
+        }
+
         private static void SetPrivateField(object instance, string name, object value)
         {
             FieldInfo field = instance.GetType().GetField(
@@ -297,9 +467,9 @@ namespace DeltaVHistoryCLI
                         SequenceNo = "P:InterpolatedValue:10",
                         ArchiveStatus = "Current"
                     });
-                    byte[] data = BatchEncoder.EncodeCsv(batch);
-                    batch.Sha256 = BatchEncoder.ComputeSha256(data);
-                    store.SavePending(batch, data);
+                    BatchPayload payload = BatchEncoder.EncodePayload(batch, 4096);
+                    batch.Sha256 = payload.Sha256;
+                    store.SavePending(batch, payload);
                 }
 
                 using (SyncLogger log = new SyncLogger(logs))
@@ -374,6 +544,8 @@ namespace DeltaVHistoryCLI
     class FakeHistorianConnection
     {
         public int ReadCount;
+        public int PointsPerRead = 1;
+        public bool UseAlternatePointType;
 
         public FakeHistorianProcessed readProcessed(
             int timeSpanHandle,
@@ -385,14 +557,28 @@ namespace DeltaVHistoryCLI
                 throw new Exception("shared Processed read arguments were not configured");
             ReadCount++;
             FakeHistorianProcessed processed = new FakeHistorianProcessed();
-            processed.nSamples = 1;
+            processed.nSamples = PointsPerRead;
             ArrayList samples = new ArrayList();
-            samples.Add(new FakeHistorianPoint {
-                timestamp = new DateTime(2026, 8, 28, 10, 0, ReadCount),
-                value = tagHandle,
-                dataType = "Float",
-                archiveStatus = 0
-            });
+            int pointIndex;
+            for (pointIndex = 0; pointIndex < PointsPerRead; pointIndex++)
+            {
+                DateTime timestamp = new DateTime(2026, 8, 28, 10, 0, 0).AddMilliseconds(
+                    (ReadCount - 1) * PointsPerRead + pointIndex);
+                if (UseAlternatePointType)
+                    samples.Add(new FakeHistorianPointAlternate {
+                        timestamp = timestamp,
+                        value = tagHandle,
+                        dataType = "Float",
+                        archiveStatus = 0
+                    });
+                else
+                    samples.Add(new FakeHistorianPoint {
+                        timestamp = timestamp,
+                        value = tagHandle,
+                        dataType = "Float",
+                        archiveStatus = 0
+                    });
+            }
             processed.dataSamples.Add(samples);
             return processed;
         }
@@ -405,6 +591,14 @@ namespace DeltaVHistoryCLI
     }
 
     class FakeHistorianPoint
+    {
+        public DateTime timestamp;
+        public object value;
+        public object dataType;
+        public int archiveStatus;
+    }
+
+    class FakeHistorianPointAlternate
     {
         public DateTime timestamp;
         public object value;

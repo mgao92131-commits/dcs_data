@@ -35,6 +35,7 @@ type receiverConfig struct {
 	Archive              string
 	ArchivePending       string
 	Staging              string
+	StagingDurability    string
 	Rejected             string
 	Logs                 string
 	ArchiveRetentionDays int
@@ -89,6 +90,11 @@ func durationMilliseconds(value time.Duration) int64 {
 }
 
 var safeID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,180}$`)
+
+const (
+	stagingDurabilityFull     = "full"
+	stagingDurabilityBuffered = "buffered"
+)
 
 func main() {
 	configArg := flag.String("config", "receiver.ini", "receiver configuration file")
@@ -173,7 +179,7 @@ func main() {
 		Addr:              config.Listen,
 		Handler:           server.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       60 * time.Second,
+		ReadTimeout:       config.WriteTimeout,
 		WriteTimeout:      config.WriteTimeout,
 		IdleTimeout:       60 * time.Second,
 	}
@@ -296,12 +302,14 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	dataPath := filepath.Join(tempDir, "data.csv")
-	staged, err := stageAndParseBody(
+	staged, err := stageAndParseBodyWithConfig(
 		dataPath,
 		r.Body,
 		s.config.MaxBodyBytes,
 		headers.CollectorID,
-		s.config.PostgresLocation)
+		s.config.PostgresLocation,
+		headers.Rows,
+		s.config.StagingDurability)
 	if err != nil {
 		s.logBatchTiming(
 			headers,
@@ -352,7 +360,11 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := writeReceiverMeta(filepath.Join(tempDir, "meta.ini"), headers, bodyBytes); err != nil {
+	if err := writeReceiverMeta(
+		filepath.Join(tempDir, "meta.ini"),
+		headers,
+		bodyBytes,
+		s.config.StagingDurability); err != nil {
 		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, staged.timings(), time.Since(started))
 		writeError(w, http.StatusInternalServerError, "cannot write batch metadata")
 		return
@@ -667,6 +679,25 @@ func stageAndParseBody(
 	collectorID string,
 	timezone *time.Location,
 ) (stagedBatch, error) {
+	return stageAndParseBodyWithConfig(
+		path,
+		body,
+		maximum,
+		collectorID,
+		timezone,
+		0,
+		stagingDurabilityFull)
+}
+
+func stageAndParseBodyWithConfig(
+	path string,
+	body io.Reader,
+	maximum int64,
+	collectorID string,
+	timezone *time.Location,
+	expectedRows int,
+	durability string,
+) (stagedBatch, error) {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0640)
 	if err != nil {
 		return stagedBatch{}, err
@@ -677,7 +708,7 @@ func stageAndParseBody(
 		sink:   io.MultiWriter(file, digest),
 	}
 	parseStarted := time.Now()
-	rows, parseErr := parseImportRows(reader, collectorID, timezone)
+	rows, parseErr := parseImportRowsWithCapacity(reader, collectorID, timezone, expectedRows)
 	if parseErr != nil {
 		_, drainErr := io.Copy(io.Discard, reader)
 		if drainErr != nil && reader.SourceError == nil && reader.SinkError == nil {
@@ -694,8 +725,10 @@ func stageAndParseBody(
 	if parseErr == nil && reader.Bytes > maximum {
 		parseErr = errBodyTooLarge
 	}
-	if syncErr := file.Sync(); parseErr == nil && syncErr != nil {
-		parseErr = syncErr
+	if parseErr == nil && strings.ToLower(strings.TrimSpace(durability)) != stagingDurabilityBuffered {
+		if syncErr := file.Sync(); syncErr != nil {
+			parseErr = syncErr
+		}
 	}
 	if closeErr := file.Close(); parseErr == nil && closeErr != nil {
 		parseErr = closeErr
@@ -721,7 +754,7 @@ func hashBody(body io.Reader, maximum int64) (string, int64, error) {
 	return hex.EncodeToString(digest.Sum(nil)), written, err
 }
 
-func writeReceiverMeta(path string, h batchHeaders, bodyBytes int64) error {
+func writeReceiverMeta(path string, h batchHeaders, bodyBytes int64, durability ...string) error {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0640)
 	if err != nil {
 		return err
@@ -734,7 +767,11 @@ func writeReceiverMeta(path string, h batchHeaders, bodyBytes int64) error {
 	if err == nil {
 		err = writer.Flush()
 	}
-	if err == nil {
+	stagingMode := stagingDurabilityFull
+	if len(durability) > 0 && strings.TrimSpace(durability[0]) != "" {
+		stagingMode = strings.ToLower(strings.TrimSpace(durability[0]))
+	}
+	if err == nil && stagingMode != stagingDurabilityBuffered {
 		err = file.Sync()
 	}
 	if closeErr := file.Close(); err == nil {
@@ -793,9 +830,13 @@ func loadReceiverConfig(path, baseDir string) (receiverConfig, error) {
 	if err != nil || maximum <= 0 {
 		return receiverConfig{}, errors.New("invalid [Server] MaxBodyBytes")
 	}
-	writeTimeoutSeconds, err := strconv.Atoi(valueOr(values, "Server.WriteTimeoutSeconds", "60"))
+	writeTimeoutSeconds, err := strconv.Atoi(valueOr(values, "Server.WriteTimeoutSeconds", "90"))
 	if err != nil || writeTimeoutSeconds <= 0 {
 		return receiverConfig{}, errors.New("invalid [Server] WriteTimeoutSeconds")
+	}
+	stagingDurability := strings.ToLower(strings.TrimSpace(valueOr(values, "Files.StagingDurability", stagingDurabilityFull)))
+	if stagingDurability != stagingDurabilityFull && stagingDurability != stagingDurabilityBuffered {
+		return receiverConfig{}, errors.New("invalid [Files] StagingDurability: expected full or buffered")
 	}
 	postgresEnabled, err := parseBool(valueOr(values, "PostgreSQL.Enabled", "false"))
 	if err != nil {
@@ -849,6 +890,7 @@ func loadReceiverConfig(path, baseDir string) (receiverConfig, error) {
 		Archive:              resolvePath(baseDir, valueOr(values, "Files.Archive", "archive")),
 		ArchivePending:       resolvePath(baseDir, valueOr(values, "Files.ArchivePending", "archive_pending")),
 		Staging:              resolvePath(baseDir, valueOr(values, "Files.Staging", "staging")),
+		StagingDurability:    stagingDurability,
 		Rejected:             resolvePath(baseDir, valueOr(values, "Files.Rejected", "rejected")),
 		Logs:                 resolvePath(baseDir, valueOr(values, "Files.Logs", "logs")),
 		ArchiveRetentionDays: archiveRetentionDays,

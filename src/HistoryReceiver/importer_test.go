@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -33,11 +34,11 @@ func TestReadImportRowsUsesOnlyCoreFields(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("expected one row, got %d", len(rows))
 	}
-	if rows[0].Tag != "TAG/A" || rows[0].ValueDouble == nil || *rows[0].ValueDouble != 1.25 || rows[0].ValueText != "1.25" {
+	if rows[0].Tag != "TAG/A" || !rows[0].HasValueDouble || rows[0].ValueDouble != 1.25 || rows[0].ValueText != "1.25" {
 		t.Fatalf("unexpected imported row: %+v", rows[0])
 	}
-	if rows[0].TimeText != "2026-08-26 09:00:00.123456" {
-		t.Fatalf("unexpected timestamp: %s", rows[0].TimeText)
+	if rows[0].SampleTime.Format("2006-01-02 15:04:05.000000") != "2026-08-26 09:00:00.123456" {
+		t.Fatalf("unexpected timestamp: %s", rows[0].SampleTime.Format("2006-01-02 15:04:05.000000"))
 	}
 }
 
@@ -54,7 +55,7 @@ func TestReadImportRowsAcceptsTextValue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].ValueText != " RUN " || rows[0].ValueDouble != nil {
+	if len(rows) != 1 || rows[0].ValueText != " RUN " || rows[0].HasValueDouble {
 		t.Fatalf("unexpected text row: %+v", rows)
 	}
 	if rows[0].DataType != "String" || rows[0].SequenceNo != "7" || rows[0].ArchiveStatus != "Current" {
@@ -104,6 +105,63 @@ func TestHistorySamplesUpsertSkipsUnchangedRows(t *testing.T) {
 	}
 	if !strings.Contains(historySamplesUpsertSQL, "ON CONFLICT (sample_key) DO UPDATE SET") {
 		t.Fatal("conditional UPSERT lost its conflict handler")
+	}
+	if strings.Contains(historySamplesUpsertSQL, "DISTINCT ON") || strings.Contains(historySamplesUpsertSQL, "row_order") {
+		t.Fatal("staging UPSERT still contains the redundant sort/deduplication path")
+	}
+	if !strings.Contains(historySamplesStageDDL, "sample_key text PRIMARY KEY") ||
+		!strings.Contains(historySamplesStageDDL, "sample_time timestamp NOT NULL") ||
+		strings.Contains(historySamplesStageDDL, "row_order") {
+		t.Fatal("staging table is not configured for typed fail-fast rows")
+	}
+}
+
+func TestImportRowsCapacityAndTypedCopyValues(t *testing.T) {
+	body := []byte("Tag,Timestamp,Value,DataType,Flags,SequenceNo,ArchiveStatus\n" +
+		"TAG/A,2026-08-26 09:00:00.0000000,1.25,Float,,,\n" +
+		"MODE/A,2026-08-26 09:00:01.0000000,RUN,String,,7,Current\n")
+	rows, err := parseImportRowsWithCapacity(
+		bytes.NewReader(body),
+		"DCS-TEST",
+		time.FixedZone("Asia/Shanghai", 8*60*60),
+		2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || cap(rows) != 2 {
+		t.Fatalf("expected preallocated rows, len=%d cap=%d", len(rows), cap(rows))
+	}
+	batch := &importBatch{
+		BatchID:     "batch-1",
+		CollectorID: "DCS-TEST",
+		Data:        rows,
+	}
+	source := newImportCopySource(batch)
+	if !source.Next() {
+		t.Fatal("COPY source did not expose first row")
+	}
+	first, err := source.Values()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstKey := first[0]
+	firstTime := first[3]
+	firstValue := first[4]
+	if !source.Next() {
+		t.Fatal("COPY source did not expose second row")
+	}
+	second, err := source.Values()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if &first[0] != &second[0] {
+		t.Fatal("COPY source allocated a values slice for every row")
+	}
+	if firstKey != rows[0].SampleKey || firstTime != rows[0].SampleTime || firstValue != rows[0].ValueDouble {
+		t.Fatalf("unexpected typed numeric row values: key=%#v time=%#v value=%#v", firstKey, firstTime, firstValue)
+	}
+	if second[0] != rows[1].SampleKey || second[3] != rows[1].SampleTime || second[4] != nil {
+		t.Fatalf("unexpected typed text row values: %#v", second)
 	}
 }
 

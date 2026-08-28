@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Diagnostics;
 using System.Reflection;
 
 namespace DeltaVHistoryCLI
@@ -43,8 +44,51 @@ namespace DeltaVHistoryCLI
         public Exception Error;
     }
 
+    public class HistorianPerformanceMetrics
+    {
+        public long RpcMilliseconds;
+        public long SampleConvertMilliseconds;
+        public long NormalizeMilliseconds;
+        public int ReturnedSamples;
+        public int InvalidSamples;
+        public int NormalizeFastPathTags;
+        public int NormalizeFallbackTags;
+    }
+
     public static class HistorySampleSet
     {
+        public static List<HistorySample> NormalizeProcessed(
+            List<HistorySample> rows,
+            out bool fastPath)
+        {
+            if (rows == null)
+                throw new ArgumentNullException("rows");
+            if (IsStrictlyOrdered(rows))
+            {
+                fastPath = true;
+                return rows;
+            }
+            fastPath = false;
+            return Normalize(rows);
+        }
+
+        public static bool IsStrictlyOrdered(List<HistorySample> rows)
+        {
+            if (rows == null)
+                throw new ArgumentNullException("rows");
+            if (rows.Count < 2)
+                return true;
+            DateTime previous = rows[0].Timestamp;
+            int i;
+            for (i = 1; i < rows.Count; i++)
+            {
+                if (rows[i].Timestamp <= previous)
+                    return false;
+                previous = rows[i].Timestamp;
+            }
+            return true;
+        }
+
         public static List<HistorySample> Normalize(List<HistorySample> rows)
         {
             if (rows == null)
@@ -88,6 +132,11 @@ namespace DeltaVHistoryCLI
         private int _connectionHandle = -1;
         private string _assemblyDirectory;
         private bool _resolverAttached;
+        private ProcessedPointAccessorSet _pointAccessors;
+        private int _processedPointAccessorBuildCount;
+        private HistorianPerformanceMetrics _lastPerformance =
+            new HistorianPerformanceMetrics();
+        private bool _lastReadHadErrors;
 
         public HistorianClient(string deltaVRoot, HistorianLog log)
         {
@@ -98,6 +147,21 @@ namespace DeltaVHistoryCLI
         public int ConnectionHandle
         {
             get { return _connectionHandle; }
+        }
+
+        public HistorianPerformanceMetrics LastPerformance
+        {
+            get { return _lastPerformance; }
+        }
+
+        public int ProcessedPointAccessorBuildCount
+        {
+            get { return _processedPointAccessorBuildCount; }
+        }
+
+        public bool LastReadHadErrors
+        {
+            get { return _lastReadHadErrors; }
         }
 
         public void Connect(string server)
@@ -243,9 +307,13 @@ namespace DeltaVHistoryCLI
             if (intervalSeconds <= 0)
                 throw new ArgumentOutOfRangeException("intervalSeconds");
 
+            _lastPerformance = new HistorianPerformanceMetrics();
+            _lastReadHadErrors = false;
             List<ProcessedTagResult> results = new List<ProcessedTagResult>();
             if (tags.Count == 0)
                 return results;
+
+            string processedSequence = BuildProcessedSequence(intervalSeconds);
 
             int timeSpanHandle = -1;
             try
@@ -285,16 +353,24 @@ namespace DeltaVHistoryCLI
                                 tag,
                                 timeSpanHandle,
                                 intervalSeconds,
-                                aggregates);
+                                aggregates,
+                                processedSequence,
+                                _lastPerformance);
                         }
                         catch (Exception ex)
                         {
                             tagResult.Error = UnwrapInvocationException(ex);
+                            _lastReadHadErrors = true;
                         }
                     }
                     results.Add(tagResult);
                 }
                 return results;
+            }
+            catch
+            {
+                _lastReadHadErrors = true;
+                throw;
             }
             finally
             {
@@ -307,64 +383,121 @@ namespace DeltaVHistoryCLI
             TagResult tag,
             int timeSpanHandle,
             int intervalSeconds,
-            ArrayList aggregates)
+            ArrayList aggregates,
+            string processedSequence,
+            HistorianPerformanceMetrics performance)
         {
-            object processed = _readProcessed.Invoke(
-                _connection,
-                new object[]
-                {
-                    timeSpanHandle,
-                    tag.Handle,
-                    _processedSampleType,
-                    aggregates
-                });
+            object processed;
+            Stopwatch rpcClock = Stopwatch.StartNew();
+            try
+            {
+                processed = _readProcessed.Invoke(
+                    _connection,
+                    new object[]
+                    {
+                        timeSpanHandle,
+                        tag.Handle,
+                        _processedSampleType,
+                        aggregates
+                    });
+            }
+            finally
+            {
+                rpcClock.Stop();
+                performance.RpcMilliseconds += rpcClock.ElapsedMilliseconds;
+            }
             if (processed == null)
                 throw new Exception("readProcessed() returned null.");
 
             ProcessedHistoryResult readResult = new ProcessedHistoryResult();
             readResult.Aggregate = "InterpolatedValue";
             readResult.IntervalSeconds = intervalSeconds;
-            readResult.ReturnedSlots = ToInt32(
-                GetMemberValue(processed, "nSamples"), 0);
-
-            IEnumerable aggregateResults = GetMemberValue(processed, "dataSamples") as IEnumerable;
-            if (aggregateResults == null)
-                throw new Exception("ProcessedHistorySamples.dataSamples is not enumerable.");
-
-            int aggregateCount = 0;
-            foreach (object aggregateResult in aggregateResults)
+            Stopwatch convertClock = Stopwatch.StartNew();
+            try
             {
-                aggregateCount++;
-                if (aggregateCount > 1)
-                    throw new Exception("readProcessed() returned more than one aggregate result.");
-                IEnumerable samples = aggregateResult as IEnumerable;
-                if (samples == null)
-                    throw new Exception("Processed aggregate result is not enumerable.");
-                foreach (object point in samples)
+                readResult.ReturnedSlots = ToInt32(
+                    GetMemberValue(processed, "nSamples"), 0);
+
+                IEnumerable aggregateResults = GetMemberValue(processed, "dataSamples") as IEnumerable;
+                if (aggregateResults == null)
+                    throw new Exception("ProcessedHistorySamples.dataSamples is not enumerable.");
+
+                int aggregateCount = 0;
+                foreach (object aggregateResult in aggregateResults)
                 {
-                    if (point == null)
-                        continue;
-                    object archiveStatus = GetMemberValue(point, "archiveStatus");
-                    if (HasArchiveStatusFlag(archiveStatus, 16))
+                    aggregateCount++;
+                    if (aggregateCount > 1)
+                        throw new Exception("readProcessed() returned more than one aggregate result.");
+                    IEnumerable samples = aggregateResult as IEnumerable;
+                    if (samples == null)
+                        throw new Exception("Processed aggregate result is not enumerable.");
+                    foreach (object point in samples)
                     {
-                        readResult.InvalidSlots++;
-                        continue;
-                    }
-                    HistorySample sample = BuildHistorySample(tag.Name, point);
-                    if (sample != null)
-                    {
-                        sample.Timestamp = ToCollectorLocalTime(sample.Timestamp);
-                        sample.SequenceNo = BuildProcessedSequence(intervalSeconds);
-                        readResult.Samples.Add(sample);
+                        if (point == null)
+                            continue;
+                        performance.ReturnedSamples++;
+                        ProcessedPointAccessorSet accessors = GetProcessedPointAccessors(point.GetType());
+                        object archiveStatus = accessors.ArchiveStatus == null
+                            ? null
+                            : accessors.ArchiveStatus.GetValue(point);
+                        if (HasArchiveStatusFlag(archiveStatus, 16))
+                        {
+                            readResult.InvalidSlots++;
+                            performance.InvalidSamples++;
+                            continue;
+                        }
+                        HistorySample sample = BuildHistorySample(
+                            tag.Name,
+                            point,
+                            accessors,
+                            archiveStatus,
+                            processedSequence);
+                        if (sample != null)
+                        {
+                            sample.Timestamp = ToCollectorLocalTime(sample.Timestamp);
+                            readResult.Samples.Add(sample);
+                        }
+                        else
+                        {
+                            performance.InvalidSamples++;
+                        }
                     }
                 }
+                if (aggregateCount != 1)
+                    throw new Exception("readProcessed() did not return the requested aggregate.");
             }
-            if (aggregateCount != 1)
-                throw new Exception("readProcessed() did not return the requested aggregate.");
+            finally
+            {
+                convertClock.Stop();
+                performance.SampleConvertMilliseconds += convertClock.ElapsedMilliseconds;
+            }
 
-            List<HistorySample> normalized = HistorySampleSet.Normalize(readResult.Samples);
-            readResult.Samples.Clear();
-            readResult.Samples.AddRange(normalized);
+            Stopwatch normalizeClock = Stopwatch.StartNew();
+            bool fastPath;
+            List<HistorySample> normalized;
+            try
+            {
+                normalized = HistorySampleSet.NormalizeProcessed(
+                    readResult.Samples,
+                    out fastPath);
+            }
+            finally
+            {
+                normalizeClock.Stop();
+                performance.NormalizeMilliseconds += normalizeClock.ElapsedMilliseconds;
+            }
+            if (fastPath)
+                performance.NormalizeFastPathTags++;
+            else
+            {
+                performance.NormalizeFallbackTags++;
+                WriteLog("WARNING Processed normalization fallback tag=" + tag.Name);
+            }
+            if (!Object.ReferenceEquals(normalized, readResult.Samples))
+            {
+                readResult.Samples.Clear();
+                readResult.Samples.AddRange(normalized);
+            }
             return readResult;
         }
 
@@ -385,6 +518,7 @@ namespace DeltaVHistoryCLI
             _readProcessed = null;
             _processedSampleType = null;
             _interpolatedAggregate = null;
+            _pointAccessors = null;
             _readInterface = null;
             if (_resolverAttached)
             {
@@ -558,6 +692,26 @@ namespace DeltaVHistoryCLI
             return field == null ? null : field.GetValue(null);
         }
 
+        private ProcessedPointAccessorSet GetProcessedPointAccessors(Type pointType)
+        {
+            if (_pointAccessors == null || _pointAccessors.PointType != pointType)
+            {
+                _pointAccessors = new ProcessedPointAccessorSet();
+                _pointAccessors.PointType = pointType;
+                _pointAccessors.Timestamp = FindMemberAccessor(pointType, "timestamp");
+                _pointAccessors.Value = FindMemberAccessor(pointType, "value");
+                _pointAccessors.DataType = FindMemberAccessor(pointType, "dataType");
+                _pointAccessors.SequenceNo = FindMemberAccessor(pointType, "sequenceNo");
+                _pointAccessors.ArchiveStatus = FindMemberAccessor(pointType, "archiveStatus");
+                _pointAccessors.IsHistoryHole = FindMemberAccessor(pointType, "isHistoryHole");
+                _pointAccessors.IsCRHole = FindMemberAccessor(pointType, "isCRHole");
+                _pointAccessors.IsManuallyDeleted = FindMemberAccessor(pointType, "isManuallyDeleted");
+                _pointAccessors.IsManuallyInserted = FindMemberAccessor(pointType, "isManuallyInserted");
+                _processedPointAccessorBuildCount++;
+            }
+            return _pointAccessors;
+        }
+
         private static object GetMemberValue(object instance, string name)
         {
             if (instance == null)
@@ -573,20 +727,7 @@ namespace DeltaVHistoryCLI
                     MemberAccessors.Add(key, accessor);
                 }
             }
-            if (accessor == null)
-                return null;
-            try
-            {
-                if (accessor.Property != null)
-                    return accessor.Property.GetValue(instance, null);
-                if (accessor.Field != null)
-                    return accessor.Field.GetValue(instance);
-                return accessor.Getter.Invoke(instance, null);
-            }
-            catch
-            {
-                return null;
-            }
+            return accessor == null ? null : accessor.GetValue(instance);
         }
 
         private static MemberAccessor FindMemberAccessor(Type type, string name)
@@ -624,10 +765,17 @@ namespace DeltaVHistoryCLI
             return null;
         }
 
-        private static HistorySample BuildHistorySample(string tagName, object point)
+        private static HistorySample BuildHistorySample(
+            string tagName,
+            object point,
+            ProcessedPointAccessorSet accessors,
+            object archiveStatus,
+            string processedSequence)
         {
             DateTime timestamp;
-            object rawTimestamp = GetMemberValue(point, "timestamp");
+            object rawTimestamp = accessors.Timestamp == null
+                ? null
+                : accessors.Timestamp.GetValue(point);
             if (rawTimestamp is DateTime)
                 timestamp = (DateTime)rawTimestamp;
             else if (!DateTime.TryParse(
@@ -638,12 +786,12 @@ namespace DeltaVHistoryCLI
             HistorySample sample = new HistorySample();
             sample.Tag = tagName;
             sample.Timestamp = timestamp;
-            sample.Value = FormatValue(GetMemberValue(point, "value"));
-            object dataType = GetMemberValue(point, "dataType");
+            sample.Value = FormatValue(accessors.Value == null ? null : accessors.Value.GetValue(point));
+            object dataType = accessors.DataType == null ? null : accessors.DataType.GetValue(point);
             sample.DataType = dataType == null ? "" : dataType.ToString();
-            sample.Flags = BuildFlags(point);
-            sample.SequenceNo = FormatValue(GetMemberValue(point, "sequenceNo"));
-            sample.ArchiveStatus = FormatValue(GetMemberValue(point, "archiveStatus"));
+            sample.Flags = BuildFlags(point, accessors);
+            sample.SequenceNo = processedSequence;
+            sample.ArchiveStatus = FormatValue(archiveStatus);
             return sample;
         }
 
@@ -778,13 +926,13 @@ namespace DeltaVHistoryCLI
                 : formattable.ToString(null, CultureInfo.InvariantCulture);
         }
 
-        private static string BuildFlags(object point)
+        private static string BuildFlags(object point, ProcessedPointAccessorSet accessors)
         {
             string result = "";
-            if (ToBool(GetMemberValue(point, "isHistoryHole"), false)) result += "HistoryHole;";
-            if (ToBool(GetMemberValue(point, "isCRHole"), false)) result += "CRHole;";
-            if (ToBool(GetMemberValue(point, "isManuallyDeleted"), false)) result += "ManuallyDeleted;";
-            if (ToBool(GetMemberValue(point, "isManuallyInserted"), false)) result += "ManuallyInserted;";
+            if (ToBool(accessors.IsHistoryHole == null ? null : accessors.IsHistoryHole.GetValue(point), false)) result += "HistoryHole;";
+            if (ToBool(accessors.IsCRHole == null ? null : accessors.IsCRHole.GetValue(point), false)) result += "CRHole;";
+            if (ToBool(accessors.IsManuallyDeleted == null ? null : accessors.IsManuallyDeleted.GetValue(point), false)) result += "ManuallyDeleted;";
+            if (ToBool(accessors.IsManuallyInserted == null ? null : accessors.IsManuallyInserted.GetValue(point), false)) result += "ManuallyInserted;";
             return result.EndsWith(";") ? result.Substring(0, result.Length - 1) : result;
         }
 
@@ -802,11 +950,42 @@ namespace DeltaVHistoryCLI
                 _log(message);
         }
 
+        private sealed class ProcessedPointAccessorSet
+        {
+            public Type PointType;
+            public MemberAccessor Timestamp;
+            public MemberAccessor Value;
+            public MemberAccessor DataType;
+            public MemberAccessor SequenceNo;
+            public MemberAccessor ArchiveStatus;
+            public MemberAccessor IsHistoryHole;
+            public MemberAccessor IsCRHole;
+            public MemberAccessor IsManuallyDeleted;
+            public MemberAccessor IsManuallyInserted;
+        }
+
         private class MemberAccessor
         {
             public PropertyInfo Property;
             public FieldInfo Field;
             public MethodInfo Getter;
+
+            public object GetValue(object instance)
+            {
+                try
+                {
+                    if (Property != null)
+                        return Property.GetValue(instance, null);
+                    if (Field != null)
+                        return Field.GetValue(instance);
+                    if (Getter != null)
+                        return Getter.Invoke(instance, null);
+                }
+                catch
+                {
+                }
+                return null;
+            }
         }
 
     }

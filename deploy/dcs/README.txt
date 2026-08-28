@@ -28,10 +28,13 @@ Reliability behavior:
   state.ini records CollectionPaused=true and the continuous host remains
   alive without reading more Historian data. The paused state retries only the
   pending drain every PendingRetrySeconds. After the Receiver recovers and
-  pending drains, collection resumes automatically.
+  enough pending data drains, collection resumes automatically.
 
   Each physical window reuses one Historian TimeSpan for serial Processed tag
-  reads. Pending data is hashed once and sent from a stream over KeepAlive.
+  reads. Pending data records its hash at spool time and is then sent once from
+  a stream over KeepAlive.
+  Normal windows target 25,000 rows / 10 MiB and retain the 50,000-row /
+  20 MiB settings as hard limits.
 
 Commands:
 

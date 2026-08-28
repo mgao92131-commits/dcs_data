@@ -4,7 +4,6 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Net;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -77,7 +76,7 @@ namespace DeltaVHistoryCLI
         {
             _url = config.Get("Receiver", "Url", "");
             _apiKey = config.Get("Receiver", "ApiKey", "");
-            _timeoutMilliseconds = checked(config.GetInt("Receiver", "TimeoutSeconds", 75) * 1000);
+            _timeoutMilliseconds = checked(config.GetInt("Receiver", "TimeoutSeconds", 105) * 1000);
             int drainSeconds = config.GetInt("Receiver", "BacklogDrainSeconds", 60);
             _backlogDrainMilliseconds = checked((long)drainSeconds * 1000L);
             _ackMode = config.Get("Receiver", "AckMode", "inbox").ToLowerInvariant();
@@ -99,19 +98,28 @@ namespace DeltaVHistoryCLI
             get { return _lastTimings; }
         }
 
-        public BatchReceipt Send(HistoryBatch batch, byte[] data)
+        public BatchReceipt Send(HistoryBatch batch, BatchPayload payload)
         {
             if (batch == null)
                 throw new ArgumentNullException("batch");
-            if (data == null)
-                throw new ArgumentNullException("data");
-            string actualHash = batch.Sha256;
+            if (payload == null || payload.Buffer == null)
+                throw new ArgumentNullException("payload");
+            if (payload.Length < 0 || payload.Length > payload.Buffer.Length)
+                throw new ArgumentException("Batch payload length is invalid.", "payload");
+            string actualHash = payload.Sha256;
             if (String.IsNullOrEmpty(actualHash))
-                actualHash = BatchEncoder.ComputeSha256(data);
-            else
-                ValidateSha256(actualHash);
+                actualHash = batch.Sha256;
+            if (String.IsNullOrEmpty(actualHash))
+                actualHash = BatchEncoder.ComputeSha256(payload.Buffer, payload.Length);
+            ValidateSha256(actualHash);
+            payload.Sha256 = actualHash;
             batch.Sha256 = actualHash;
-            using (MemoryStream input = new MemoryStream(data, false))
+            using (MemoryStream input = new MemoryStream(
+                payload.Buffer,
+                0,
+                payload.Length,
+                false,
+                true))
             {
                 return SendPayload(
                     batch.BatchId,
@@ -123,8 +131,19 @@ namespace DeltaVHistoryCLI
                     batch.Samples.Count,
                     actualHash,
                     input,
-                    data.Length);
+                    payload.Length);
             }
+        }
+
+        public BatchReceipt Send(HistoryBatch batch, byte[] data)
+        {
+            if (data == null)
+                throw new ArgumentNullException("data");
+            BatchPayload payload = new BatchPayload();
+            payload.Buffer = data;
+            payload.Length = data.Length;
+            payload.Sha256 = batch == null ? null : batch.Sha256;
+            return Send(batch, payload);
         }
 
         public int SendPending()
@@ -284,6 +303,8 @@ namespace DeltaVHistoryCLI
             string end = Required(meta, "End");
             string expectedHash = Required(meta, "Sha256").ToLowerInvariant();
             int expectedRows = ParseNonNegativeInt(Required(meta, "Rows"), "Rows");
+            long expectedBytes = ParseNonNegativeLong(Required(meta, "Bytes"), "Bytes");
+            ValidateSha256(expectedHash);
 
             if (!String.Equals(batchId, Path.GetFileName(batchDirectory), StringComparison.Ordinal))
                 throw new InvalidDataException("BatchId does not match its directory name.");
@@ -304,10 +325,8 @@ namespace DeltaVHistoryCLI
                 FileOptions.SequentialScan))
             {
                 long payloadBytes = input.Length;
-                string actualHash = ComputeSha256(input);
-                if (!String.Equals(expectedHash, actualHash, StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException("Local data.csv SHA-256 does not match meta.ini.");
-                input.Position = 0;
+                if (payloadBytes != expectedBytes)
+                    throw new InvalidDataException("Local data.csv length does not match meta.ini.");
                 return SendPayload(
                     batchId,
                     collectorId,
@@ -316,7 +335,7 @@ namespace DeltaVHistoryCLI
                     start,
                     end,
                     expectedRows,
-                    actualHash,
+                    expectedHash,
                     input,
                     payloadBytes);
             }
@@ -541,6 +560,14 @@ namespace DeltaVHistoryCLI
             return value;
         }
 
+        private static long ParseNonNegativeLong(string text, string name)
+        {
+            long value;
+            if (!Int64.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value) || value < 0)
+                throw new InvalidDataException("Invalid " + name + ": " + text);
+            return value;
+        }
+
         private static void ValidateHeader(string value)
         {
             if (value.IndexOf('\r') >= 0 || value.IndexOf('\n') >= 0)
@@ -551,19 +578,6 @@ namespace DeltaVHistoryCLI
         {
             if (!Regex.IsMatch(value, "^[0-9a-fA-F]{64}$"))
                 throw new InvalidDataException("Batch SHA-256 must contain 64 hexadecimal characters.");
-        }
-
-        private static string ComputeSha256(Stream stream)
-        {
-            using (SHA256 sha = SHA256.Create())
-            {
-                byte[] hash = sha.ComputeHash(stream);
-                StringBuilder text = new StringBuilder(hash.Length * 2);
-                int i;
-                for (i = 0; i < hash.Length; i++)
-                    text.Append(hash[i].ToString("x2", CultureInfo.InvariantCulture));
-                return text.ToString();
-            }
         }
 
         private static void CopyPayload(Stream input, Stream output, long payloadBytes)

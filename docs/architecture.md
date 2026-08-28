@@ -57,7 +57,9 @@ allowed while a transient failure leaves pending space available. Once the
 pending batch/byte safety limit is reached, or a healthy Receiver cannot drain
 the backlog within its budget, the state records `CollectionPaused=true` and
 the cycle does not read more Historian data. The continuous host remains alive
-and retries only the pending drain on the shorter `PendingRetrySeconds` cycle.
+and retries the pending drain on the shorter `PendingRetrySeconds` cycle. Once
+a paused cycle drains enough pending data for the state to recover, collection
+may resume immediately; reaching the safety limit pauses it again.
 
 After a successful drain, the state clears `CollectionPaused` and collection
 resumes from the durable Historian checkpoint. The default pending limits are
@@ -66,8 +68,14 @@ resumes from the durable Historian checkpoint. The default pending limits are
 The timeout relationship for synchronous database ACK is:
 
 ```text
-PostgreSQL import 45s < Receiver HTTP write 60s < DCS sender wait 75s
+PostgreSQL import 45s < Receiver HTTP request 90s < DCS sender wait 105s
 ```
+
+Normal collection windows target 25,000 rows / 10 MiB while
+`MaxBatchRows=50000` and `MaxBatchBytes=20971520` remain hard limits. Each DCS
+batch also emits a `Performance` line with Historian RPC, conversion,
+normalization, encoding, send, ACK wait, working-set, and managed-memory
+measurements.
 
 Each completed batch emits `HistorianReadMs`, `EncodeMs`, `SendMs`,
 `AckWaitMs`, `TotalMs`, `PendingBatches`, `PendingBytes`, and
@@ -87,7 +95,15 @@ is auxiliary: if it fails after COMMIT, the Receiver logs a warning, moves the
 payload to `archive_pending` when possible, and still returns
 `commit_level=database`.
 
-Pending files are hashed once and then sent from a FileStream with HTTP
-KeepAlive enabled. The wire CSV, Receiver, PostgreSQL, spool, and ACK formats
+Receiver maintenance retries `archive_pending` entries hourly, up to 100
+batches per pass. Entries with valid persisted metadata are moved back to
+`archive`; entries that still fail remain in place and continue to generate a
+warning. Receiver staging defaults to `StagingDurability=full`; `buffered` is
+available as an explicit performance-test tradeoff, while PostgreSQL COMMIT
+remains the synchronous ACK boundary.
+
+Pending files record their hash when spooled and are then sent once from a
+FileStream with HTTP KeepAlive enabled. The Receiver still validates the body
+hash. The wire CSV, Receiver, PostgreSQL, spool, and ACK formats
 remain compatible; the continuous checkpoint file adds the pause status and
 reason fields.
