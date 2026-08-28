@@ -76,6 +76,19 @@ func TestSampleKeyIsStable(t *testing.T) {
 	}
 }
 
+func TestProcessedSampleKeyIsOrderedByTimestamp(t *testing.T) {
+	sequence := "P:InterpolatedValue:10"
+	first := sampleKey("DCS-TEST", "TAG/A", "2026-08-28 09:00:00.0000000", sequence, "1.25")
+	second := sampleKey("DCS-TEST", "TAG/A", "2026-08-28 09:00:10.0000000", sequence, "1.26")
+	changedValue := sampleKey("DCS-TEST", "TAG/A", "2026-08-28 09:00:00.0000000", sequence, "9.99")
+	if len(first) != 64 || first >= second {
+		t.Fatalf("processed keys must be 64 characters and time ordered: %q %q", first, second)
+	}
+	if first != changedValue {
+		t.Fatal("processed key identity must not depend on value")
+	}
+}
+
 func TestLoadBatchRejectsChangedCSV(t *testing.T) {
 	root := t.TempDir()
 	batchID := "test_batch_001"

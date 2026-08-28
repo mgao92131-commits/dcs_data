@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,12 +77,12 @@ func TestSynchronousCommitEndToEnd(t *testing.T) {
 
 	batchID := "integration_" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	body := integrationCSV(time.Now().UTC().Truncate(time.Microsecond))
-	t.Cleanup(func() {
+	defer func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
 		_, _ = pool.Exec(cleanupCtx, "DELETE FROM history_samples WHERE batch_id=$1", batchID)
 		_, _ = pool.Exec(cleanupCtx, "DELETE FROM imported_batches WHERE batch_id=$1", batchID)
-	})
+	}()
 
 	endpoint := httpServer.URL + "/api/history/batch"
 	status, responseBody := postIntegrationBatch(t, endpoint, batchID, body)
@@ -121,6 +122,89 @@ func TestSynchronousCommitEndToEnd(t *testing.T) {
 		t.Fatalf("unexpected retry ACK: %+v", ack)
 	}
 
+}
+
+func TestBulkImport49600Rows(t *testing.T) {
+	databaseURL := os.Getenv("DCS_HISTORY_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("DCS_HISTORY_TEST_DATABASE_URL is not set")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ensureIntegrationSchema(t, ctx, pool)
+
+	const rowCount = 49600
+	testID := strconv.FormatInt(time.Now().UnixNano(), 10)
+	collectorID := "DCS-BULK-" + testID
+	firstBatchID := "bulk_insert_" + testID
+	updateBatchID := "bulk_update_" + testID
+	rows := make([]importRow, rowCount)
+	startTime := time.Date(2026, 8, 28, 0, 0, 0, 0, time.UTC)
+	for index := range rows {
+		timestamp := startTime.Add(time.Duration(index) * time.Second).Format("2006-01-02 15:04:05.000000")
+		value := float64(index) / 10
+		rows[index] = importRow{
+			SampleKey:     sampleKey(collectorID, "TAG/BULK", timestamp, "P:InterpolatedValue:10", strconv.FormatFloat(value, 'f', 1, 64)),
+			Tag:           "TAG/BULK",
+			TimeText:      timestamp,
+			ValueText:     strconv.FormatFloat(value, 'f', 1, 64),
+			ValueDouble:   &value,
+			DataType:      "Float",
+			SequenceNo:    "P:InterpolatedValue:10",
+			ArchiveStatus: "Current",
+		}
+	}
+	importer := &batchImporter{pool: pool}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		_, _ = pool.Exec(cleanupCtx, "DELETE FROM history_samples WHERE batch_id IN ($1, $2)", firstBatchID, updateBatchID)
+		_, _ = pool.Exec(cleanupCtx, "DELETE FROM imported_batches WHERE batch_id IN ($1, $2)", firstBatchID, updateBatchID)
+	}()
+
+	insertBatch := importBatch{
+		BatchID: firstBatchID, CollectorID: collectorID,
+		SHA256: strings.Repeat("a", 64), Rows: rowCount, Data: rows,
+	}
+	started := time.Now()
+	if err := importer.importBatch(ctx, insertBatch); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("bulk insert rows=%d elapsed=%s", rowCount, time.Since(started).Round(time.Millisecond))
+
+	for index := range rows {
+		value := float64(index)/10 + 1
+		rows[index].ValueDouble = &value
+		rows[index].ValueText = strconv.FormatFloat(value, 'f', 1, 64)
+	}
+	updateBatch := importBatch{
+		BatchID: updateBatchID, CollectorID: collectorID,
+		SHA256: strings.Repeat("b", 64), Rows: rowCount, Data: rows,
+	}
+	started = time.Now()
+	if err := importer.importBatch(ctx, updateBatch); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("bulk update rows=%d elapsed=%s", rowCount, time.Since(started).Round(time.Millisecond))
+
+	var count int
+	if err := pool.QueryRow(ctx,
+		"SELECT count(*) FROM history_samples WHERE collector_id=$1 AND batch_id=$2",
+		collectorID, updateBatchID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != rowCount {
+		t.Fatalf("expected %d updated rows, got %d", rowCount, count)
+	}
 }
 
 func ensureIntegrationSchema(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {

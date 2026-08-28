@@ -302,37 +302,65 @@ func (i *batchImporter) importBatch(ctx context.Context, batch importBatch) erro
 	}
 	defer tx.Rollback(ctx)
 
-	for start := 0; start < len(batch.Data); start += i.importBatchSize {
-		end := start + i.importBatchSize
-		if end > len(batch.Data) {
-			end = len(batch.Data)
+	_, err = tx.Exec(ctx, `CREATE TEMP TABLE history_samples_stage (
+		row_order bigint NOT NULL,
+		sample_key text NOT NULL,
+		collector_id text NOT NULL,
+		tag text NOT NULL,
+		sample_time text NOT NULL,
+		value_double double precision,
+		value_text text NOT NULL,
+		data_type text NOT NULL,
+		flags text NOT NULL,
+		sequence_no text NOT NULL,
+		archive_status text NOT NULL,
+		batch_id text NOT NULL
+	) ON COMMIT DROP`)
+	if err != nil {
+		return err
+	}
+
+	copyRows := make([][]interface{}, len(batch.Data))
+	for index, row := range batch.Data {
+		copyRows[index] = []interface{}{
+			int64(index), row.SampleKey, batch.CollectorID, row.Tag, row.TimeText,
+			row.ValueDouble, row.ValueText, row.DataType, row.Flags,
+			row.SequenceNo, row.ArchiveStatus, batch.BatchID,
 		}
-		queued := &pgx.Batch{}
-		for _, row := range batch.Data[start:end] {
-			queued.Queue(
-				`INSERT INTO history_samples
-				 (sample_key, collector_id, tag, sample_time, value_double, value_text,
-				  data_type, flags, sequence_no, archive_status, batch_id)
-				 VALUES ($1, $2, $3, $4::timestamp, $5, $6, $7, $8, $9, $10, $11)
-				 ON CONFLICT (sample_key) DO UPDATE SET
-				  value_double=EXCLUDED.value_double, value_text=EXCLUDED.value_text,
-				  data_type=EXCLUDED.data_type, flags=EXCLUDED.flags,
-				  archive_status=EXCLUDED.archive_status, batch_id=EXCLUDED.batch_id,
-				  received_at=CURRENT_TIMESTAMP`,
-				row.SampleKey, batch.CollectorID, row.Tag, row.TimeText,
-				row.ValueDouble, row.ValueText, row.DataType, row.Flags,
-				row.SequenceNo, row.ArchiveStatus, batch.BatchID)
-		}
-		results := tx.SendBatch(ctx, queued)
-		for index := start; index < end; index++ {
-			if _, err = results.Exec(); err != nil {
-				_ = results.Close()
-				return err
-			}
-		}
-		if err = results.Close(); err != nil {
-			return err
-		}
+	}
+	copied, err := tx.CopyFrom(
+		ctx,
+		pgx.Identifier{"history_samples_stage"},
+		[]string{
+			"row_order", "sample_key", "collector_id", "tag", "sample_time",
+			"value_double", "value_text", "data_type", "flags", "sequence_no",
+			"archive_status", "batch_id",
+		},
+		pgx.CopyFromRows(copyRows))
+	if err != nil {
+		return err
+	}
+	if copied != int64(len(batch.Data)) {
+		return fmt.Errorf("staging COPY row count mismatch: expected %d, got %d", len(batch.Data), copied)
+	}
+
+	_, err = tx.Exec(ctx, `INSERT INTO history_samples
+		 (sample_key, collector_id, tag, sample_time, value_double, value_text,
+		  data_type, flags, sequence_no, archive_status, batch_id)
+		 SELECT sample_key, collector_id, tag, sample_time::timestamp, value_double,
+		  value_text, data_type, flags, sequence_no, archive_status, batch_id
+		 FROM (
+		  SELECT DISTINCT ON (sample_key) *
+		  FROM history_samples_stage
+		  ORDER BY sample_key, row_order DESC
+		 ) AS staged
+		 ON CONFLICT (sample_key) DO UPDATE SET
+		  value_double=EXCLUDED.value_double, value_text=EXCLUDED.value_text,
+		  data_type=EXCLUDED.data_type, flags=EXCLUDED.flags,
+		  archive_status=EXCLUDED.archive_status, batch_id=EXCLUDED.batch_id,
+		  received_at=CURRENT_TIMESTAMP`)
+	if err != nil {
+		return err
 	}
 
 	_, err = tx.Exec(
@@ -371,7 +399,21 @@ func sampleKey(collectorID, tag, timestamp, sequenceNo, valueText string) string
 		identity = "value:" + valueText
 	}
 	digest := sha256.Sum256([]byte(collectorID + "\x1f" + tag + "\x1f" + timestamp + "\x1f" + identity))
-	return hex.EncodeToString(digest[:])
+	digestText := hex.EncodeToString(digest[:])
+	if !strings.HasPrefix(sequenceNo, "P:") {
+		return digestText
+	}
+
+	groupDigest := sha256.Sum256([]byte(collectorID + "\x1f" + tag + "\x1f" + sequenceNo))
+	groupText := hex.EncodeToString(groupDigest[:])
+	sortableTime := strings.NewReplacer("-", "", " ", "", ":", "", ".", "").Replace(timestamp)
+	if len(sortableTime) > 21 {
+		sortableTime = sortableTime[:21]
+	}
+	for len(sortableTime) < 21 {
+		sortableTime += "0"
+	}
+	return groupText[:16] + sortableTime + digestText[:27]
 }
 
 func hashFile(path string) (string, error) {
