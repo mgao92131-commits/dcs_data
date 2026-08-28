@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -131,7 +132,8 @@ namespace DeltaVHistoryCLI
                     batch.Samples.Count,
                     actualHash,
                     input,
-                    payload.Length);
+                    payload.Length,
+                    false);
             }
         }
 
@@ -337,7 +339,8 @@ namespace DeltaVHistoryCLI
                     expectedRows,
                     expectedHash,
                     input,
-                    payloadBytes);
+                    payloadBytes,
+                    true);
             }
         }
 
@@ -351,7 +354,8 @@ namespace DeltaVHistoryCLI
             int expectedRows,
             string actualHash,
             Stream data,
-            long payloadBytes)
+            long payloadBytes,
+            bool verifyLocalHash)
         {
             if (data == null)
                 throw new ArgumentNullException("data");
@@ -393,7 +397,10 @@ namespace DeltaVHistoryCLI
                 {
                     using (Stream output = request.GetRequestStream())
                     {
-                        CopyPayload(data, output, payloadBytes);
+                        if (verifyLocalHash)
+                            CopyPayloadAndHash(data, output, payloadBytes, actualHash);
+                        else
+                            CopyPayload(data, output, payloadBytes);
                     }
                 }
                 finally
@@ -582,6 +589,36 @@ namespace DeltaVHistoryCLI
 
         private static void CopyPayload(Stream input, Stream output, long payloadBytes)
         {
+            CopyPayloadCore(input, output, payloadBytes, null);
+        }
+
+        private static string CopyPayloadAndHash(
+            Stream input,
+            Stream output,
+            long payloadBytes,
+            string expectedHash)
+        {
+            using (SHA256 sha = SHA256.Create())
+            {
+                CopyPayloadCore(input, output, payloadBytes, sha);
+                byte[] hash = sha.Hash;
+                StringBuilder text = new StringBuilder(hash.Length * 2);
+                int i;
+                for (i = 0; i < hash.Length; i++)
+                    text.Append(hash[i].ToString("x2", CultureInfo.InvariantCulture));
+                string actualHash = text.ToString();
+                if (!String.Equals(actualHash, expectedHash, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("Local data.csv SHA-256 does not match meta.ini.");
+                return actualHash;
+            }
+        }
+
+        private static void CopyPayloadCore(
+            Stream input,
+            Stream output,
+            long payloadBytes,
+            HashAlgorithm hash)
+        {
             byte[] buffer = new byte[65536];
             long remaining = payloadBytes;
             while (remaining > 0)
@@ -592,11 +629,15 @@ namespace DeltaVHistoryCLI
                 int read = input.Read(buffer, 0, requested);
                 if (read <= 0)
                     throw new InvalidDataException("Payload stream ended before Content-Length.");
+                if (hash != null)
+                    hash.TransformBlock(buffer, 0, read, buffer, 0);
                 output.Write(buffer, 0, read);
                 remaining -= read;
             }
             if (input.Read(buffer, 0, 1) != 0)
                 throw new InvalidDataException("Payload stream is longer than Content-Length.");
+            if (hash != null)
+                hash.TransformFinalBlock(new byte[0], 0, 0);
             output.Flush();
         }
     }

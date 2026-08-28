@@ -2,7 +2,8 @@
 
 ## Build
 
-The DCS build requires the .NET Framework 3.5 compiler and always targets x86:
+The supported DCS baseline is Windows 7 32-bit with the .NET Framework 3.5
+compiler/runtime and an x86 process; no .NET 2.0 fallback is maintained:
 
 ```bat
 scripts\package-dcs.bat

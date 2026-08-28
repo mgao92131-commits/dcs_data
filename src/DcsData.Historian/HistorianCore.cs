@@ -132,7 +132,8 @@ namespace DeltaVHistoryCLI
         private int _connectionHandle = -1;
         private string _assemblyDirectory;
         private bool _resolverAttached;
-        private ProcessedPointAccessorSet _pointAccessors;
+        private readonly Dictionary<Type, ProcessedPointAccessorSet> _processedPointAccessors =
+            new Dictionary<Type, ProcessedPointAccessorSet>();
         private int _processedPointAccessorBuildCount;
         private HistorianPerformanceMetrics _lastPerformance =
             new HistorianPerformanceMetrics();
@@ -518,7 +519,7 @@ namespace DeltaVHistoryCLI
             _readProcessed = null;
             _processedSampleType = null;
             _interpolatedAggregate = null;
-            _pointAccessors = null;
+            _processedPointAccessors.Clear();
             _readInterface = null;
             if (_resolverAttached)
             {
@@ -694,22 +695,24 @@ namespace DeltaVHistoryCLI
 
         private ProcessedPointAccessorSet GetProcessedPointAccessors(Type pointType)
         {
-            if (_pointAccessors == null || _pointAccessors.PointType != pointType)
+            ProcessedPointAccessorSet accessors;
+            if (!_processedPointAccessors.TryGetValue(pointType, out accessors))
             {
-                _pointAccessors = new ProcessedPointAccessorSet();
-                _pointAccessors.PointType = pointType;
-                _pointAccessors.Timestamp = FindMemberAccessor(pointType, "timestamp");
-                _pointAccessors.Value = FindMemberAccessor(pointType, "value");
-                _pointAccessors.DataType = FindMemberAccessor(pointType, "dataType");
-                _pointAccessors.SequenceNo = FindMemberAccessor(pointType, "sequenceNo");
-                _pointAccessors.ArchiveStatus = FindMemberAccessor(pointType, "archiveStatus");
-                _pointAccessors.IsHistoryHole = FindMemberAccessor(pointType, "isHistoryHole");
-                _pointAccessors.IsCRHole = FindMemberAccessor(pointType, "isCRHole");
-                _pointAccessors.IsManuallyDeleted = FindMemberAccessor(pointType, "isManuallyDeleted");
-                _pointAccessors.IsManuallyInserted = FindMemberAccessor(pointType, "isManuallyInserted");
+                accessors = new ProcessedPointAccessorSet();
+                accessors.PointType = pointType;
+                accessors.Timestamp = FindMemberAccessor(pointType, "timestamp");
+                accessors.Value = FindMemberAccessor(pointType, "value");
+                accessors.DataType = FindMemberAccessor(pointType, "dataType");
+                accessors.SequenceNo = FindMemberAccessor(pointType, "sequenceNo");
+                accessors.ArchiveStatus = FindMemberAccessor(pointType, "archiveStatus");
+                accessors.IsHistoryHole = FindMemberAccessor(pointType, "isHistoryHole");
+                accessors.IsCRHole = FindMemberAccessor(pointType, "isCRHole");
+                accessors.IsManuallyDeleted = FindMemberAccessor(pointType, "isManuallyDeleted");
+                accessors.IsManuallyInserted = FindMemberAccessor(pointType, "isManuallyInserted");
+                _processedPointAccessors.Add(pointType, accessors);
                 _processedPointAccessorBuildCount++;
             }
-            return _pointAccessors;
+            return accessors;
         }
 
         private static object GetMemberValue(object instance, string name)

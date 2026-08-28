@@ -216,6 +216,19 @@ namespace DeltaVHistoryCLI
                     alternateResults[0].Result.Samples[0].Tag == "TAG/ALTERNATE",
                     "Processed point accessors rebuild for a different point type");
 
+                fakeConnection.UseAlternatePointType = false;
+                List<TagResult> repeatedTags = new List<TagResult>();
+                repeatedTags.Add(new TagResult { Name = "TAG/REPEATED", Handle = 104, Status = 1 });
+                List<ProcessedTagResult> repeatedResults = fakeClient.ReadProcessedBatch(
+                    repeatedTags,
+                    new DateTime(2026, 8, 28, 10, 0, 0),
+                    new DateTime(2026, 8, 28, 10, 5, 0),
+                    10);
+                Assert(fakeClient.ProcessedPointAccessorBuildCount == 2 &&
+                    repeatedResults[0].Result != null &&
+                    repeatedResults[0].Result.Samples.Count == 1000,
+                    "Processed point accessors reuse an earlier runtime point type");
+
                 List<HistorySample> unordered = new List<HistorySample>();
                 unordered.Add(new HistorySample { Timestamp = new DateTime(2026, 8, 28, 10, 0, 20) });
                 unordered.Add(new HistorySample { Timestamp = new DateTime(2026, 8, 28, 10, 0, 10) });
@@ -269,22 +282,60 @@ namespace DeltaVHistoryCLI
                 }
                 fakeClient.Dispose();
 
-                byte[] streamingInput = new byte[150000];
-                int streamingIndex;
-                for (streamingIndex = 0; streamingIndex < streamingInput.Length; streamingIndex++)
-                    streamingInput[streamingIndex] = (byte)(streamingIndex % 251);
-                MemoryStream streamingSource = new MemoryStream(streamingInput, false);
-                MemoryStream streamingDestination = new MemoryStream();
-                InvokePrivate(
-                    typeof(BatchSender),
-                    "CopyPayload",
-                    new object[] { streamingSource, streamingDestination, (long)streamingInput.Length });
-                byte[] streamingOutput = streamingDestination.ToArray();
-                Assert(streamingOutput.Length == streamingInput.Length,
-                    "streaming sender payload length");
-                for (streamingIndex = 0; streamingIndex < streamingInput.Length; streamingIndex++)
-                    Assert(streamingOutput[streamingIndex] == streamingInput[streamingIndex],
-                        "streaming sender payload copy");
+                int[] streamingSizes = new int[] { 150000, 5 * 1024 * 1024 };
+                int streamingSizeIndex;
+                for (streamingSizeIndex = 0; streamingSizeIndex < streamingSizes.Length; streamingSizeIndex++)
+                {
+                    byte[] streamingInput = new byte[streamingSizes[streamingSizeIndex]];
+                    int streamingIndex;
+                    for (streamingIndex = 0; streamingIndex < streamingInput.Length; streamingIndex++)
+                        streamingInput[streamingIndex] = (byte)(streamingIndex % 251);
+                    string expectedStreamingHash = BatchEncoder.ComputeSha256(streamingInput);
+                    MemoryStream streamingSource = new MemoryStream(streamingInput, false);
+                    MemoryStream streamingDestination = new MemoryStream();
+                    string actualStreamingHash = (string)InvokePrivate(
+                        typeof(BatchSender),
+                        "CopyPayloadAndHash",
+                        new object[] {
+                            streamingSource,
+                            streamingDestination,
+                            (long)streamingInput.Length,
+                            expectedStreamingHash
+                        });
+                    byte[] streamingOutput = streamingDestination.ToArray();
+                    Assert(streamingOutput.Length == streamingInput.Length &&
+                        actualStreamingHash == expectedStreamingHash,
+                        "streaming sender payload length and SHA");
+                    for (streamingIndex = 0; streamingIndex < streamingInput.Length; streamingIndex++)
+                        Assert(streamingOutput[streamingIndex] == streamingInput[streamingIndex],
+                            "streaming sender payload copy");
+                }
+
+                byte[] tamperedInput = new byte[150000];
+                int tamperedIndex;
+                for (tamperedIndex = 0; tamperedIndex < tamperedInput.Length; tamperedIndex++)
+                    tamperedInput[tamperedIndex] = (byte)(tamperedIndex % 251);
+                string tamperedExpectedHash = BatchEncoder.ComputeSha256(tamperedInput);
+                tamperedInput[tamperedInput.Length / 2] ^= 1;
+                bool localHashRejected = false;
+                try
+                {
+                    InvokePrivate(
+                        typeof(BatchSender),
+                        "CopyPayloadAndHash",
+                        new object[] {
+                            new MemoryStream(tamperedInput, false),
+                            new MemoryStream(),
+                            (long)tamperedInput.Length,
+                            tamperedExpectedHash
+                        });
+                }
+                catch (TargetInvocationException ex)
+                {
+                    localHashRejected = ex.InnerException is InvalidDataException;
+                }
+                Assert(localHashRejected,
+                    "same-length local payload corruption is rejected by SHA");
 
                 HistoryBatch encodedBatch = new HistoryBatch();
                 encodedBatch.Samples.Add(new HistorySample {

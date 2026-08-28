@@ -62,8 +62,6 @@ namespace DeltaVHistoryCLI
         public DateTime RangeEnd;
         public List<HistorySample> Samples = new List<HistorySample>();
         public string Sha256;
-        public long HistorianConnectMilliseconds;
-        public long ResolveTagsMilliseconds;
         public long HistorianRpcMilliseconds;
         public long SampleConvertMilliseconds;
         public long NormalizeMilliseconds;

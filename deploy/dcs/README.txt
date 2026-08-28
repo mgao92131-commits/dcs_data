@@ -3,7 +3,8 @@ DeltaV Processed History Collector
 
 Runtime requirements:
 
-  Windows with .NET Framework 3.5
+  Windows 7 32-bit
+  .NET Framework 3.5 (the supported minimum and runtime)
   DeltaV Historian 10.3 assemblies
   x86 process
   normal user write access to this directory

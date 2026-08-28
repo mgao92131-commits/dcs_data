@@ -77,10 +77,14 @@ batch also emits a `Performance` line with Historian RPC, conversion,
 normalization, encoding, send, ACK wait, working-set, and managed-memory
 measurements.
 
-Each completed batch emits `HistorianReadMs`, `EncodeMs`, `SendMs`,
-`AckWaitMs`, `TotalMs`, `PendingBatches`, `PendingBytes`, and
-`SyncLagSeconds`. The Receiver emits the corresponding receive, validation,
-parse, COPY, upsert, commit, and total timings.
+Each collection cycle emits one `CycleMetrics` record containing
+`ConnectMs`, `ResolveTagsMs`, tag counts, the estimated bytes per row, and the
+effective window. Each completed batch emits `HistorianReadMs`, `EncodeMs`,
+`SendMs`, `AckWaitMs`, `TotalMs`, `PendingBatches`, `PendingBytes`, and
+`SyncLagSeconds`; its `Performance` record contains only batch-local Historian
+RPC, conversion, normalization, throughput, and memory timings. The Receiver
+emits the corresponding receive, validation, parse, COPY, upsert, commit, and
+total timings.
 
 The Receiver hashes, stages, validates, and converts the incoming CSV while
 reading the HTTP body. Synchronous database ACK reuses those parsed rows

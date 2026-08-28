@@ -1,8 +1,10 @@
 # DeltaV Processed History Collector
 
 This repository contains a DCS collector and its existing Receiver. The DCS
-collector targets .NET Framework 3.5/x86 and reads every configured Historian
-tag with `readProcessed`, `Aggregate.InterpolatedValue`, and a 10-second grid.
+collector targets the Windows 7 32-bit / .NET Framework 3.5 / x86 baseline and
+reads every configured Historian tag with `readProcessed`,
+`Aggregate.InterpolatedValue`, and a 10-second grid. No .NET 2.0 fallback is
+maintained.
 
 ## DCS build
 

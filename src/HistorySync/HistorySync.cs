@@ -111,6 +111,16 @@ namespace DeltaVHistoryCLI
         public long TargetBatchBytes;
     }
 
+    class CycleMetrics
+    {
+        public long ConnectMilliseconds;
+        public long ResolveTagsMilliseconds;
+        public int ValidTags;
+        public int InvalidTags;
+        public double EstimatedBytesPerRow;
+        public TimeSpan EffectiveWindow;
+    }
+
     class SyncLogger : IDisposable
     {
         private StreamWriter _writer;
@@ -145,7 +155,7 @@ namespace DeltaVHistoryCLI
 
     class SyncProgram
     {
-        private const string Version = "3.3-performance";
+        private const string Version = "3.3.1";
         private const int CollectionPausedExitCode = 45;
         private const string MutexName = "Global\\DeltaVHistorySync";
         private const string ContinuousStopEventName =
@@ -1156,8 +1166,7 @@ namespace DeltaVHistoryCLI
         {
             HistorianClient client = null;
             bool ownsHistorian = historianSession == null;
-            long historianConnectMilliseconds = 0;
-            long resolveTagsMilliseconds = 0;
+            CycleMetrics cycleMetrics = new CycleMetrics();
             double bytesPerRowEstimate = historianSession == null
                 ? 256.0
                 : historianSession.BytesPerRowEstimate;
@@ -1169,13 +1178,13 @@ namespace DeltaVHistoryCLI
                     Stopwatch connectClock = Stopwatch.StartNew();
                     client = ConnectHistorian(options, log);
                     connectClock.Stop();
-                    historianConnectMilliseconds = connectClock.ElapsedMilliseconds;
+                    cycleMetrics.ConnectMilliseconds = connectClock.ElapsedMilliseconds;
 
                     List<string> tagNames = LoadSyncTags(options);
                     Stopwatch resolveClock = Stopwatch.StartNew();
                     tags = client.ResolveTags(tagNames);
                     resolveClock.Stop();
-                    resolveTagsMilliseconds = resolveClock.ElapsedMilliseconds;
+                    cycleMetrics.ResolveTagsMilliseconds = resolveClock.ElapsedMilliseconds;
                 }
                 else
                 {
@@ -1186,8 +1195,8 @@ namespace DeltaVHistoryCLI
                         options,
                         tagNames,
                         log,
-                        out historianConnectMilliseconds,
-                        out resolveTagsMilliseconds);
+                        out cycleMetrics.ConnectMilliseconds,
+                        out cycleMetrics.ResolveTagsMilliseconds);
                     client = historianSession.Client;
                     tags = historianSession.Tags;
                 }
@@ -1199,6 +1208,8 @@ namespace DeltaVHistoryCLI
                 int validTags = tags.Count - badTags;
                 if (validTags <= 0)
                     throw new Exception("No valid Historian tags.");
+                cycleMetrics.ValidTags = validTags;
+                cycleMetrics.InvalidTags = badTags;
 
                 DateTime collectionStart = AlignDown(
                     options.Start,
@@ -1221,19 +1232,14 @@ namespace DeltaVHistoryCLI
                     bytesPerRowEstimate,
                     options.SamplingIntervalSeconds,
                     options.Slice);
-
-                log.Write(
-                    "Sampling=InterpolatedValue intervalSeconds=" +
-                    options.SamplingIntervalSeconds.ToString(CultureInfo.InvariantCulture) +
-                    " validTags=" + validTags.ToString(CultureInfo.InvariantCulture) +
-                     " maxWindowMinutes=" + options.Slice.TotalMinutes.ToString(
-                         "0.###", CultureInfo.InvariantCulture) +
-                     " targetRows=" + options.TargetBatchRows.ToString(CultureInfo.InvariantCulture) +
-                     " targetBytes=" + options.TargetBatchBytes.ToString(CultureInfo.InvariantCulture) +
-                     " estimatedBytesPerRow=" + bytesPerRowEstimate.ToString(
-                         "0.###", CultureInfo.InvariantCulture) +
-                     " effectiveWindowMinutes=" + effectiveSlice.TotalMinutes.ToString(
-                        "0.###", CultureInfo.InvariantCulture));
+                cycleMetrics.EstimatedBytesPerRow = bytesPerRowEstimate;
+                cycleMetrics.EffectiveWindow = effectiveSlice;
+                LogCycleMetrics(
+                    options,
+                    log,
+                    collectionStart,
+                    collectionEnd,
+                    cycleMetrics);
 
                 DateTime sliceStart = collectionStart;
                 int batches = 0;
@@ -1259,8 +1265,6 @@ namespace DeltaVHistoryCLI
                         state,
                         stateStore,
                         ref created,
-                        historianConnectMilliseconds,
-                        resolveTagsMilliseconds,
                         ref bytesPerRowEstimate);
                     if (result != 0 && result != 5)
                         return result;
@@ -1294,8 +1298,6 @@ namespace DeltaVHistoryCLI
             ref bool directSendAllowed,
             SyncState state,
             SyncStateStore stateStore,
-            long historianConnectMilliseconds,
-            long resolveTagsMilliseconds,
             ref double bytesPerRowEstimate)
         {
             string batchId = BuildBatchId(options.CollectorId);
@@ -1317,9 +1319,6 @@ namespace DeltaVHistoryCLI
                 batch.Server = options.Server;
                 batch.RangeStart = start;
                 batch.RangeEnd = end;
-                batch.HistorianConnectMilliseconds = historianConnectMilliseconds;
-                batch.ResolveTagsMilliseconds = resolveTagsMilliseconds;
-
                 int tagIndex;
                 int invalidTags = 0;
                 int successfulTags = 0;
@@ -1747,10 +1746,8 @@ namespace DeltaVHistoryCLI
                  " SyncLagSeconds=" + syncLagSeconds.ToString(CultureInfo.InvariantCulture));
             log.Write(
                 "Performance batch_id=" + batch.BatchId +
-                " ConnectMs=" + batch.HistorianConnectMilliseconds.ToString(CultureInfo.InvariantCulture) +
-                " ResolveTagsMs=" + batch.ResolveTagsMilliseconds.ToString(CultureInfo.InvariantCulture) +
-                " RpcMs=" + batch.HistorianRpcMilliseconds.ToString(CultureInfo.InvariantCulture) +
-                " ConvertMs=" + batch.SampleConvertMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                 " RpcMs=" + batch.HistorianRpcMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                 " ConvertMs=" + batch.SampleConvertMilliseconds.ToString(CultureInfo.InvariantCulture) +
                 " NormalizeMs=" + batch.NormalizeMilliseconds.ToString(CultureInfo.InvariantCulture) +
                 " ReturnedSamples=" + batch.ReturnedSamples.ToString(CultureInfo.InvariantCulture) +
                 " InvalidSamples=" + batch.InvalidSamples.ToString(CultureInfo.InvariantCulture) +
@@ -1758,7 +1755,29 @@ namespace DeltaVHistoryCLI
                 " NormalizeFallbackTags=" + batch.NormalizeFallbackTags.ToString(CultureInfo.InvariantCulture) +
                 " RowsPerSec=" + rowsPerSecond.ToString("0.###", CultureInfo.InvariantCulture) +
                 " WorkingSetBytes=" + workingSetBytes.ToString(CultureInfo.InvariantCulture) +
-                " GCMemoryBytes=" + gcMemoryBytes.ToString(CultureInfo.InvariantCulture));
+                 " GCMemoryBytes=" + gcMemoryBytes.ToString(CultureInfo.InvariantCulture));
+        }
+
+        private static void LogCycleMetrics(
+            SyncOptions options,
+            SyncLogger log,
+            DateTime start,
+            DateTime end,
+            CycleMetrics metrics)
+        {
+            log.Write(
+                "CycleMetrics range=" + FormatTime(start) + " .. " + FormatTime(end) +
+                " Sampling=InterpolatedValue" +
+                " IntervalSeconds=" + options.SamplingIntervalSeconds.ToString(CultureInfo.InvariantCulture) +
+                " ConnectMs=" + metrics.ConnectMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                " ResolveTagsMs=" + metrics.ResolveTagsMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                " ValidTags=" + metrics.ValidTags.ToString(CultureInfo.InvariantCulture) +
+                " InvalidTags=" + metrics.InvalidTags.ToString(CultureInfo.InvariantCulture) +
+                " MaxWindowMinutes=" + options.Slice.TotalMinutes.ToString("0.###", CultureInfo.InvariantCulture) +
+                " TargetBatchRows=" + options.TargetBatchRows.ToString(CultureInfo.InvariantCulture) +
+                " TargetBatchBytes=" + options.TargetBatchBytes.ToString(CultureInfo.InvariantCulture) +
+                " EstimatedBytesPerRow=" + metrics.EstimatedBytesPerRow.ToString("0.###", CultureInfo.InvariantCulture) +
+                " EffectiveWindowSeconds=" + metrics.EffectiveWindow.TotalSeconds.ToString("0.###", CultureInfo.InvariantCulture));
         }
 
         private static int CollectWindow(
@@ -1773,8 +1792,6 @@ namespace DeltaVHistoryCLI
             SyncState state,
             SyncStateStore stateStore,
             ref int created,
-            long historianConnectMilliseconds,
-            long resolveTagsMilliseconds,
             ref double bytesPerRowEstimate)
         {
             if (!directSendAllowed)
@@ -1817,8 +1834,6 @@ namespace DeltaVHistoryCLI
                 ref directSendAllowed,
                 state,
                 stateStore,
-                historianConnectMilliseconds,
-                resolveTagsMilliseconds,
                 ref bytesPerRowEstimate);
             if (result != 21)
             {
@@ -1849,14 +1864,12 @@ namespace DeltaVHistoryCLI
             int first = CollectWindow(
                 options, start, middle, log, client, tags, sender,
                 ref directSendAllowed, state, stateStore, ref created,
-                historianConnectMilliseconds, resolveTagsMilliseconds,
                 ref bytesPerRowEstimate);
             if (first != 0 && first != 5)
                 return first;
             int second = CollectWindow(
                 options, middle, end, log, client, tags, sender,
                 ref directSendAllowed, state, stateStore, ref created,
-                historianConnectMilliseconds, resolveTagsMilliseconds,
                 ref bytesPerRowEstimate);
             if (second != 0 && second != 5)
                 return second;
