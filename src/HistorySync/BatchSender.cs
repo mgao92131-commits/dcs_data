@@ -59,13 +59,12 @@ namespace DeltaVHistoryCLI
         private readonly int _sendRetryMilliseconds;
         private readonly string _ackMode;
         private readonly SyncLogger _log;
-        private BatchSendTimings _lastTimings;
 
         public BatchSender(IniConfig config, SyncLogger log)
         {
             _url = config.Get("Receiver", "Url", "");
             _apiKey = config.Get("Receiver", "ApiKey", "");
-            int timeoutSeconds = config.GetInt("Receiver", "TimeoutSeconds", 105);
+            int timeoutSeconds = config.GetInt("Receiver", "TimeoutSeconds", 135);
             int retrySeconds = config.GetInt("Receiver", "SendRetrySeconds", 30);
             _ackMode = config.Get("Receiver", "AckMode", "database").ToLowerInvariant();
             _log = log;
@@ -82,15 +81,29 @@ namespace DeltaVHistoryCLI
             _sendRetryMilliseconds = checked(retrySeconds * 1000);
         }
 
-        public BatchSendTimings LastTimings
-        {
-            get { return _lastTimings; }
-        }
-
         public BatchReceipt SendWithRetry(
             HistoryBatch batch,
             BatchPayload payload,
             WaitHandle stopHandle)
+        {
+            return SendWithRetryCore(
+                batch,
+                payload,
+                stopHandle == null ? null : new WaitHandle[] { stopHandle });
+        }
+
+        internal BatchReceipt SendWithRetryAny(
+            HistoryBatch batch,
+            BatchPayload payload,
+            WaitHandle[] stopHandles)
+        {
+            return SendWithRetryCore(batch, payload, stopHandles);
+        }
+
+        private BatchReceipt SendWithRetryCore(
+            HistoryBatch batch,
+            BatchPayload payload,
+            WaitHandle[] stopHandles)
         {
             if (batch == null)
                 throw new ArgumentNullException("batch");
@@ -100,25 +113,19 @@ namespace DeltaVHistoryCLI
             int attempt = 0;
             while (true)
             {
-                ThrowIfStopRequested(stopHandle);
+                ThrowIfStopRequested(stopHandles);
                 attempt++;
                 try
                 {
                     BatchReceipt receipt = Send(batch, payload);
                     if (receipt.Timings != null)
-                    {
                         receipt.Timings.Attempts = attempt;
-                        _lastTimings = receipt.Timings;
-                    }
                     return receipt;
                 }
                 catch (BatchSendException ex)
                 {
                     if (ex.Timings != null)
-                    {
                         ex.Timings.Attempts = attempt;
-                        _lastTimings = ex.Timings;
-                    }
                     if (ex.Permanent)
                         throw;
 
@@ -128,14 +135,14 @@ namespace DeltaVHistoryCLI
                         " afterSeconds=" +
                         (_sendRetryMilliseconds / 1000).ToString(CultureInfo.InvariantCulture) +
                         " error=" + ex.Message);
-                    WaitBeforeRetry(batch.BatchId, stopHandle);
+                    WaitBeforeRetry(batch.BatchId, stopHandles);
                 }
             }
         }
 
         public BatchReceipt SendWithRetry(HistoryBatch batch, BatchPayload payload)
         {
-            return SendWithRetry(batch, payload, null);
+            return SendWithRetryCore(batch, payload, null);
         }
 
         public BatchReceipt Send(HistoryBatch batch, BatchPayload payload)
@@ -252,6 +259,7 @@ namespace DeltaVHistoryCLI
 
                 string responseText;
                 HttpStatusCode status;
+                BatchReceipt receipt = null;
                 Stopwatch ackClock = Stopwatch.StartNew();
                 try
                 {
@@ -283,7 +291,7 @@ namespace DeltaVHistoryCLI
                         batchId,
                         actualHash,
                         expectedRows);
-                    BatchReceipt receipt = new BatchReceipt();
+                    receipt = new BatchReceipt();
                     receipt.BatchId = batchId;
                     receipt.Mode = mode;
                     receipt.CommitLevel = commitLevel;
@@ -292,43 +300,47 @@ namespace DeltaVHistoryCLI
                     receipt.Rows = expectedRows;
                     receipt.PayloadBytes = payloadBytes;
                     receipt.Timings = timings;
-                    _log.Write(
-                        "ACK database batch=" + batchId +
-                        " rows=" + expectedRows.ToString(CultureInfo.InvariantCulture) +
-                        " SendMs=" + timings.SendMilliseconds.ToString(CultureInfo.InvariantCulture) +
-                        " AckWaitMs=" + timings.AckWaitMilliseconds.ToString(CultureInfo.InvariantCulture) +
-                        " TotalMs=" + timings.TotalMilliseconds.ToString(CultureInfo.InvariantCulture));
-                    return receipt;
                 }
                 finally
                 {
                     ackClock.Stop();
                     timings.AckWaitMilliseconds = ackClock.ElapsedMilliseconds;
                 }
+                totalClock.Stop();
+                timings.TotalMilliseconds = totalClock.ElapsedMilliseconds;
+                _log.Write(
+                    "ACK database batch=" + batchId +
+                    " rows=" + expectedRows.ToString(CultureInfo.InvariantCulture) +
+                    " SendMs=" + timings.SendMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                    " AckWaitMs=" + timings.AckWaitMilliseconds.ToString(CultureInfo.InvariantCulture) +
+                    " TotalMs=" + timings.TotalMilliseconds.ToString(CultureInfo.InvariantCulture));
+                return receipt;
             }
             finally
             {
                 totalClock.Stop();
                 timings.TotalMilliseconds = totalClock.ElapsedMilliseconds;
-                _lastTimings = timings;
             }
         }
 
-        private void WaitBeforeRetry(string batchId, WaitHandle stopHandle)
+        private void WaitBeforeRetry(string batchId, WaitHandle[] stopHandles)
         {
-            if (stopHandle == null)
+            if (stopHandles == null || stopHandles.Length == 0)
             {
                 Thread.Sleep(_sendRetryMilliseconds);
                 return;
             }
-            if (stopHandle.WaitOne(_sendRetryMilliseconds, false))
+            if (WaitHandle.WaitAny(stopHandles, _sendRetryMilliseconds, false) !=
+                WaitHandle.WaitTimeout)
                 throw new SyncStopRequestedException(
                     "Stop requested while waiting to retry batch " + batchId + ".");
         }
 
-        private static void ThrowIfStopRequested(WaitHandle stopHandle)
+        private static void ThrowIfStopRequested(WaitHandle[] stopHandles)
         {
-            if (stopHandle != null && stopHandle.WaitOne(0, false))
+            if (stopHandles != null &&
+                stopHandles.Length > 0 &&
+                WaitHandle.WaitAny(stopHandles, 0, false) != WaitHandle.WaitTimeout)
                 throw new SyncStopRequestedException("Stop requested.");
         }
 

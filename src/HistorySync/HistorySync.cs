@@ -132,6 +132,7 @@ namespace DeltaVHistoryCLI
 
     class SyncLogger : IDisposable
     {
+        private readonly object _writeLock = new object();
         private StreamWriter _writer;
 
         public SyncLogger(string directory)
@@ -146,18 +147,26 @@ namespace DeltaVHistoryCLI
 
         public void Write(string text)
         {
-            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " " + text;
-            Console.WriteLine(text);
-            _writer.WriteLine(line);
+            lock (_writeLock)
+            {
+                if (_writer == null)
+                    return;
+                string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " " + text;
+                Console.WriteLine(text);
+                _writer.WriteLine(line);
+            }
         }
 
         public void Dispose()
         {
-            if (_writer != null)
+            lock (_writeLock)
             {
-                _writer.Flush();
-                _writer.Close();
-                _writer = null;
+                if (_writer != null)
+                {
+                    _writer.Flush();
+                    _writer.Close();
+                    _writer = null;
+                }
             }
         }
     }
@@ -169,7 +178,7 @@ namespace DeltaVHistoryCLI
 
     class SyncProgram
     {
-        private const string Version = "3.4.0";
+        private const string Version = "3.4.1";
         private const int InitialCheckpointMinutes = 15;
         private const int CheckpointRetrySeconds = 5;
         private const string MutexName = "Global\\DeltaVHistorySync";
@@ -970,6 +979,7 @@ namespace DeltaVHistoryCLI
 
             HistorianClient client = null;
             bool ownsHistorian = historianSession == null;
+            BatchPipeline pipeline = null;
             CycleMetrics cycleMetrics = new CycleMetrics();
             double bytesPerRowEstimate = historianSession == null
                 ? 256.0
@@ -1049,6 +1059,13 @@ namespace DeltaVHistoryCLI
                     collectionEnd,
                     cycleMetrics);
 
+                pipeline = new BatchPipeline(
+                    options,
+                    sender,
+                    state,
+                    stateStore,
+                    log,
+                    stopHandle);
                 DateTime sliceStart = collectionStart;
                 int batches = 0;
                 while (sliceStart < collectionEnd)
@@ -1071,9 +1088,7 @@ namespace DeltaVHistoryCLI
                         log,
                         client,
                         tags,
-                        sender,
-                        state,
-                        stateStore,
+                        pipeline,
                         ref created,
                         ref bytesPerRowEstimate,
                         stopHandle);
@@ -1082,6 +1097,7 @@ namespace DeltaVHistoryCLI
                     batches += created;
                     sliceStart = sliceEnd;
                 }
+                pipeline.WaitForAll();
                 log.Write(
                     "Completed batches=" +
                     batches.ToString(CultureInfo.InvariantCulture) +
@@ -1089,8 +1105,41 @@ namespace DeltaVHistoryCLI
                     badTags.ToString(CultureInfo.InvariantCulture));
                 return badTags == 0 ? 0 : 5;
             }
+            catch (SyncStopRequestedException ex)
+            {
+                log.Write("Pipeline stopped: " + ex.Message);
+                return 0;
+            }
+            catch (BatchSendException ex)
+            {
+                log.Write(
+                    (ex.AuthenticationFailure
+                        ? "Receiver authentication failed"
+                        : "Receiver permanently rejected batch") +
+                    " status=" +
+                    ex.StatusCode.ToString(CultureInfo.InvariantCulture) +
+                    " error=" + ex.Message);
+                return ex.AuthenticationFailure ? 42 : 41;
+            }
+            catch (InvalidDataException ex)
+            {
+                log.Write("Permanent batch data/protocol error: " + ex.Message);
+                return 41;
+            }
+            catch (BatchLimitException ex)
+            {
+                log.Write("Batch limit failure: " + ex.Message);
+                return 20;
+            }
+            catch (Exception ex)
+            {
+                log.Write("Collection pipeline failed: " + ex.Message);
+                return 20;
+            }
             finally
             {
+                if (pipeline != null)
+                    pipeline.Dispose();
                 if (historianSession != null)
                     historianSession.BytesPerRowEstimate = bytesPerRowEstimate;
                 if (historianSession != null &&
@@ -1102,261 +1151,172 @@ namespace DeltaVHistoryCLI
             }
         }
 
-        private static int CreateBatch(
+        private static PreparedBatch PrepareBatch(
             SyncOptions options,
             DateTime start,
             DateTime end,
             SyncLogger log,
             HistorianClient client,
             List<TagResult> tags,
-            BatchSender sender,
-            SyncState state,
-            SyncStateStore stateStore,
             ref double bytesPerRowEstimate,
             WaitHandle stopHandle)
         {
             string batchId = BuildBatchId(options.CollectorId);
             log.Write(
-                "Collect batch=" + batchId +
+                "Prepare batch=" + batchId +
                 " range=" + FormatTime(start) +
                 " .. " + FormatTime(end));
             Stopwatch totalClock = Stopwatch.StartNew();
             Stopwatch historianClock = Stopwatch.StartNew();
-            long historianReadMilliseconds = 0;
-            long encodeMilliseconds = 0;
-            BatchSendTimings sendTimings = null;
+            ThrowIfStopRequested(stopHandle);
 
-            try
+            HistoryBatch batch = new HistoryBatch();
+            batch.BatchId = batchId;
+            batch.CollectorId = options.CollectorId;
+            batch.Mode = options.Command;
+            batch.Sampling = "InterpolatedValue";
+            batch.SamplingIntervalSeconds = options.SamplingIntervalSeconds;
+            batch.Server = options.Server;
+            batch.RangeStart = start;
+            batch.RangeEnd = end;
+
+            int tagIndex;
+            int invalidTags = 0;
+            int successfulTags = 0;
+            int failedTags = 0;
+            int invalidSlots = 0;
+            List<ProcessedTagResult> processedResults =
+                client.ReadProcessedBatch(
+                    tags,
+                    start,
+                    end,
+                    options.SamplingIntervalSeconds);
+            for (tagIndex = 0; tagIndex < processedResults.Count; tagIndex++)
             {
                 ThrowIfStopRequested(stopHandle);
-                if (options.Command == "sync" &&
-                    (state == null || stateStore == null))
-                    throw new Exception("Continuous sync requires a checkpoint state.");
-                if (options.Command == "sync" &&
-                    start > state.CheckpointEnd)
-                    throw new InvalidDataException(
-                        "Historian window starts after CheckpointEnd.");
-
-                HistoryBatch batch = new HistoryBatch();
-                batch.BatchId = batchId;
-                batch.CollectorId = options.CollectorId;
-                batch.Mode = options.Command;
-                batch.Sampling = "InterpolatedValue";
-                batch.SamplingIntervalSeconds = options.SamplingIntervalSeconds;
-                batch.Server = options.Server;
-                batch.RangeStart = start;
-                batch.RangeEnd = end;
-
-                int tagIndex;
-                int invalidTags = 0;
-                int successfulTags = 0;
-                int failedTags = 0;
-                int invalidSlots = 0;
-                List<ProcessedTagResult> processedResults =
-                    client.ReadProcessedBatch(
-                        tags,
-                        start,
-                        end,
-                        options.SamplingIntervalSeconds);
-                for (tagIndex = 0; tagIndex < processedResults.Count; tagIndex++)
+                ProcessedTagResult processedTag = processedResults[tagIndex];
+                if (processedTag.Tag == null || processedTag.Tag.Status != 1)
                 {
-                    ThrowIfStopRequested(stopHandle);
-                    ProcessedTagResult processedTag = processedResults[tagIndex];
-                    if (processedTag.Tag == null || processedTag.Tag.Status != 1)
-                    {
-                        invalidTags++;
-                        continue;
-                    }
-                    if (processedTag.Error != null)
-                    {
-                        failedTags++;
-                        log.Write(
-                            "Processed tag failed tag=" + processedTag.Tag.Name +
-                            " start=" + FormatTime(start) +
-                            " end=" + FormatTime(end) +
-                            " intervalSeconds=" +
-                            options.SamplingIntervalSeconds.ToString(
-                                CultureInfo.InvariantCulture) +
-                            " error=" + processedTag.Error.Message);
-                        continue;
-                    }
-
-                    ProcessedHistoryResult result = processedTag.Result;
-                    if (result == null)
-                    {
-                        failedTags++;
-                        log.Write(
-                            "Processed tag returned no result tag=" +
-                            processedTag.Tag.Name +
-                            " start=" + FormatTime(start) +
-                            " end=" + FormatTime(end) +
-                            " intervalSeconds=" +
-                            options.SamplingIntervalSeconds.ToString(
-                                CultureInfo.InvariantCulture));
-                        continue;
-                    }
-
-                    successfulTags++;
-                    invalidSlots += result.InvalidSlots;
-                    int sampleIndex;
-                    for (sampleIndex = 0; sampleIndex < result.Samples.Count; sampleIndex++)
-                    {
-                        HistorySample sample = result.Samples[sampleIndex];
-                        if (sample.Timestamp < start || sample.Timestamp >= end)
-                            continue;
-                        batch.Samples.Add(sample);
-                    }
-                    if (batch.Samples.Count > options.MaxRows)
-                        throw new BatchLimitException("Batch row limit exceeded.");
+                    invalidTags++;
+                    continue;
                 }
-
-                historianClock.Stop();
-                historianReadMilliseconds = historianClock.ElapsedMilliseconds;
-                HistorianPerformanceMetrics performance = client.LastPerformance;
-                batch.HistorianRpcMilliseconds = performance.RpcMilliseconds;
-                batch.SampleConvertMilliseconds =
-                    performance.SampleConvertMilliseconds;
-                batch.NormalizeMilliseconds = performance.NormalizeMilliseconds;
-                batch.ReturnedSamples = performance.ReturnedSamples;
-                batch.InvalidSamples = performance.InvalidSamples;
-                batch.NormalizeFastPathTags =
-                    performance.NormalizeFastPathTags;
-                batch.NormalizeFallbackTags =
-                    performance.NormalizeFallbackTags;
-
-                if (successfulTags == 0)
-                    throw new Exception("All valid Historian tag reads failed.");
-                if (failedTags > options.MaxFailedTagsPerBatch)
-                    throw new Exception(
-                        "Failed Historian tag count " +
-                        failedTags.ToString(CultureInfo.InvariantCulture) +
-                        " exceeds [Sampling] MaxFailedTagsPerBatch=" +
-                        options.MaxFailedTagsPerBatch.ToString(
+                if (processedTag.Error != null)
+                {
+                    failedTags++;
+                    log.Write(
+                        "Processed tag failed tag=" + processedTag.Tag.Name +
+                        " start=" + FormatTime(start) +
+                        " end=" + FormatTime(end) +
+                        " intervalSeconds=" +
+                        options.SamplingIntervalSeconds.ToString(
                             CultureInfo.InvariantCulture) +
-                        ". The partial batch was rejected.");
-
-                batch.FailedTags = failedTags;
-                batch.InvalidSlots = invalidSlots;
-                log.Write(
-                    "Batch collection completed batch=" + batchId +
-                    " tags=" + tags.Count.ToString(CultureInfo.InvariantCulture) +
-                    " successTags=" +
-                    successfulTags.ToString(CultureInfo.InvariantCulture) +
-                    " failedTags=" +
-                    failedTags.ToString(CultureInfo.InvariantCulture) +
-                    " invalidTags=" +
-                    invalidTags.ToString(CultureInfo.InvariantCulture) +
-                    " rows=" +
-                    batch.Samples.Count.ToString(CultureInfo.InvariantCulture) +
-                    " invalidSlots=" +
-                    invalidSlots.ToString(CultureInfo.InvariantCulture) +
-                    " HistorianReadMs=" +
-                    historianReadMilliseconds.ToString(
-                        CultureInfo.InvariantCulture));
-
-                Stopwatch encodeClock = Stopwatch.StartNew();
-                BatchPayload payload = BatchEncoder.EncodePayload(
-                    batch,
-                    EstimatePayloadCapacity(
-                        batch.Samples.Count,
-                        bytesPerRowEstimate));
-                if (payload.Length > options.MaxBytes)
-                    throw new BatchLimitException("Batch size limit exceeded.");
-                batch.Sha256 = payload.Sha256;
-                if (batch.Samples.Count > 0)
-                {
-                    double currentBytesPerRow =
-                        (double)payload.Length / batch.Samples.Count;
-                    bytesPerRowEstimate =
-                        bytesPerRowEstimate * 0.8 + currentBytesPerRow * 0.2;
+                        " error=" + processedTag.Error.Message);
+                    continue;
                 }
-                encodeClock.Stop();
-                encodeMilliseconds = encodeClock.ElapsedMilliseconds;
 
-                BatchReceipt receipt = sender.SendWithRetry(
-                    batch,
-                    payload,
-                    stopHandle);
-                sendTimings = receipt.Timings;
-                if (!String.Equals(
-                    receipt.BatchId,
-                    batch.BatchId,
-                    StringComparison.Ordinal))
-                    throw new InvalidDataException(
-                        "Receiver ACK batch identity does not match the in-memory batch.");
-                if (!String.Equals(
-                    receipt.CommitLevel,
-                    "database",
-                    StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException(
-                        "Receiver ACK did not prove PostgreSQL database commit.");
+                ProcessedHistoryResult result = processedTag.Result;
+                if (result == null)
+                {
+                    failedTags++;
+                    log.Write(
+                        "Processed tag returned no result tag=" +
+                        processedTag.Tag.Name +
+                        " start=" + FormatTime(start) +
+                        " end=" + FormatTime(end) +
+                        " intervalSeconds=" +
+                        options.SamplingIntervalSeconds.ToString(
+                            CultureInfo.InvariantCulture));
+                    continue;
+                }
 
-                if (options.Command == "sync")
-                    SaveCheckpointWithRetry(
-                        state,
-                        stateStore,
-                        receipt.RangeEnd,
-                        log,
-                        stopHandle);
+                successfulTags++;
+                invalidSlots += result.InvalidSlots;
+                int sampleIndex;
+                for (sampleIndex = 0; sampleIndex < result.Samples.Count; sampleIndex++)
+                {
+                    HistorySample sample = result.Samples[sampleIndex];
+                    if (sample.Timestamp < start || sample.Timestamp >= end)
+                        continue;
+                    batch.Samples.Add(sample);
+                }
+                if (batch.Samples.Count > options.MaxRows)
+                    throw new BatchLimitException("Batch row limit exceeded.");
+            }
 
-                totalClock.Stop();
-                LogBatchMetrics(
-                    options,
-                    state,
-                    log,
-                    batch,
-                    payload.Length,
-                    totalClock,
-                    historianReadMilliseconds,
-                    encodeMilliseconds,
-                    sendTimings);
-                log.Write(
-                    "Batch complete after database ACK batch=" + batchId +
-                    " rows=" +
-                    batch.Samples.Count.ToString(CultureInfo.InvariantCulture));
-                return invalidTags == 0 ? 0 : 5;
-            }
-            catch (SyncStopRequestedException)
+            historianClock.Stop();
+            long historianReadMilliseconds = historianClock.ElapsedMilliseconds;
+            HistorianPerformanceMetrics performance = client.LastPerformance;
+            batch.HistorianRpcMilliseconds = performance.RpcMilliseconds;
+            batch.SampleConvertMilliseconds =
+                performance.SampleConvertMilliseconds;
+            batch.NormalizeMilliseconds = performance.NormalizeMilliseconds;
+            batch.ReturnedSamples = performance.ReturnedSamples;
+            batch.InvalidSamples = performance.InvalidSamples;
+            batch.NormalizeFastPathTags = performance.NormalizeFastPathTags;
+            batch.NormalizeFallbackTags = performance.NormalizeFallbackTags;
+
+            if (successfulTags == 0)
+                throw new Exception("All valid Historian tag reads failed.");
+            if (failedTags > options.MaxFailedTagsPerBatch)
+                throw new Exception(
+                    "Failed Historian tag count " +
+                    failedTags.ToString(CultureInfo.InvariantCulture) +
+                    " exceeds [Sampling] MaxFailedTagsPerBatch=" +
+                    options.MaxFailedTagsPerBatch.ToString(
+                        CultureInfo.InvariantCulture) +
+                    ". The partial batch was rejected.");
+
+            batch.FailedTags = failedTags;
+            batch.InvalidSlots = invalidSlots;
+            log.Write(
+                "Batch prepared=" + batchId +
+                " tags=" + tags.Count.ToString(CultureInfo.InvariantCulture) +
+                " successTags=" +
+                successfulTags.ToString(CultureInfo.InvariantCulture) +
+                " failedTags=" +
+                failedTags.ToString(CultureInfo.InvariantCulture) +
+                " invalidTags=" +
+                invalidTags.ToString(CultureInfo.InvariantCulture) +
+                " rows=" +
+                batch.Samples.Count.ToString(CultureInfo.InvariantCulture) +
+                " invalidSlots=" +
+                invalidSlots.ToString(CultureInfo.InvariantCulture) +
+                " HistorianReadMs=" +
+                historianReadMilliseconds.ToString(
+                    CultureInfo.InvariantCulture));
+
+            Stopwatch encodeClock = Stopwatch.StartNew();
+            BatchPayload payload = BatchEncoder.EncodePayload(
+                batch,
+                EstimatePayloadCapacity(
+                    batch.Samples.Count,
+                    bytesPerRowEstimate));
+            if (payload.Length > options.MaxBytes)
+                throw new BatchLimitException("Batch size limit exceeded.");
+            batch.Sha256 = payload.Sha256;
+            if (batch.Samples.Count > 0)
             {
-                log.Write("Stop requested; current in-memory batch was not checkpointed.");
-                return 0;
+                double currentBytesPerRow =
+                    (double)payload.Length / batch.Samples.Count;
+                bytesPerRowEstimate =
+                    bytesPerRowEstimate * 0.8 + currentBytesPerRow * 0.2;
             }
-            catch (BatchLimitException ex)
-            {
-                log.Write(
-                    "Batch limit batch=" + batchId +
-                    " error=" + ex.Message);
-                return 21;
-            }
-            catch (BatchSendException ex)
-            {
-                sendTimings = ex.Timings;
-                log.Write(
-                    (ex.AuthenticationFailure
-                        ? "Receiver authentication failed"
-                        : "Receiver permanently rejected batch") +
-                    "=" + batchId +
-                    " status=" +
-                    ex.StatusCode.ToString(CultureInfo.InvariantCulture) +
-                    " error=" + ex.Message);
-                return ex.AuthenticationFailure ? 42 : 41;
-            }
-            catch (InvalidDataException ex)
-            {
-                log.Write(
-                    "Permanent batch data/protocol error batch=" +
-                    batchId +
-                    " error=" + ex.Message);
-                return 41;
-            }
-            catch (Exception ex)
-            {
-                log.Write("Batch failed=" + batchId + " error=" + ex.Message);
-                return 20;
-            }
+            encodeClock.Stop();
+
+            PreparedBatch prepared = new PreparedBatch();
+            prepared.Batch = batch;
+            prepared.Payload = payload;
+            prepared.RangeStart = start;
+            prepared.RangeEnd = end;
+            prepared.State = BatchWorkState.Prepared;
+            prepared.ResultCode = invalidTags == 0 ? 0 : 5;
+            prepared.HistorianReadMilliseconds = historianReadMilliseconds;
+            prepared.EncodeMilliseconds = encodeClock.ElapsedMilliseconds;
+            prepared.TotalClock = totalClock;
+            return prepared;
         }
 
-        private static void SaveCheckpointWithRetry(
+        internal static void SaveCheckpointWithRetry(
             SyncState state,
             SyncStateStore stateStore,
             DateTime checkpointEnd,
@@ -1398,7 +1358,7 @@ namespace DeltaVHistoryCLI
             }
         }
 
-        private static void LogBatchMetrics(
+        internal static void LogBatchMetrics(
             SyncOptions options,
             SyncState state,
             SyncLogger log,
@@ -1407,7 +1367,10 @@ namespace DeltaVHistoryCLI
             Stopwatch totalClock,
             long historianReadMilliseconds,
             long encodeMilliseconds,
-            BatchSendTimings sendTimings)
+            BatchSendTimings sendTimings,
+            long sequence,
+            int pipelineDepth,
+            int inFlight)
         {
             long sendMilliseconds = sendTimings == null
                 ? 0
@@ -1449,6 +1412,9 @@ namespace DeltaVHistoryCLI
                 totalClock.ElapsedMilliseconds.ToString(
                     CultureInfo.InvariantCulture) +
                 " Attempts=" + attempts.ToString(CultureInfo.InvariantCulture) +
+                " Sequence=" + sequence.ToString(CultureInfo.InvariantCulture) +
+                " PipelineDepth=" + pipelineDepth.ToString(CultureInfo.InvariantCulture) +
+                " InFlight=" + inFlight.ToString(CultureInfo.InvariantCulture) +
                 " CheckpointEnd=" +
                 (state == null ? "None" : FormatTime(state.CheckpointEnd)) +
                 " SyncLagSeconds=" +
@@ -1532,30 +1498,38 @@ namespace DeltaVHistoryCLI
             SyncLogger log,
             HistorianClient client,
             List<TagResult> tags,
-            BatchSender sender,
-            SyncState state,
-            SyncStateStore stateStore,
+            BatchPipeline pipeline,
             ref int created,
             ref double bytesPerRowEstimate,
             WaitHandle stopHandle)
         {
-            int result = CreateBatch(
-                options,
-                start,
-                end,
-                log,
-                client,
-                tags,
-                sender,
-                state,
-                stateStore,
-                ref bytesPerRowEstimate,
-                stopHandle);
-            if (result != 21)
+            pipeline.WaitForCapacity();
+            PreparedBatch prepared = null;
+            try
             {
-                if (result == 0 || result == 5)
-                    created++;
-                return result;
+                prepared = PrepareBatch(
+                    options,
+                    start,
+                    end,
+                    log,
+                    client,
+                    tags,
+                    ref bytesPerRowEstimate,
+                    stopHandle);
+            }
+            catch (BatchLimitException ex)
+            {
+                log.Write(
+                    "Batch limit range=" + FormatTime(start) +
+                    " .. " + FormatTime(end) +
+                    " error=" + ex.Message);
+            }
+
+            if (prepared != null)
+            {
+                pipeline.Submit(prepared);
+                created++;
+                return prepared.ResultCode;
             }
 
             if (end.Subtract(start).TotalSeconds <= options.MinWindowSeconds)
@@ -1587,9 +1561,7 @@ namespace DeltaVHistoryCLI
                 log,
                 client,
                 tags,
-                sender,
-                state,
-                stateStore,
+                pipeline,
                 ref created,
                 ref bytesPerRowEstimate,
                 stopHandle);
@@ -1602,9 +1574,7 @@ namespace DeltaVHistoryCLI
                 log,
                 client,
                 tags,
-                sender,
-                state,
-                stateStore,
+                pipeline,
                 ref created,
                 ref bytesPerRowEstimate,
                 stopHandle);
@@ -1915,7 +1885,7 @@ namespace DeltaVHistoryCLI
             return TimeSpan.FromMinutes(value);
         }
 
-        private static string FormatTime(DateTime value)
+        internal static string FormatTime(DateTime value)
         {
             return value.ToString(
                 "yyyy-MM-dd HH:mm:ss.fffffff",
