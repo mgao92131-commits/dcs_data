@@ -33,6 +33,15 @@ namespace DeltaVHistoryCLI
                     typeof(BatchSender).GetMethod("SendPending") == null,
                     "pending sender API must be removed");
                 Assert(
+                    typeof(BatchSender).GetProperty("LastTimings") == null,
+                    "BatchSender must not keep global timings");
+                Assert(
+                    HasMethod(typeof(BatchPipeline), "WaitForCapacity") &&
+                    HasMethod(typeof(BatchPipeline), "AdvanceCheckpoint") &&
+                    HasMethod(typeof(BatchPipeline), "WaitForAll") &&
+                    HasMethod(typeof(BatchPipeline), "Stop"),
+                    "two-slot pipeline API must be exposed");
+                Assert(
                     typeof(SyncState).GetField("CheckpointEnd") != null,
                     "single CheckpointEnd state field");
                 Assert(
@@ -47,6 +56,8 @@ namespace DeltaVHistoryCLI
                 RunHistorianCoreSelfTest();
                 RunStateSelfTest();
                 RunBatchBackpressureSelfTest();
+                RunPipelinePermanentSelfTest();
+                RunPipelineStopSelfTest();
                 RunAckLossSelfTest();
                 RunPermanentStatusSelfTest(400, false);
                 RunPermanentStatusSelfTest(401, true);
@@ -341,18 +352,20 @@ namespace DeltaVHistoryCLI
         private static void RunBatchBackpressureSelfTest()
         {
             string root = CreateTempRoot("HistorySyncBackpressureSelfTest");
-            ScriptedReceiver receiver = new ScriptedReceiver(
-                new int[] { 503, 503, 503, 200, 200 },
-                false);
-            receiver.Start();
-            ManualResetEvent pipelineDone = new ManualResetEvent(false);
-            ManualResetEvent releaseAck = receiver.ReleaseResponse;
-            Exception pipelineError = null;
-            int firstResult = -1;
-            int secondResult = -1;
             DateTime firstStart = new DateTime(2026, 8, 29, 10, 0, 0);
             DateTime firstEnd = firstStart.AddMinutes(5);
             DateTime secondEnd = firstEnd.AddMinutes(5);
+            DateTime thirdEnd = secondEnd.AddMinutes(5);
+            PipelineReceiver receiver = new PipelineReceiver(
+                firstStart,
+                firstEnd,
+                secondEnd);
+            receiver.Start();
+            ManualResetEvent pipelineDone = new ManualResetEvent(false);
+            ManualResetEvent pipelineStop = new ManualResetEvent(false);
+            Exception pipelineError = null;
+            DateTime checkpoint = firstStart;
+            int historianReads = -1;
             try
             {
                 IniConfig config = LoadReceiverConfig(
@@ -365,7 +378,7 @@ namespace DeltaVHistoryCLI
                     root,
                     "sync",
                     firstStart,
-                    secondEnd);
+                    thirdEnd);
                 SyncState state = new SyncState();
                 state.CheckpointEnd = firstStart;
                 SyncStateStore stateStore = new SyncStateStore(
@@ -375,6 +388,7 @@ namespace DeltaVHistoryCLI
                     new FakeHistorianReadInterface();
                 FakeHistorianConnection fakeConnection =
                     new FakeHistorianConnection();
+                fakeConnection.PointsPerRead = 1;
                 HistorianClient fakeClient = CreateFakeClient(
                     fakeRead,
                     fakeConnection);
@@ -392,47 +406,44 @@ namespace DeltaVHistoryCLI
                         using (SyncLogger log = new SyncLogger(logs))
                         {
                             BatchSender sender = new BatchSender(config, log);
-                            int firstCreated = 0;
                             double estimate = 256.0;
-                            object[] firstArgs = new object[]
-                            {
+                            using (BatchPipeline batchPipeline = new BatchPipeline(
                                 options,
-                                firstStart,
-                                firstEnd,
-                                log,
-                                fakeClient,
-                                tags,
                                 sender,
                                 state,
                                 stateStore,
-                                firstCreated,
-                                estimate,
-                                null
-                            };
-                            firstResult = (int)InvokePrivate(
-                                typeof(SyncProgram),
-                                "CollectWindow",
-                                firstArgs);
-                            int secondCreated = 0;
-                            object[] secondArgs = new object[]
-                            {
-                                options,
-                                firstEnd,
-                                secondEnd,
                                 log,
-                                fakeClient,
-                                tags,
-                                sender,
-                                state,
-                                stateStore,
-                                secondCreated,
-                                firstArgs[10],
-                                null
-                            };
-                            secondResult = (int)InvokePrivate(
-                                typeof(SyncProgram),
-                                "CollectWindow",
-                                secondArgs);
+                                pipelineStop))
+                            {
+                                PrepareAndSubmit(
+                                    options,
+                                    firstStart,
+                                    firstEnd,
+                                    log,
+                                    fakeClient,
+                                    tags,
+                                    batchPipeline,
+                                    ref estimate);
+                                PrepareAndSubmit(
+                                    options,
+                                    firstEnd,
+                                    secondEnd,
+                                    log,
+                                    fakeClient,
+                                    tags,
+                                    batchPipeline,
+                                    ref estimate);
+                                PrepareAndSubmit(
+                                    options,
+                                    secondEnd,
+                                    thirdEnd,
+                                    log,
+                                    fakeClient,
+                                    tags,
+                                    batchPipeline,
+                                    ref estimate);
+                                batchPipeline.WaitForAll();
+                            }
                         }
                     }
                     catch (Exception ex)
@@ -449,46 +460,308 @@ namespace DeltaVHistoryCLI
                 pipeline.Start();
 
                 Assert(
+                    receiver.TwoRequestsObserved.WaitOne(10000, false),
+                    "pipeline fills both in-memory slots");
+                Assert(
                     receiver.ThirdTransientObserved.WaitOne(10000, false),
                     "Batch 1 reaches repeated transient failures");
                 Assert(
-                    fakeConnection.ReadCount == 1 &&
-                    state.CheckpointEnd == firstStart,
-                    "no next Historian read or checkpoint before Batch 1 ACK");
-                releaseAck.Set();
-                Assert(
-                    pipelineDone.WaitOne(15000, false),
-                    "strict backpressure pipeline completes");
-                Assert(
-                    pipelineError == null,
-                    "strict backpressure pipeline has no error");
-                Assert(
-                    firstResult == 0 && secondResult == 0,
-                    "ACKed batches return success");
+                    receiver.SecondAcked.WaitOne(10000, false),
+                    "Batch 2 can ACK before Batch 1");
                 Assert(
                     fakeConnection.ReadCount == 2 &&
-                    state.CheckpointEnd == secondEnd,
-                    "Batch 2 starts only after Batch 1 checkpoint");
+                    state.CheckpointEnd == firstStart,
+                    "depth two blocks the third Historian read and ordered checkpoint");
                 Assert(
-                    receiver.Requests == 5,
-                    "three transient retries then two acknowledged batches");
+                    receiver.ThirdRequestObserved.WaitOne(15000, false),
+                    "Batch 1 ACK releases the next Historian window");
                 Assert(
-                    ByteArraysEqual(receiver.Bodies[0], receiver.Bodies[1]) &&
-                    ByteArraysEqual(receiver.Bodies[0], receiver.Bodies[2]) &&
-                    ByteArraysEqual(receiver.Bodies[0], receiver.Bodies[3]),
-                    "Batch 1 retries use identical payload bytes");
+                    pipelineDone.WaitOne(20000, false),
+                    "two-slot ACK pipeline completes");
                 Assert(
-                    StringEqualsAll(receiver.BatchIds, 0, 3) &&
-                    StringEqualsAll(receiver.Hashes, 0, 3),
-                    "Batch 1 retries use identical BatchId and SHA");
+                    pipelineError == null,
+                    "two-slot ACK pipeline has no error");
+                Assert(
+                    receiver.FirstAckAt > DateTime.MinValue &&
+                    receiver.SecondAckAt > DateTime.MinValue &&
+                    receiver.SecondAckAt < receiver.FirstAckAt,
+                    "out-of-order ACK does not move checkpoint past Batch 1");
+                historianReads = fakeConnection.ReadCount;
+                checkpoint = state.CheckpointEnd;
+                Assert(
+                    historianReads == 3 && checkpoint == thirdEnd,
+                    "all three batches are read and checkpointed in order");
+                Assert(
+                    receiver.CountForRange(firstStart) == 4 &&
+                    receiver.CountForRange(firstEnd) == 1 &&
+                    receiver.CountForRange(secondEnd) == 1,
+                    "pipeline sends three batches with four retries for Batch 1");
+                Assert(
+                    receiver.RetriesAreIdentical(firstStart),
+                    "Batch 1 retries use identical BatchId SHA and payload");
                 Assert(
                     !Directory.Exists(Path.Combine(root, "spool")),
-                    "backpressure run creates no spool directory");
+                    "pipeline run creates no spool directory");
             }
             finally
             {
-                releaseAck.Set();
+                pipelineStop.Set();
+                pipelineDone.WaitOne(5000, false);
                 receiver.StopAndJoin();
+                pipelineStop.Close();
+                DeleteTempRoot(root);
+            }
+        }
+
+        private static void RunPipelinePermanentSelfTest()
+        {
+            string root = CreateTempRoot("HistorySyncPipelinePermanentSelfTest");
+            DateTime firstStart = new DateTime(2026, 8, 29, 14, 0, 0);
+            DateTime firstEnd = firstStart.AddMinutes(5);
+            DateTime secondEnd = firstEnd.AddMinutes(5);
+            DateTime thirdEnd = secondEnd.AddMinutes(5);
+            PipelineReceiver receiver = new PipelineReceiver(
+                firstStart,
+                firstEnd,
+                secondEnd,
+                true);
+            receiver.Start();
+            ManualResetEvent pipelineDone = new ManualResetEvent(false);
+            ManualResetEvent pipelineStop = new ManualResetEvent(false);
+            Exception pipelineError = null;
+            try
+            {
+                IniConfig config = LoadReceiverConfig(root, receiver.Port, 1);
+                string logs = Path.Combine(root, "logs");
+                Directory.CreateDirectory(logs);
+                SyncOptions options = BuildTestOptions(
+                    root,
+                    "sync",
+                    firstStart,
+                    thirdEnd);
+                SyncState state = new SyncState();
+                state.CheckpointEnd = firstStart;
+                SyncStateStore stateStore = new SyncStateStore(options.StatePath);
+                stateStore.Save(state);
+                FakeHistorianReadInterface fakeRead =
+                    new FakeHistorianReadInterface();
+                FakeHistorianConnection fakeConnection =
+                    new FakeHistorianConnection();
+                HistorianClient fakeClient = CreateFakeClient(
+                    fakeRead,
+                    fakeConnection);
+                List<TagResult> tags = new List<TagResult>();
+                tags.Add(new TagResult {
+                    Name = "TAG/PERMANENT",
+                    Handle = 101,
+                    Status = 1
+                });
+
+                Thread producer = new Thread(delegate()
+                {
+                    try
+                    {
+                        using (SyncLogger log = new SyncLogger(logs))
+                        {
+                            BatchSender sender = new BatchSender(config, log);
+                            double estimate = 256.0;
+                            using (BatchPipeline pipeline = new BatchPipeline(
+                                options,
+                                sender,
+                                state,
+                                stateStore,
+                                log,
+                                pipelineStop))
+                            {
+                                PrepareAndSubmit(
+                                    options,
+                                    firstStart,
+                                    firstEnd,
+                                    log,
+                                    fakeClient,
+                                    tags,
+                                    pipeline,
+                                    ref estimate);
+                                PrepareAndSubmit(
+                                    options,
+                                    firstEnd,
+                                    secondEnd,
+                                    log,
+                                    fakeClient,
+                                    tags,
+                                    pipeline,
+                                    ref estimate);
+                                PrepareAndSubmit(
+                                    options,
+                                    secondEnd,
+                                    thirdEnd,
+                                    log,
+                                    fakeClient,
+                                    tags,
+                                    pipeline,
+                                    ref estimate);
+                                pipeline.WaitForAll();
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        pipelineError = ex;
+                    }
+                    finally
+                    {
+                        fakeClient.Dispose();
+                        pipelineDone.Set();
+                    }
+                });
+                producer.IsBackground = true;
+                producer.Start();
+                Assert(
+                    pipelineDone.WaitOne(10000, false),
+                    "permanent pipeline error stops the producer");
+                Assert(
+                    pipelineError is BatchSendException &&
+                    ((BatchSendException)pipelineError).StatusCode == 400,
+                    "pipeline propagates permanent Receiver error");
+                Assert(
+                    fakeConnection.ReadCount <= 2 &&
+                    state.CheckpointEnd == firstStart &&
+                    receiver.CountForRange(secondEnd) == 0,
+                    "permanent error prevents Batch 3 and checkpoint bypass");
+            }
+            finally
+            {
+                pipelineStop.Set();
+                pipelineDone.WaitOne(5000, false);
+                receiver.StopAndJoin();
+                pipelineStop.Close();
+                DeleteTempRoot(root);
+            }
+        }
+
+        private static void RunPipelineStopSelfTest()
+        {
+            string root = CreateTempRoot("HistorySyncPipelineStopSelfTest");
+            DateTime firstStart = new DateTime(2026, 8, 29, 15, 0, 0);
+            DateTime firstEnd = firstStart.AddMinutes(5);
+            DateTime secondEnd = firstEnd.AddMinutes(5);
+            DateTime thirdEnd = secondEnd.AddMinutes(5);
+            PipelineReceiver receiver = new PipelineReceiver(
+                firstStart,
+                firstEnd,
+                secondEnd);
+            receiver.Start();
+            ManualResetEvent pipelineDone = new ManualResetEvent(false);
+            ManualResetEvent pipelineStop = new ManualResetEvent(false);
+            Exception pipelineError = null;
+            try
+            {
+                IniConfig config = LoadReceiverConfig(root, receiver.Port, 30);
+                string logs = Path.Combine(root, "logs");
+                Directory.CreateDirectory(logs);
+                SyncOptions options = BuildTestOptions(
+                    root,
+                    "sync",
+                    firstStart,
+                    thirdEnd);
+                SyncState state = new SyncState();
+                state.CheckpointEnd = firstStart;
+                SyncStateStore stateStore = new SyncStateStore(options.StatePath);
+                FakeHistorianReadInterface fakeRead =
+                    new FakeHistorianReadInterface();
+                FakeHistorianConnection fakeConnection =
+                    new FakeHistorianConnection();
+                HistorianClient fakeClient = CreateFakeClient(
+                    fakeRead,
+                    fakeConnection);
+                List<TagResult> tags = new List<TagResult>();
+                tags.Add(new TagResult {
+                    Name = "TAG/STOP",
+                    Handle = 101,
+                    Status = 1
+                });
+
+                Thread producer = new Thread(delegate()
+                {
+                    try
+                    {
+                        using (SyncLogger log = new SyncLogger(logs))
+                        {
+                            BatchSender sender = new BatchSender(config, log);
+                            double estimate = 256.0;
+                            using (BatchPipeline pipeline = new BatchPipeline(
+                                options,
+                                sender,
+                                state,
+                                stateStore,
+                                log,
+                                pipelineStop))
+                            {
+                                PrepareAndSubmit(
+                                    options,
+                                    firstStart,
+                                    firstEnd,
+                                    log,
+                                    fakeClient,
+                                    tags,
+                                    pipeline,
+                                    ref estimate);
+                                PrepareAndSubmit(
+                                    options,
+                                    firstEnd,
+                                    secondEnd,
+                                    log,
+                                    fakeClient,
+                                    tags,
+                                    pipeline,
+                                    ref estimate);
+                                PrepareAndSubmit(
+                                    options,
+                                    secondEnd,
+                                    thirdEnd,
+                                    log,
+                                    fakeClient,
+                                    tags,
+                                    pipeline,
+                                    ref estimate);
+                                pipeline.WaitForAll();
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        pipelineError = ex;
+                    }
+                    finally
+                    {
+                        fakeClient.Dispose();
+                        pipelineDone.Set();
+                    }
+                });
+                producer.IsBackground = true;
+                producer.Start();
+                Assert(
+                    receiver.TwoRequestsObserved.WaitOne(10000, false),
+                    "stop test fills both pipeline slots");
+                pipelineStop.Set();
+                Assert(
+                    pipelineDone.WaitOne(5000, false),
+                    "stop interrupts all pipeline workers");
+                Assert(
+                    pipelineError is SyncStopRequestedException,
+                    "pipeline returns a stop-requested result");
+                Assert(
+                    fakeConnection.ReadCount == 2 &&
+                    state.CheckpointEnd == firstStart &&
+                    receiver.CountForRange(secondEnd) == 0,
+                    "stop does not read or checkpoint a third batch");
+            }
+            finally
+            {
+                pipelineStop.Set();
+                pipelineDone.WaitOne(5000, false);
+                receiver.StopAndJoin();
+                pipelineStop.Close();
                 DeleteTempRoot(root);
             }
         }
@@ -668,6 +941,37 @@ namespace DeltaVHistoryCLI
             options.StatePath = Path.Combine(root, "state.ini");
             options.LogsDirectory = Path.Combine(root, "logs");
             return options;
+        }
+
+        private static PreparedBatch PrepareAndSubmit(
+            SyncOptions options,
+            DateTime start,
+            DateTime end,
+            SyncLogger log,
+            HistorianClient client,
+            List<TagResult> tags,
+            BatchPipeline pipeline,
+            ref double bytesPerRowEstimate)
+        {
+            pipeline.WaitForCapacity();
+            object[] args = new object[]
+            {
+                options,
+                start,
+                end,
+                log,
+                client,
+                tags,
+                bytesPerRowEstimate,
+                null
+            };
+            PreparedBatch prepared = (PreparedBatch)InvokePrivate(
+                typeof(SyncProgram),
+                "PrepareBatch",
+                args);
+            bytesPerRowEstimate = (double)args[6];
+            pipeline.Submit(prepared);
+            return prepared;
         }
 
         private static IniConfig LoadReceiverConfig(
@@ -952,6 +1256,355 @@ namespace DeltaVHistoryCLI
         public int archiveStatus;
     }
 
+    class PipelineReceiver
+    {
+        private readonly string _firstRange;
+        private readonly string _secondRange;
+        private readonly string _thirdRange;
+        private readonly bool _firstPermanent;
+        private readonly TcpListener _listener;
+        private readonly object _sync = new object();
+        private readonly Dictionary<string, int> _attempts =
+            new Dictionary<string, int>(StringComparer.Ordinal);
+        private readonly List<Thread> _handlers = new List<Thread>();
+        private Thread _acceptThread;
+        private bool _stopping;
+        private Exception _error;
+        private DateTime _firstAckAt;
+        private DateTime _secondAckAt;
+
+        public readonly ManualResetEvent TwoRequestsObserved =
+            new ManualResetEvent(false);
+        public readonly ManualResetEvent ThirdTransientObserved =
+            new ManualResetEvent(false);
+        public readonly ManualResetEvent SecondAcked =
+            new ManualResetEvent(false);
+        public readonly ManualResetEvent ThirdRequestObserved =
+            new ManualResetEvent(false);
+        public readonly List<byte[]> Bodies = new List<byte[]>();
+        public readonly List<string> BatchIds = new List<string>();
+        public readonly List<string> Hashes = new List<string>();
+        public readonly List<string> RangeStarts = new List<string>();
+        public int Requests;
+
+        public PipelineReceiver(
+            DateTime firstStart,
+            DateTime secondStart,
+            DateTime thirdStart)
+            : this(firstStart, secondStart, thirdStart, false)
+        {
+        }
+
+        public PipelineReceiver(
+            DateTime firstStart,
+            DateTime secondStart,
+            DateTime thirdStart,
+            bool firstPermanent)
+        {
+            _firstRange = SyncProgram.FormatTime(firstStart);
+            _secondRange = SyncProgram.FormatTime(secondStart);
+            _thirdRange = SyncProgram.FormatTime(thirdStart);
+            _firstPermanent = firstPermanent;
+            _listener = new TcpListener(IPAddress.Loopback, 0);
+            _listener.Start();
+        }
+
+        public int Port
+        {
+            get { return ((IPEndPoint)_listener.LocalEndpoint).Port; }
+        }
+
+        public DateTime FirstAckAt
+        {
+            get { lock (_sync) return _firstAckAt; }
+        }
+
+        public DateTime SecondAckAt
+        {
+            get { lock (_sync) return _secondAckAt; }
+        }
+
+        public void Start()
+        {
+            _acceptThread = new Thread(AcceptLoop);
+            _acceptThread.IsBackground = true;
+            _acceptThread.Start();
+        }
+
+        public int CountForRange(DateTime rangeStart)
+        {
+            string expected = SyncProgram.FormatTime(rangeStart);
+            lock (_sync)
+            {
+                int count = 0;
+                int i;
+                for (i = 0; i < RangeStarts.Count; i++)
+                    if (RangeStarts[i] == expected)
+                        count++;
+                return count;
+            }
+        }
+
+        public bool RetriesAreIdentical(DateTime rangeStart)
+        {
+            string expected = SyncProgram.FormatTime(rangeStart);
+            lock (_sync)
+            {
+                int first = -1;
+                int i;
+                for (i = 0; i < RangeStarts.Count; i++)
+                {
+                    if (RangeStarts[i] != expected)
+                        continue;
+                    if (first < 0)
+                    {
+                        first = i;
+                        continue;
+                    }
+                    if (BatchIds[i] != BatchIds[first] ||
+                        Hashes[i] != Hashes[first] ||
+                        !ByteArraysEqual(Bodies[i], Bodies[first]))
+                        return false;
+                }
+                return first >= 0;
+            }
+        }
+
+        public void StopAndJoin()
+        {
+            lock (_sync)
+                _stopping = true;
+            try { _listener.Stop(); }
+            catch { }
+            if (_acceptThread != null && !_acceptThread.Join(10000))
+                throw new Exception("Pipeline Receiver accept loop did not stop.");
+
+            Thread[] handlers;
+            lock (_sync)
+                handlers = _handlers.ToArray();
+            int i;
+            for (i = 0; i < handlers.Length; i++)
+                if (handlers[i] != null && !handlers[i].Join(10000))
+                    throw new Exception("Pipeline Receiver request handler did not stop.");
+            if (_error != null)
+                throw new Exception("Pipeline Receiver failed.", _error);
+        }
+
+        private void AcceptLoop()
+        {
+            try
+            {
+                while (true)
+                {
+                    TcpClient client;
+                    try
+                    {
+                        client = _listener.AcceptTcpClient();
+                    }
+                    catch (Exception ex)
+                    {
+                        if (IsStopping())
+                            return;
+                        throw ex;
+                    }
+                    Thread handler = new Thread(delegate() { Handle(client); });
+                    handler.IsBackground = true;
+                    lock (_sync)
+                        _handlers.Add(handler);
+                    handler.Start();
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!IsStopping())
+                    _error = ex;
+            }
+        }
+
+        private void Handle(TcpClient client)
+        {
+            try
+            {
+                using (client)
+                using (NetworkStream stream = client.GetStream())
+                {
+                    client.ReceiveTimeout = 10000;
+                    client.SendTimeout = 10000;
+                    string headers = ReadHeaders(stream);
+                    if (headers == null)
+                        throw new Exception("request headers ended early");
+                    int contentLength = Int32.Parse(
+                        HeaderValue(headers, "Content-Length"),
+                        CultureInfo.InvariantCulture);
+                    byte[] body = ReadBody(stream, contentLength);
+                    string batchId = HeaderValue(headers, "X-Batch-Id");
+                    string hash = HeaderValue(headers, "X-Content-SHA256");
+                    string rangeStart = HeaderValue(headers, "X-Range-Start");
+                    int attempt = RecordRequest(
+                        body,
+                        batchId,
+                        hash,
+                        rangeStart);
+                    int statusCode = StatusFor(rangeStart, attempt);
+                    if (rangeStart == _firstRange && attempt == 3)
+                        ThirdTransientObserved.Set();
+                    if (rangeStart == _secondRange && statusCode == 200)
+                    {
+                        lock (_sync)
+                            _secondAckAt = DateTime.Now;
+                        SecondAcked.Set();
+                    }
+                    if (rangeStart == _firstRange && statusCode == 200)
+                    {
+                        lock (_sync)
+                            _firstAckAt = DateTime.Now;
+                    }
+                    if (rangeStart == _thirdRange)
+                        ThirdRequestObserved.Set();
+
+                    string responseText;
+                    if (statusCode == 200)
+                    {
+                        responseText =
+                            "{\"ok\":true,\"committed\":true," +
+                            "\"commit_level\":\"database\"," +
+                            "\"batch_id\":\"" + batchId +
+                            "\",\"sha256\":\"" + hash +
+                            "\",\"received_rows\":" +
+                            HeaderValue(headers, "X-Row-Count") + "}";
+                    }
+                    else
+                        responseText = "temporary";
+                    byte[] responseBody = Encoding.UTF8.GetBytes(responseText);
+                    string responseHeaders =
+                        "HTTP/1.1 " +
+                        statusCode.ToString(CultureInfo.InvariantCulture) +
+                        " " + (statusCode == 200 ? "OK" : "Error") + "\r\n" +
+                        "Content-Type: application/json\r\n" +
+                        "Content-Length: " +
+                        responseBody.Length.ToString(CultureInfo.InvariantCulture) +
+                        "\r\nConnection: close\r\n\r\n";
+                    byte[] headerBytes = Encoding.ASCII.GetBytes(responseHeaders);
+                    stream.Write(headerBytes, 0, headerBytes.Length);
+                    stream.Write(responseBody, 0, responseBody.Length);
+                    stream.Flush();
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!IsStopping())
+                    _error = ex;
+            }
+        }
+
+        private int RecordRequest(
+            byte[] body,
+            string batchId,
+            string hash,
+            string rangeStart)
+        {
+            lock (_sync)
+            {
+                int attempt;
+                if (!_attempts.TryGetValue(rangeStart, out attempt))
+                    attempt = 0;
+                attempt++;
+                _attempts[rangeStart] = attempt;
+                Requests++;
+                Bodies.Add(body);
+                BatchIds.Add(batchId);
+                Hashes.Add(hash);
+                RangeStarts.Add(rangeStart);
+                if (Requests >= 2)
+                    TwoRequestsObserved.Set();
+                return attempt;
+            }
+        }
+
+        private int StatusFor(string rangeStart, int attempt)
+        {
+            if (rangeStart == _firstRange)
+            {
+                if (_firstPermanent)
+                    return 400;
+                return attempt <= 3 ? 503 : 200;
+            }
+            return 200;
+        }
+
+        private bool IsStopping()
+        {
+            lock (_sync)
+                return _stopping;
+        }
+
+        private static string ReadHeaders(Stream stream)
+        {
+            StringBuilder text = new StringBuilder();
+            while (text.Length < 65536)
+            {
+                int value = stream.ReadByte();
+                if (value < 0)
+                    return null;
+                text.Append((char)value);
+                int length = text.Length;
+                if (length >= 4 &&
+                    text[length - 4] == '\r' &&
+                    text[length - 3] == '\n' &&
+                    text[length - 2] == '\r' &&
+                    text[length - 1] == '\n')
+                    return text.ToString();
+            }
+            throw new Exception("HTTP request headers are too large.");
+        }
+
+        private static byte[] ReadBody(Stream stream, int length)
+        {
+            byte[] body = new byte[length];
+            int offset = 0;
+            while (offset < length)
+            {
+                int read = stream.Read(body, offset, length - offset);
+                if (read <= 0)
+                    throw new Exception("HTTP request body ended early.");
+                offset += read;
+            }
+            return body;
+        }
+
+        private static bool ByteArraysEqual(byte[] left, byte[] right)
+        {
+            if (left == null || right == null || left.Length != right.Length)
+                return false;
+            int i;
+            for (i = 0; i < left.Length; i++)
+                if (left[i] != right[i])
+                    return false;
+            return true;
+        }
+
+        private static string HeaderValue(string headers, string name)
+        {
+            string[] lines = headers.Split(
+                new string[] { "\r\n" },
+                StringSplitOptions.None);
+            int i;
+            for (i = 1; i < lines.Length; i++)
+            {
+                int separator = lines[i].IndexOf(':');
+                if (separator <= 0)
+                    continue;
+                string key = lines[i].Substring(0, separator).Trim();
+                if (String.Equals(
+                    key,
+                    name,
+                    StringComparison.OrdinalIgnoreCase))
+                    return lines[i].Substring(separator + 1).Trim();
+            }
+            throw new Exception("Missing HTTP header: " + name);
+        }
+    }
+
     class ScriptedReceiver
     {
         private readonly int[] _statuses;
@@ -959,6 +1612,7 @@ namespace DeltaVHistoryCLI
         private readonly TcpListener _listener;
         private Thread _thread;
         private readonly object _sync = new object();
+        private bool _stopping;
 
         public readonly ManualResetEvent ThirdTransientObserved =
             new ManualResetEvent(false);
@@ -994,6 +1648,8 @@ namespace DeltaVHistoryCLI
 
         public void StopAndJoin()
         {
+            lock (_sync)
+                _stopping = true;
             ReleaseResponse.Set();
             try { _listener.Stop(); }
             catch { }
@@ -1091,7 +1747,11 @@ namespace DeltaVHistoryCLI
             }
             catch (Exception ex)
             {
-                Error = ex;
+                lock (_sync)
+                {
+                    if (!_stopping)
+                        Error = ex;
+                }
             }
         }
 
