@@ -209,7 +209,7 @@ namespace DeltaVHistoryCLI
                             _stateStore,
                             next.RangeEnd,
                             _log,
-                            null);
+                            _externalStop);
                     }
                     catch (Exception ex)
                     {

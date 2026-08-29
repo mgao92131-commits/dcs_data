@@ -55,6 +55,7 @@ namespace DeltaVHistoryCLI
                 RunPureFunctionSelfTest();
                 RunHistorianCoreSelfTest();
                 RunStateSelfTest();
+                RunCheckpointRetryStopSelfTest();
                 RunBatchBackpressureSelfTest();
                 RunPipelinePermanentSelfTest();
                 RunPipelineStopSelfTest();
@@ -346,6 +347,70 @@ namespace DeltaVHistoryCLI
             finally
             {
                 DeleteTempRoot(root);
+            }
+        }
+
+        private static void RunCheckpointRetryStopSelfTest()
+        {
+            string root = CreateTempRoot("HistorySyncCheckpointRetryStopSelfTest");
+            ManualResetEvent stop = new ManualResetEvent(false);
+            ManualResetEvent done = new ManualResetEvent(false);
+            Exception saveError = null;
+            DateTime before = new DateTime(2026, 8, 29, 8, 0, 0);
+            try
+            {
+                string statePath = Path.Combine(root, "state.ini");
+                SyncState state = new SyncState();
+                state.CheckpointEnd = before;
+                SyncStateStore stateStore = new SyncStateStore(statePath);
+                stateStore.Save(state);
+
+                File.Delete(statePath);
+                Directory.CreateDirectory(statePath);
+                using (SyncLogger log =
+                    new SyncLogger(Path.Combine(root, "logs")))
+                {
+                    Thread worker = new Thread(delegate()
+                    {
+                        try
+                        {
+                            SyncProgram.SaveCheckpointWithRetry(
+                                state,
+                                stateStore,
+                                before.AddMinutes(5),
+                                log,
+                                stop);
+                        }
+                        catch (Exception ex)
+                        {
+                            saveError = ex;
+                        }
+                        finally
+                        {
+                            done.Set();
+                        }
+                    });
+                    worker.IsBackground = true;
+                    worker.Start();
+                    Thread.Sleep(250);
+                    stop.Set();
+                    Assert(
+                        done.WaitOne(2000, false),
+                        "checkpoint retry stops after the stop event");
+                }
+                Assert(
+                    saveError is SyncStopRequestedException,
+                    "checkpoint save retry propagates stop");
+                Assert(
+                    state.CheckpointEnd == before,
+                    "failed checkpoint retry leaves the durable state unchanged");
+            }
+            finally
+            {
+                stop.Set();
+                DeleteTempRoot(root);
+                stop.Close();
+                done.Close();
             }
         }
 
