@@ -22,16 +22,17 @@ import (
 )
 
 type batchImporter struct {
-	pool              *pgxpool.Pool
-	inbox             string
-	archive           string
-	rejected          string
-	interval          time.Duration
-	importTimeout     time.Duration
-	importBatchSize   int
-	maxBatchesPerPass int
-	timezone          *time.Location
-	logger            *log.Logger
+	pool                    *pgxpool.Pool
+	inbox                   string
+	archive                 string
+	rejected                string
+	interval                time.Duration
+	importTimeout           time.Duration
+	importBatchSize         int
+	maxBatchesPerPass       int
+	timezone                *time.Location
+	logger                  *log.Logger
+	importPreparedBatchFunc func(context.Context, importBatch) (importBatch, error)
 }
 
 var errBatchConflict = errors.New("batch_id already exists with different content")
@@ -270,7 +271,7 @@ func (i *batchImporter) importOnce(ctx context.Context) (int, int, error) {
 		}
 		totalMs := durationMilliseconds(time.Since(started))
 		i.logger.Printf(
-			"imported batch=%s rows=%d ReceiveMs=0 ValidateMs=0 ParseMs=%d CopyMs=%d UpsertMs=%d CommitMs=%d TotalMs=%d elapsed=%dms",
+			"imported batch=%s rows=%d ReceiveMs=0 ValidateMs=0 ParseMs=%d CopyMs=%d UpsertMs=%d CommitMs=%d CommitQueueWaitMs=0 ArchiveMs=0 TotalMs=%d elapsed=%dms",
 			batch.BatchID, batch.Rows, parseMs, copyMs, upsertMs, commitMs, totalMs, totalMs)
 	}
 	return imported, failed, nil
@@ -287,6 +288,9 @@ func (i *batchImporter) importDirectory(ctx context.Context, directory string) (
 func (i *batchImporter) importPreparedBatch(ctx context.Context, batch importBatch) (importBatch, error) {
 	if batch.Timings == nil {
 		batch.Timings = &importTimings{}
+	}
+	if i.importPreparedBatchFunc != nil {
+		return i.importPreparedBatchFunc(ctx, batch)
 	}
 	batchCtx, cancel := context.WithTimeout(ctx, i.importTimeout)
 	err := i.importBatch(batchCtx, &batch)

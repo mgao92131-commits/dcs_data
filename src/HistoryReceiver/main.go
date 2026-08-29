@@ -58,6 +58,10 @@ type receiverServer struct {
 	dbPool   *pgxpool.Pool
 	importer *batchImporter
 	commitMu sync.Mutex
+
+	// beforeSynchronousCommit is nil in production. Tests use it to verify that
+	// receiving and parsing the next request can proceed while a commit waits.
+	beforeSynchronousCommit func(batchHeaders)
 }
 
 type batchHeaders struct {
@@ -316,7 +320,9 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 			staged.BodyBytes,
 			staged.Receive,
 			0,
+			0,
 			staged.timings(),
+			0,
 			time.Since(started))
 		if errors.Is(err, errBodyTooLarge) {
 			writeError(w, http.StatusRequestEntityTooLarge, err.Error())
@@ -344,7 +350,7 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 	actualHash := staged.ActualHash
 	bodyBytes := staged.BodyBytes
 	if !strings.EqualFold(actualHash, headers.SHA256) {
-		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, staged.timings(), time.Since(started))
+		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, 0, staged.timings(), 0, time.Since(started))
 		s.reject(tempDir, headers.BatchID, "sha256")
 		keepTemp = true
 		writeError(w, http.StatusBadRequest, "SHA-256 mismatch")
@@ -353,7 +359,7 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 
 	rows := len(staged.Rows)
 	if rows != headers.Rows {
-		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, staged.timings(), time.Since(started))
+		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, 0, staged.timings(), 0, time.Since(started))
 		s.reject(tempDir, headers.BatchID, "rows")
 		keepTemp = true
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("row count mismatch: expected %d, got %d", headers.Rows, rows))
@@ -365,14 +371,14 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 		headers,
 		bodyBytes,
 		s.config.StagingDurability); err != nil {
-		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, staged.timings(), time.Since(started))
+		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, 0, staged.timings(), 0, time.Since(started))
 		writeError(w, http.StatusInternalServerError, "cannot write batch metadata")
 		return
 	}
 
 	if s.config.SynchronousCommit {
 		if s.importer == nil {
-			s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, staged.timings(), time.Since(started))
+			s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, 0, staged.timings(), 0, time.Since(started))
 			writeError(w, http.StatusServiceUnavailable, "database importer is unavailable")
 			return
 		}
@@ -384,9 +390,17 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 			Data:        staged.Rows,
 			Timings:     staged.timings(),
 		}
+		if s.beforeSynchronousCommit != nil {
+			s.beforeSynchronousCommit(headers)
+		}
+		commitQueued := time.Now()
 		s.commitMu.Lock()
+		commitQueueWait := time.Since(commitQueued)
 		batch, importErr := s.importer.importPreparedBatch(r.Context(), batch)
+		s.commitMu.Unlock()
+		archiveElapsed := time.Duration(0)
 		if importErr == nil && !batch.AlreadyCommitted {
+			archiveStarted := time.Now()
 			if archiveErr := s.importer.moveToArchive(tempDir, headers.BatchID); archiveErr != nil {
 				s.logger.Printf(
 					"WARNING: PostgreSQL committed batch=%s but archive move failed: %v",
@@ -403,14 +417,14 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 						headers.BatchID)
 				}
 			}
+			archiveElapsed = time.Since(archiveStarted)
 		} else if importErr == nil && batch.AlreadyCommitted {
 			s.logger.Printf(
 				"idempotent database commit observed while importing batch=%s; archive move skipped",
 				headers.BatchID)
 		}
-		s.commitMu.Unlock()
 		if importErr != nil {
-			s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, batch.Timings, time.Since(started))
+			s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, commitQueueWait, batch.Timings, archiveElapsed, time.Since(started))
 			s.logger.Printf("synchronous import failed batch=%s error=%v", headers.BatchID, importErr)
 			if errors.Is(importErr, errInvalidBatch) {
 				s.reject(tempDir, headers.BatchID, "invalid")
@@ -428,7 +442,7 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 		if !batch.AlreadyCommitted {
 			keepTemp = true
 		}
-		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, batch.Timings, time.Since(started))
+		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, commitQueueWait, batch.Timings, archiveElapsed, time.Since(started))
 		s.logger.Printf(
 			"committed PostgreSQL batch=%s collector=%s rows=%d bytes=%d elapsed=%s",
 			batch.BatchID, headers.CollectorID, rows, bodyBytes,
@@ -439,12 +453,12 @@ func (s *receiverServer) handleBatch(w http.ResponseWriter, r *http.Request) {
 
 	ack, err := s.commit(tempDir, headers)
 	if err != nil {
-		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, staged.timings(), time.Since(started))
+		s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, 0, staged.timings(), 0, time.Since(started))
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 	keepTemp = true
-	s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, staged.timings(), time.Since(started))
+	s.logBatchTiming(headers, bodyBytes, staged.Receive, 0, 0, staged.timings(), 0, time.Since(started))
 	s.logger.Printf(
 		"committed batch=%s collector=%s rows=%d bytes=%d elapsed=%s",
 		headers.BatchID,
@@ -473,7 +487,7 @@ func (s *receiverServer) hashAndAckExisting(
 		writeError(w, http.StatusBadRequest, "retry body does not match existing batch")
 		return
 	}
-	s.logBatchTiming(headers, bodyBytes, receiveElapsed, 0, nil, time.Since(started))
+	s.logBatchTiming(headers, bodyBytes, receiveElapsed, 0, 0, nil, 0, time.Since(started))
 	s.logger.Printf(
 		"idempotent ACK batch=%s rows=%d commit_level=%s",
 		headers.BatchID,
@@ -500,7 +514,9 @@ func (s *receiverServer) logBatchTiming(
 	bodyBytes int64,
 	receive time.Duration,
 	validate time.Duration,
+	commitQueueWait time.Duration,
 	timings *importTimings,
+	archive time.Duration,
 	total time.Duration,
 ) {
 	if s.logger == nil {
@@ -518,7 +534,7 @@ func (s *receiverServer) logBatchTiming(
 	}
 	totalMs := durationMilliseconds(total)
 	s.logger.Printf(
-		"batch timing batch_id=%s rows=%d bytes=%d elapsed=%dms ReceiveMs=%d ValidateMs=%d ParseMs=%d CopyMs=%d UpsertMs=%d CommitMs=%d TotalMs=%d",
+		"batch timing batch_id=%s rows=%d bytes=%d elapsed=%dms ReceiveMs=%d ValidateMs=%d ParseMs=%d CopyMs=%d UpsertMs=%d CommitMs=%d CommitQueueWaitMs=%d ArchiveMs=%d TotalMs=%d",
 		headers.BatchID,
 		headers.Rows,
 		bodyBytes,
@@ -529,6 +545,8 @@ func (s *receiverServer) logBatchTiming(
 		copyMs,
 		upsertMs,
 		commitMs,
+		durationMilliseconds(commitQueueWait),
+		durationMilliseconds(archive),
 		totalMs)
 }
 
@@ -830,7 +848,7 @@ func loadReceiverConfig(path, baseDir string) (receiverConfig, error) {
 	if err != nil || maximum <= 0 {
 		return receiverConfig{}, errors.New("invalid [Server] MaxBodyBytes")
 	}
-	writeTimeoutSeconds, err := strconv.Atoi(valueOr(values, "Server.WriteTimeoutSeconds", "90"))
+	writeTimeoutSeconds, err := strconv.Atoi(valueOr(values, "Server.WriteTimeoutSeconds", "120"))
 	if err != nil || writeTimeoutSeconds <= 0 {
 		return receiverConfig{}, errors.New("invalid [Server] WriteTimeoutSeconds")
 	}

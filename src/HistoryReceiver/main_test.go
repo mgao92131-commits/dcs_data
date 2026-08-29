@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -109,6 +110,75 @@ func TestSynchronousInvalidPayloadReturnsBadRequest(t *testing.T) {
 	}
 }
 
+func TestSynchronousCommitPipelineStagesConcurrently(t *testing.T) {
+	server, root := newTestReceiver(t)
+	server.config.SynchronousCommit = true
+	var logBuffer bytes.Buffer
+	server.logger = log.New(&logBuffer, "", 0)
+
+	firstID := "pipeline_batch_1"
+	secondID := "pipeline_batch_2"
+	body := testCSV()
+	firstImportStarted := make(chan struct{})
+	secondStaged := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	server.beforeSynchronousCommit = func(headers batchHeaders) {
+		if headers.BatchID == secondID {
+			close(secondStaged)
+		}
+	}
+	server.importer = &batchImporter{
+		inbox:    server.config.Inbox,
+		archive:  server.config.Archive,
+		rejected: server.config.Rejected,
+		timezone: time.FixedZone("Asia/Shanghai", 8*60*60),
+		importPreparedBatchFunc: func(ctx context.Context, batch importBatch) (importBatch, error) {
+			if batch.BatchID == firstID {
+				close(firstImportStarted)
+				<-releaseFirst
+			}
+			return batch, nil
+		},
+	}
+
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	go func() {
+		responses <- serveTestBatch(server, firstID, body)
+	}()
+	select {
+	case <-firstImportStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first synchronous import did not start")
+	}
+	go func() {
+		responses <- serveTestBatch(server, secondID, body)
+	}()
+	select {
+	case <-secondStaged:
+		// The second request reached the pre-commit hook while the first
+		// request was still blocked in the database import hook.
+	case <-time.After(5 * time.Second):
+		close(releaseFirst)
+		t.Fatal("second request did not finish receive/parse before commit lock")
+	}
+	close(releaseFirst)
+
+	firstResponse := <-responses
+	secondResponse := <-responses
+	if firstResponse.Code != http.StatusOK || secondResponse.Code != http.StatusOK {
+		t.Fatalf("concurrent synchronous commits failed: first=%d second=%d", firstResponse.Code, secondResponse.Code)
+	}
+	if !strings.Contains(logBuffer.String(), "CommitQueueWaitMs=") ||
+		!strings.Contains(logBuffer.String(), "ArchiveMs=") {
+		t.Fatalf("pipeline timing fields missing from receiver log: %s", logBuffer.String())
+	}
+	if entries, err := os.ReadDir(filepath.Join(root, "archive")); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 2 {
+		t.Fatalf("expected both committed batches to archive, got %d", len(entries))
+	}
+}
+
 func TestHealthReturnsServiceUnavailableWhenDatabaseIsDown(t *testing.T) {
 	server, _ := newTestReceiver(t)
 	server.config.PostgresEnabled = true
@@ -198,7 +268,6 @@ func TestReceiverTimeoutDefaultsAreOrdered(t *testing.T) {
 		"Listen=127.0.0.1:8080",
 		"ApiKey=test-secret",
 		"MaxBodyBytes=1024",
-		"WriteTimeoutSeconds=60",
 		"",
 		"[PostgreSQL]",
 		"Enabled=false",
@@ -212,7 +281,7 @@ func TestReceiverTimeoutDefaultsAreOrdered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.WriteTimeout != 60*time.Second || config.ImportTimeout != 45*time.Second ||
+	if config.WriteTimeout != 120*time.Second || config.ImportTimeout != 45*time.Second ||
 		config.StagingDurability != stagingDurabilityFull {
 		t.Fatalf("unexpected defaults: write=%s import=%s staging_durability=%s", config.WriteTimeout, config.ImportTimeout, config.StagingDurability)
 	}
@@ -471,6 +540,30 @@ func sendTestBatch(
 	secret string,
 ) *httptest.ResponseRecorder {
 	t.Helper()
+	request := newTestBatchRequest(batchID, body, hash, rows, secret)
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, request)
+	return response
+}
+
+func serveTestBatch(
+	server *receiverServer,
+	batchID string,
+	body []byte,
+) *httptest.ResponseRecorder {
+	request := newTestBatchRequest(batchID, body, hashBytes(body), 2, "test-secret")
+	response := httptest.NewRecorder()
+	server.routes().ServeHTTP(response, request)
+	return response
+}
+
+func newTestBatchRequest(
+	batchID string,
+	body []byte,
+	hash string,
+	rows int,
+	secret string,
+) *http.Request {
 	request := httptest.NewRequest(http.MethodPost, "/api/history/batch", bytes.NewReader(body))
 	request.Header.Set("Authorization", "Bearer "+secret)
 	request.Header.Set("X-Collector-Id", "DCS-APP-01")
@@ -481,9 +574,7 @@ func sendTestBatch(
 	request.Header.Set("X-Range-End", "2026-08-26 09:05:00.0000000")
 	request.Header.Set("X-Row-Count", strconv.Itoa(rows))
 	request.Header.Set("X-Content-SHA256", hash)
-	response := httptest.NewRecorder()
-	server.routes().ServeHTTP(response, request)
-	return response
+	return request
 }
 
 func testCSV() []byte {
