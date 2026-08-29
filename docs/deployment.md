@@ -1,108 +1,68 @@
-# DCS processed collector deployment
+# Deployment
 
-## Build
+## Package layout
 
-The supported build command is:
+The DCS package contains only:
 
-    scripts\package-dcs.bat
+    bin\\
+    config\\
+    scripts\\
+    state\\
+    logs\\
 
-The package at artifacts\dcs_data contains only:
+The v3.4.1 DCS runtime has no local batch queue, spool, pending directory or
+`send` command. A prepared batch exists only in memory until the Receiver
+returns a PostgreSQL database ACK.
 
-    bin\
-    config\
-    scripts\
-    state\
-    logs\
+## DCS runtime
 
-There is no local batch-file directory and no send command.
+The Historian producer is single-threaded. It reads and prepares windows in
+order, while two fixed sender workers send at most two uncheckpointed batches.
+`WaitForCapacity` runs before the next Historian read, so a full pipeline never
+reads a third batch.
 
-## Setup
+Only a contiguous ACK prefix can advance `CheckpointEnd`. If Batch N+1 is
+ACKed before Batch N, N+1 remains in memory and no later batch is prepared.
+When N is ACKed, the coordinator saves N and then any already ACKed successor
+before releasing capacity.
 
-1. Copy the package to a normal-user writable local directory.
-2. Copy config\config.example.ini to config\config.ini.
-3. Copy config\tags.example.txt to config\tags.txt.
-4. Remove status, alarm, interlock, pulse, digital-event and invalid tags.
-5. Set the Collector Id, Receiver URL and API key.
-6. Run scripts\status.cmd.
-7. Start with start-historysync.cmd or scripts\start-historysync.cmd.
-
-run.cmd is the foreground diagnostic host. stop-historysync.cmd sends the
-named-event stop request. Stop interrupts the fixed retry wait and exits after
-the active operation observes the stop event.
+Transient connection, timeout, HTTP 408/429 and HTTP 5xx failures retain the
+same batch in its slot and retry it every `SendRetrySeconds`. HTTP 401/403,
+other permanent 4xx responses and invalid ACKs stop the command. A stop request
+interrupts retry waits; only the contiguous ACK prefix is persisted.
 
 ## Configuration
 
-The DCS configuration must define:
-
-    [Historian]
-    Server=APP
-    ConnectRetries=3
-    RetrySeconds=10
-
-    [Sampling]
-    IntervalSeconds=10
-    MaxFailedTagsPerBatch=5
-
-    [Sync]
-    IntervalMinutes=5
-    EndDelaySeconds=30
-    OverlapSeconds=60
-    MaxWindowMinutes=30
-    MinWindowSeconds=10
-
-    [Batch]
-    TargetRows=25000
-    MaxRows=50000
-    TargetBytes=10485760
-    MaxBytes=20971520
-
-    [Files]
-    Tags=..\config\tags.txt
-    Logs=..\logs
-    State=..\state\state.ini
+The DCS example uses:
 
     [Receiver]
-    Enabled=true
-    Url=http://192.168.1.10:8080/api/history/batch
-    TimeoutSeconds=105
+    TimeoutSeconds=135
     SendRetrySeconds=30
     AckMode=database
-    ApiKey=CHANGE_ME_BEFORE_USE
 
-No legacy queue, pause, drain or asynchronous ACK settings are read.
+The Receiver example uses `ImportTimeoutSeconds=45` and
+`WriteTimeoutSeconds=120`. The timeout budget is therefore:
 
-## Runtime behavior
+    ImportTimeoutSeconds < WriteTimeoutSeconds < DCS TimeoutSeconds
+    45                    < 120                 < 135
 
-At first start, if state.ini does not exist, the collector initializes
-CheckpointEnd to a 15-minute bootstrap point before the current completed time.
-Each subsequent run reads from CheckpointEnd - OverlapSeconds.
+Set the Collector Id, Receiver URL and API key before starting. The only DCS
+state file is:
 
-For each window the order is fixed:
+    [ContinuousSync]
+    CheckpointEnd=yyyy-MM-dd HH:mm:ss.fffffff
 
-    Historian read
-      -> encode in memory
-      -> send
-      -> wait for PostgreSQL database ACK
-      -> save CheckpointEnd
-      -> next window
+After a restart, the collector reads again from `CheckpointEnd` minus the
+configured overlap. Receiver sample-key idempotency makes this re-read safe.
 
-Transient Receiver failure blocks the active Batch and retries it every
-SendRetrySeconds. No later Historian window is read while that retry loop is
-active. Permanent data or authentication errors stop the current command and
-leave the checkpoint unchanged. After the cause is corrected, rerun the
-command; the Receiver sample-key idempotency handles any re-read.
+## Field acceptance test
 
-status.cmd reports the configured Historian, Receiver reachability,
-CheckpointEnd, sync lag, AckMode=database, and the last logged error.
-
-## 现场验收
-
-1. Start normal synchronization and note CheckpointEnd.
+1. Start normal synchronization and record `CheckpointEnd`.
 2. Disconnect the Receiver network.
-3. Confirm logs show retries of one Batch every 30 seconds.
-4. Confirm no new local CSV files are created, the Historian read count does
-   not advance to the next window, and CheckpointEnd is unchanged.
-5. Restore the network.
-6. Confirm the same Batch receives database ACK, checkpoint advances, and the
-   collector catches up.
-7. Check PostgreSQL for no time gap and no duplicate sample keys.
+3. Confirm the active batches retry every 30 seconds.
+4. Confirm there are no local CSV files, no spool directory, and no third
+   Historian batch read after the two pipeline slots are occupied.
+5. Confirm `CheckpointEnd` does not advance while the oldest batch is blocked.
+6. Restore the network and confirm the oldest batch is ACKed, the contiguous
+   checkpoint advances, and the collector catches up automatically.
+7. Verify PostgreSQL has no time gap and no duplicate sample keys.

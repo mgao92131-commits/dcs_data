@@ -8,82 +8,108 @@
 - DeltaV Historian 10.3 assemblies
 - normal-user execution
 
-## Data flow
+## v3.4.1 bounded ACK pipeline
+
+The DCS collector has one durable boundary: a PostgreSQL database ACK. The
+Historian producer remains a single thread, while at most two prepared batches
+are sent by two fixed sender workers:
 
     DeltaV readProcessed(InterpolatedValue, 10s)
             |
             v
-    HistorySync reads one ordered window
+    single Historian producer
             |
             v
-    HistoryBatch + BatchPayload in memory
+    in-memory Batch 1 / Batch 2
+            |
+       +----+----+
+       |         |
+       v         v
+    sender 1  sender 2
+       |         |
+       +----+----+
             |
             v
-    BatchSender sends and waits for database ACK
+    Receiver PostgreSQL COMMIT ACK
             |
             v
-    SyncStateStore saves CheckpointEnd atomically
+    ordered CheckpointEnd coordinator
             |
             v
-    next window
+    release one slot and read the next window
 
-The collector never creates a local batch queue. During a retry, the same
-HistoryBatch and BatchPayload remain in memory. A process restart discards that
-memory and reads again from the last durable checkpoint.
+There is no DCS local batch queue. A retry keeps the same HistoryBatch and
+BatchPayload in memory. A process restart discards that memory and reads again
+from the last durable checkpoint.
 
-## Ordering invariant
+## Pipeline invariants
 
-For every continuous batch:
+`BatchPipeline.PipelineDepth` is fixed at 2. `WaitForCapacity` runs before
+`PrepareBatch`, so a full pipeline blocks the producer before it reads the next
+Historian window. The producer never calls Historian concurrently.
 
-    read N
-      -> encode N
-      -> send N
-      -> database ACK N
-      -> save CheckpointEnd=N.End
-      -> read N+1
+Each prepared batch receives a monotonically increasing sequence:
 
-CollectWindow only returns after the current batch has either completed, been
-rejected permanently, or the process received stop. A transient send failure
-remains inside BatchSender.SendWithRetry; it cannot return control to
-collection and therefore cannot cause the next Historian read.
+    Checkpoint = N-1
+    N   = Sending
+    N+1 = Acked
+    N+2 = forbidden
 
-The first window begins at:
+An ACK may arrive out of order. An ACKed later batch remains in memory until
+the oldest outstanding sequence is also ACKed. The coordinator then saves the
+contiguous ACK prefix one range at a time:
+
+    ACK N+1                    Checkpoint remains N-1
+    ACK N                      save N.End, then save N+1.End
+    both saves complete        release a slot and read N+2
+
+The active slot count includes prepared, sending, ACKed-but-not-checkpointed,
+and failed batches. A transient failure therefore occupies its slot and cannot
+create an unbounded backlog.
+
+## Preparation, sending and checkpointing
+
+`PrepareBatch` only performs Historian reads, batch construction and CSV/SHA-256
+encoding. It does not send and does not modify state. `BatchPipeline.Submit`
+hands the prepared object to one worker. The worker calls
+`BatchSender.SendWithRetry`, validates the database ACK, marks the object
+ACKed, and asks the coordinator to advance the contiguous prefix.
+
+The first continuous window begins at:
 
     state.CheckpointEnd.AddSeconds(-options.OverlapSeconds)
 
-Within one run, subsequent windows start exactly at the previous window end.
-The Receiver sample key and idempotent database write make overlap and restart
-re-reads safe.
+Subsequent windows start at the previous window end. Receiver sample-key
+idempotency makes overlap and restart re-reads safe.
 
-## State
-
-state.ini contains exactly one value:
+Checkpoint state contains exactly:
 
     [ContinuousSync]
     CheckpointEnd=2026-08-29 07:30:00.0000000
 
-The value advances only after a validated Receiver ACK with
-commit_level=database. State writes use a flushed temporary file and atomic
-replacement with a recovery rename fallback. If saving fails, the current
-Batch remains complete in memory but the collector retries the state save and
-does not read another Batch.
-
-init and backfill send their data but do not modify the continuous checkpoint.
+Only a validated `commit_level=database` ACK can advance it. State writes use a
+flushed temporary file and atomic replacement. If a state write fails, the ACKed
+batch remains retained and the coordinator retries the write before releasing a
+slot. `init` and `backfill` use the same two-slot sender pipeline but do not
+modify the continuous checkpoint.
 
 ## Retry and error policy
 
-BatchSender classifies failures as follows:
+`BatchSender` is immutable after construction and safe for both workers. Each
+call owns its request, payload stream and timing object:
 
 - connection failures, TCP errors, request/ACK timeout, HTTP 408/429 and
-  HTTP 5xx: wait SendRetrySeconds, then resend the identical Batch;
-- HTTP 401/403: authentication failure, stop immediately;
-- HTTP 4xx other than retryable statuses, including 400/409/413: permanent
-  batch/protocol failure, stop immediately;
-- HTTP 200 with an invalid or non-database ACK: permanent protocol failure,
-  stop immediately.
+  HTTP 5xx: wait `SendRetrySeconds`, then resend the identical BatchId, SHA-256
+  and body;
+- HTTP 401/403: authentication failure, stop the producer and both workers;
+- other permanent 4xx, including 400/409/413: stop the producer and both
+  workers;
+- HTTP 200 with an invalid or non-database ACK: permanent protocol failure.
 
-The default receiver timeout is 105 seconds and the default retry interval is
-30 seconds. A stop event interrupts the retry wait.
+The default DCS timeout is 135 seconds and the default retry interval is
+30 seconds. A stop event interrupts both retry waits. On a fatal worker error,
+only the already contiguous ACK prefix may advance CheckpointEnd; all other
+in-memory batches are discarded.
 
 ## Component responsibilities
 
@@ -96,13 +122,19 @@ The default receiver timeout is 105 seconds and the default retry interval is
     BatchSender.cs
         one HTTP request, ACK validation and fixed-interval retry
 
+    BatchPipeline.cs
+        depth-2 slots, two sender workers and ordered ACK/checkpoint advancement
+
     HistorySync.cs
-        windows, batch ordering, continuous schedule and checkpoint progression
+        preparation, producer windows, continuous schedule and pipeline wiring
 
     SyncState.cs
         one CheckpointEnd and reliable atomic persistence
 
     HistoryReceiver
-        HTTP intake, PostgreSQL transaction, idempotency and database ACK
+        concurrent HTTP receive/parse, serialized PostgreSQL commit and database ACK
 
-The Receiver is not changed by this DCS refactor.
+The Receiver keeps `commitMu` for PostgreSQL import only. Archive movement is
+outside that mutex. Receiver timing logs include `CommitQueueWaitMs` and
+`ArchiveMs` so database queue pressure can be measured before considering
+parallel database imports.

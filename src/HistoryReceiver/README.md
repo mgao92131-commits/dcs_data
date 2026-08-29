@@ -1,80 +1,52 @@
-# HistoryReceiver v2
+# HistoryReceiver
 
-HistoryReceiver 校验 DCS 批次并在 PostgreSQL 事务提交后返回 ACK。
+HistoryReceiver accepts authenticated DCS CSV batches and returns a database
+ACK only after the PostgreSQL transaction commits when `SynchronousCommit=true`.
 
-## 请求处理
+## Request flow
 
 ```text
-HTTP body
- -> Bearer authentication
- -> size / SHA-256 / CSV / row-count validation
- -> PostgreSQL transaction
- -> history_samples UPSERT
- -> imported_batches INSERT
- -> COMMIT
+HTTP request
+ -> Bearer authentication and size checks
+ -> SHA-256, CSV and row-count validation
+ -> durable staging
+ -> receive/parse work may run concurrently
+ -> commitMu protects the PostgreSQL import
+ -> unlock commitMu
+ -> archive or archive_pending
  -> committed=true, commit_level=database ACK
 ```
 
-配置 `SynchronousCommit=true` 时不会先写 inbox 再提前 ACK。数据库不可用或
-事务失败返回 HTTP 503，DCS Collector 会把批次保存到 pending outbox。
-语义校验失败的批次返回 HTTP 400 并移动到 rejected，不会被无限重试。
+The first pipeline version intentionally serializes PostgreSQL imports while
+allowing the next request to finish receiving and parsing. Archive movement is
+outside the database mutex. Timing logs include `CommitQueueWaitMs` and
+`ArchiveMs` to show whether database commit serialization is the next
+optimization target.
 
-同一 BatchId、SHA-256 和行数可以安全重试；数据库中的 `imported_batches`
-保证幂等。相同 BatchId 对应不同内容会失败。
+If PostgreSQL is unavailable or the transaction fails, the Receiver returns
+HTTP 503. The DCS retains the same in-memory batch and retries it; no DCS spool
+or pending outbox is involved. A permanent validation or authentication error
+returns a permanent HTTP error. Repeated committed requests are safe because
+`imported_batches` verifies the body hash and PostgreSQL sample-key upserts are
+idempotent.
 
-## 构建与测试
+## Build and test
 
 ```bat
 go test ./...
+go test -race ./...
 go vet ./...
 scripts\build-receiver.bat
 ```
 
-真实 PostgreSQL COMMIT/ACK 集成测试不会默认连接生产库。准备可清理的测试
-数据库后设置 `DCS_HISTORY_TEST_DATABASE_URL`，再运行：
+The PostgreSQL integration test is opt-in and requires a disposable database
+configured through `DCS_HISTORY_TEST_DATABASE_URL`.
 
-```bat
-test-phase3-integration.bat
-```
-
-## 数据库
-
-```bat
-psql -d deltav_history -f sql\create_tables.sql
-```
-
-`history_samples` 保存 Collector、Tag、时间、原始文本值、可选数值、数据类型、
-Flags、SequenceNo、ArchiveStatus、BatchId 和接收时间。字符串状态值不会再因
-`ParseFloat` 失败而丢弃。
-
-样本身份目前使用：
-
-```text
-SequenceNo available:
-  SHA256(CollectorId + Tag + original Timestamp + SequenceNo)
-
-SequenceNo unavailable (temporary fallback):
-  SHA256(CollectorId + Tag + original Timestamp + ValueText)
-```
-
-该 fallback 优先避免丢样本，但历史修订值可能并存。上线前必须在目标 DeltaV
-版本确认 SequenceNo/ArchiveStatus 的实际属性名与稳定性，再决定最终唯一键。
-
-旧 `history_raw` 保留为 v1 只读历史，不会因身份规则不同而自动复制到新表。
-如需迁移，请通过 v2 backfill 重新读取对应历史范围。
-
-## 健康检查
+## Health check
 
 ```text
 GET http://192.168.1.10:8080/healthz
 ```
 
-数据库同步 ACK 必须包含 `commit_level=database`；未启用同步提交时为
-`commit_level=inbox`。响应包括 `database_ok` 和 `inbox_batches`。Receiver archive 默认保留 30 天，
-日志默认保留 30 天；rejected 批次只报警，不自动删除。
-archive 移动失败的已提交批次会保留在 `archive_pending`，Receiver 每小时自动
-重试恢复，每轮最多 100 个；仍失败的项目继续保留并告警。
-
-示例配置默认 `StagingDurability=full`，会将接收的 CSV 和 metadata 刷到稳定存储。
-`buffered` 仅建议用于受控性能测试；同步模式下 PostgreSQL COMMIT 仍是 ACK 边界，
-但未提交的 staging 文件可能在掉电后丢失。
+The Receiver still supports `commit_level=inbox` for its own asynchronous
+mode, but the DCS production path requires `commit_level=database`.

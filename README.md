@@ -5,20 +5,23 @@ Windows 7 32-bit、.NET Framework 3.5、x86 基线，使用
 readProcessed、Aggregate.InterpolatedValue 和 10 秒采样网格读取配置的
 Historian tag。
 
-## v3.4 同步模型
+## v3.4.1 双窗口 ACK 流水线
 
-DCS 端只有一个可靠边界：
+DCS 端仍只有一个可靠边界，但允许最多两个尚未被连续 ACK 覆盖的内存
+Batch 同时在流水线中：
 
-    Historian Read
-        -> memory HistoryBatch
-        -> HTTP Receiver
+    Historian producer (single thread)
+        -> memory Batch 1 / Batch 2
+        -> two sender workers
         -> PostgreSQL COMMIT ACK
-        -> state.ini CheckpointEnd
-        -> next batch
+        -> ordered CheckpointEnd coordinator
+        -> release one slot and read the next window
 
-一个 Batch 没有收到 commit_level=database 的 ACK，就不会读取或发送后续
-Batch。网络错误、超时和 HTTP 5xx 会按 [Receiver] SendRetrySeconds
-固定间隔重发同一个内存 Batch；401/403 和数据/协议错误立即停止当前同步。
+Historian 永远只有一个读取线程，流水线深度固定为 2。Batch 2 可以先于
+Batch 1 ACK，但只要最老 Batch 尚未 ACK，就不会读取 Batch 3，Checkpoint
+也不会越过 Batch 1。网络错误、超时和 HTTP 5xx 会按
+[Receiver] SendRetrySeconds 固定间隔重发同一个内存 Batch；401/403 和
+数据/协议错误立即停止 Producer 与两个 Sender worker。
 
 state.ini 只有：
 
@@ -43,7 +46,7 @@ checkpoint 的窗口；Receiver 通过 sample key 和 batch 幂等处理重复�
     logs\
     README.txt
 
-正常运行只在内存中保留当前 Batch，不创建本地批次文件。
+正常运行最多只在内存中保留两个 Batch，不创建本地批次文件。
 
 ## 命令
 
@@ -76,7 +79,7 @@ sync、init 和 backfill 都是完整的 Historian -> Receiver -> database
     MaxBytes=20971520
 
     [Receiver]
-    TimeoutSeconds=105
+    TimeoutSeconds=135
     SendRetrySeconds=30
     AckMode=database
 

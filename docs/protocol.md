@@ -44,11 +44,28 @@ The Receiver returns HTTP 200 only after the PostgreSQL transaction commits:
 DCS validates every field. commit_level=database is the only ACK that can
 advance CheckpointEnd.
 
+## Bounded pipeline semantics
+
+The DCS producer may have at most two batches that are not covered by the
+durable checkpoint. Historian reads are blocked before a third batch is
+prepared. The two batches may be received and processed concurrently by the
+Receiver, but CheckpointEnd advances only across a contiguous sequence:
+
+    Checkpoint = N-1
+    N   = sending
+    N+1 = ACKed out of order
+    N+2 = not prepared
+
+An out-of-order ACK is retained in memory. When N is ACKed, the DCS saves N and
+then any consecutive ACKed successor, releasing one or more slots only after
+the checkpoint writes complete. A transient failure therefore cannot create an
+unbounded in-memory backlog.
+
 ## Failure handling
 
 | Response/failure | DCS behavior |
 | --- | --- |
-| HTTP 200 with a valid database ACK | Save CheckpointEnd, then read the next Batch |
+| HTTP 200 with a valid database ACK | Save the contiguous CheckpointEnd prefix, then release capacity |
 | connection/TCP error or timeout | Wait SendRetrySeconds, resend the same Batch |
 | HTTP 408/429 or 5xx | Wait SendRetrySeconds, resend the same Batch |
 | HTTP 401/403 | Stop with authentication error |
