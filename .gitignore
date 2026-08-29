@@ -6,7 +6,6 @@ state.ini
 .env.*
 
 # Runtime data
-spool/
 logs/
 inbox/
 archive/

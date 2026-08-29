@@ -17,410 +17,41 @@ namespace DeltaVHistoryCLI
         {
             try
             {
-                Assert(typeof(HistorianClient).GetMethod("ReadRaw") == null,
+                Assert(
+                    typeof(HistorianClient).GetMethod("ReadRaw") == null,
                     "Raw API must not be exposed");
-                Assert(typeof(HistorianClient).GetMethod("ReadProcessed") != null,
+                Assert(
+                    typeof(HistorianClient).GetMethod("ReadProcessed") != null,
                     "Processed API must be exposed");
-                Assert(typeof(HistorianClient).GetMethod("ReadProcessedBatch") != null,
+                Assert(
+                    typeof(HistorianClient).GetMethod("ReadProcessedBatch") != null,
                     "Processed batch API must be exposed");
+                Assert(
+                    HasMethod(typeof(BatchSender), "SendWithRetry"),
+                    "database ACK retry API must be exposed");
+                Assert(
+                    typeof(BatchSender).GetMethod("SendPending") == null,
+                    "pending sender API must be removed");
+                Assert(
+                    typeof(SyncState).GetField("CheckpointEnd") != null,
+                    "single CheckpointEnd state field");
+                Assert(
+                    typeof(SyncState).GetField("LastCollectedEnd") == null &&
+                    typeof(SyncState).GetField("LastAcceptedEnd") == null &&
+                    typeof(SyncState).GetField("LastCommittedEnd") == null &&
+                    typeof(SyncState).GetField("CollectionPaused") == null &&
+                    typeof(SyncState).GetField("PauseReason") == null,
+                    "legacy state fields must be removed");
 
-                DateTime input = new DateTime(2026, 8, 28, 10, 5, 27);
-                DateTime aligned = (DateTime)InvokePrivate(
-                    typeof(SyncProgram),
-                    "AlignDown",
-                    new object[] { input, 10 });
-                Assert(aligned == new DateTime(2026, 8, 28, 10, 5, 20),
-                    "10-second grid alignment");
-
-                int futureWait = (int)InvokePrivate(
-                    typeof(SyncProgram),
-                    "CalculateWaitMilliseconds",
-                    new object[] {
-                        new DateTime(2026, 8, 28, 10, 5, 0),
-                        new DateTime(2026, 8, 28, 10, 0, 0)
-                    });
-                int overdueWait = (int)InvokePrivate(
-                    typeof(SyncProgram),
-                    "CalculateWaitMilliseconds",
-                    new object[] {
-                        new DateTime(2026, 8, 28, 10, 0, 0),
-                        new DateTime(2026, 8, 28, 10, 5, 0)
-                    });
-                Assert(futureWait == 300000 && overdueWait == 0,
-                    "fixed start-to-start schedule delay");
-
-                string timingRoot = Path.Combine(
-                    Path.GetTempPath(),
-                    "HistorySyncTimingSelfTest_" + Guid.NewGuid().ToString("N"));
-                Directory.CreateDirectory(timingRoot);
-                try
-                {
-                    string timingConfig = Path.Combine(timingRoot, "config.ini");
-                    File.WriteAllText(
-                        timingConfig,
-                        "[Sync]\nIntervalMinutes=5\n[Receiver]\nPendingRetrySeconds=30\n");
-                    int pendingRetryMilliseconds = (int)InvokePrivate(
-                        typeof(SyncProgram),
-                        "ReadPendingRetryMilliseconds",
-                        new object[] {
-                            new string[] { "run", "--config", timingConfig },
-                            timingRoot
-                        });
-                    Assert(pendingRetryMilliseconds == 30000,
-                        "paused pending retry schedule");
-
-                    DateTime scheduleBase = new DateTime(2026, 8, 28, 10, 0, 0);
-                    object[] pausedSchedule = new object[] {
-                        scheduleBase,
-                        scheduleBase,
-                        300000,
-                        pendingRetryMilliseconds,
-                        true,
-                        false
-                    };
-                    DateTime retryStart = (DateTime)InvokePrivate(
-                        typeof(SyncProgram),
-                        "CalculateNextContinuousStart",
-                        pausedSchedule);
-                    Assert(retryStart == scheduleBase.AddSeconds(30) &&
-                        (bool)pausedSchedule[5],
-                        "paused state enters short retry mode");
-
-                    DateTime retryNow = scheduleBase.AddSeconds(31);
-                    object[] stillPausedSchedule = new object[] {
-                        retryStart,
-                        retryNow,
-                        300000,
-                        pendingRetryMilliseconds,
-                        true,
-                        pausedSchedule[5]
-                    };
-                    DateTime retryAgain = (DateTime)InvokePrivate(
-                        typeof(SyncProgram),
-                        "CalculateNextContinuousStart",
-                        stillPausedSchedule);
-                    Assert(retryAgain == retryNow.AddSeconds(30) &&
-                        (bool)stillPausedSchedule[5],
-                        "paused state keeps short retry mode");
-
-                    DateTime resumedNow = scheduleBase.AddSeconds(62);
-                    object[] resumedSchedule = new object[] {
-                        retryAgain,
-                        resumedNow,
-                        300000,
-                        pendingRetryMilliseconds,
-                        false,
-                        stillPausedSchedule[5]
-                    };
-                    DateTime resumedStart = (DateTime)InvokePrivate(
-                        typeof(SyncProgram),
-                        "CalculateNextContinuousStart",
-                        resumedSchedule);
-                    Assert(resumedStart == resumedNow.AddMinutes(5) &&
-                        !(bool)resumedSchedule[5],
-                        "successful drain exits retry mode and resumes collection");
-                }
-                finally
-                {
-                    try { Directory.Delete(timingRoot, true); }
-                    catch { }
-                }
-
-                TimeSpan slice = (TimeSpan)InvokePrivate(
-                    typeof(SyncProgram),
-                    "CalculateEffectiveSlice",
-                    new object[] { 827, 50000, 10, TimeSpan.FromMinutes(30) });
-                Assert(slice == TimeSpan.FromMinutes(10),
-                    "row-capacity pre-split");
-                TimeSpan byteLimitedSlice = (TimeSpan)InvokePrivate(
-                    typeof(SyncProgram),
-                    "CalculateByteAwareSlice",
-                    new object[] {
-                        100,
-                        50000,
-                        25000,
-                        20971520L,
-                        10240L,
-                        100.0,
-                        10,
-                        TimeSpan.FromMinutes(30)
-                    });
-                Assert(byteLimitedSlice == TimeSpan.FromSeconds(10),
-                    "byte-aware pre-split");
-
-                DateTime utc = new DateTime(
-                    2026, 8, 27, 2, 0, 0, DateTimeKind.Utc);
-                DateTime local = (DateTime)InvokePrivate(
-                    typeof(HistorianClient),
-                    "ToCollectorLocalTime",
-                    new object[] { utc });
-                Assert(local == utc.ToLocalTime(),
-                    "UTC Historian timestamp conversion");
-
-                string sequence = (string)InvokePrivate(
-                    typeof(HistorianClient),
-                    "BuildProcessedSequence",
-                    new object[] { 10 });
-                Assert(sequence == "P:InterpolatedValue:10",
-                    "stable Processed identity");
-
-                FakeHistorianReadInterface fakeRead = new FakeHistorianReadInterface();
-                FakeHistorianConnection fakeConnection = new FakeHistorianConnection();
-                HistorianClient fakeClient = new HistorianClient("", null);
-                SetPrivateField(fakeClient, "_readInterface", fakeRead);
-                SetPrivateField(fakeClient, "_connection", fakeConnection);
-                SetPrivateField(
-                    fakeClient,
-                    "_readProcessed",
-                    typeof(FakeHistorianConnection).GetMethod("readProcessed"));
-                SetPrivateField(fakeClient, "_processedSampleType", typeof(object));
-                SetPrivateField(fakeClient, "_interpolatedAggregate", "InterpolatedValue");
-                SetPrivateField(fakeClient, "_connectionHandle", 1);
-                fakeConnection.PointsPerRead = 1000;
-                List<TagResult> fakeTags = new List<TagResult>();
-                fakeTags.Add(new TagResult { Name = "TAG/A", Handle = 101, Status = 1 });
-                fakeTags.Add(new TagResult { Name = "TAG/B", Handle = 102, Status = 1 });
-                fakeTags.Add(new TagResult { Name = "TAG/INVALID", Handle = -1, Status = 0 });
-                List<ProcessedTagResult> fakeResults = fakeClient.ReadProcessedBatch(
-                    fakeTags,
-                    new DateTime(2026, 8, 28, 10, 0, 0),
-                    new DateTime(2026, 8, 28, 10, 5, 0),
-                    10);
-                Assert(fakeRead.CreateCount == 1 && fakeRead.ReleaseCount == 1,
-                    "one shared Historian TimeSpan per window");
-                Assert(fakeConnection.ReadCount == 2 && fakeResults.Count == 3 &&
-                    fakeResults[0].Result != null && fakeResults[1].Result != null &&
-                    fakeResults[2].Error != null,
-                    "serial Processed reads preserve per-tag results");
-                Assert(fakeClient.ProcessedPointAccessorBuildCount == 1 &&
-                    fakeResults[0].Result.Samples.Count == 1000 &&
-                    fakeResults[1].Result.Samples.Count == 1000,
-                    "Processed point accessors are reused for one point type");
-                Assert(fakeClient.LastPerformance.ReturnedSamples == 2000 &&
-                    fakeClient.LastPerformance.InvalidSamples == 0 &&
-                    fakeClient.LastPerformance.NormalizeFastPathTags == 2 &&
-                    fakeClient.LastPerformance.NormalizeFallbackTags == 0,
-                    "Processed hot-path performance counters");
-
-                fakeConnection.UseAlternatePointType = true;
-                List<TagResult> alternateTags = new List<TagResult>();
-                alternateTags.Add(new TagResult { Name = "TAG/ALTERNATE", Handle = 103, Status = 1 });
-                List<ProcessedTagResult> alternateResults = fakeClient.ReadProcessedBatch(
-                    alternateTags,
-                    new DateTime(2026, 8, 28, 10, 0, 0),
-                    new DateTime(2026, 8, 28, 10, 5, 0),
-                    10);
-                Assert(fakeClient.ProcessedPointAccessorBuildCount == 2 &&
-                    alternateResults[0].Result != null &&
-                    alternateResults[0].Result.Samples.Count == 1000 &&
-                    alternateResults[0].Result.Samples[0].Tag == "TAG/ALTERNATE",
-                    "Processed point accessors rebuild for a different point type");
-
-                fakeConnection.UseAlternatePointType = false;
-                List<TagResult> repeatedTags = new List<TagResult>();
-                repeatedTags.Add(new TagResult { Name = "TAG/REPEATED", Handle = 104, Status = 1 });
-                List<ProcessedTagResult> repeatedResults = fakeClient.ReadProcessedBatch(
-                    repeatedTags,
-                    new DateTime(2026, 8, 28, 10, 0, 0),
-                    new DateTime(2026, 8, 28, 10, 5, 0),
-                    10);
-                Assert(fakeClient.ProcessedPointAccessorBuildCount == 2 &&
-                    repeatedResults[0].Result != null &&
-                    repeatedResults[0].Result.Samples.Count == 1000,
-                    "Processed point accessors reuse an earlier runtime point type");
-
-                List<HistorySample> unordered = new List<HistorySample>();
-                unordered.Add(new HistorySample { Timestamp = new DateTime(2026, 8, 28, 10, 0, 20) });
-                unordered.Add(new HistorySample { Timestamp = new DateTime(2026, 8, 28, 10, 0, 10) });
-                bool normalizeFastPath;
-                List<HistorySample> normalized = HistorySampleSet.NormalizeProcessed(
-                    unordered,
-                    out normalizeFastPath);
-                Assert(!normalizeFastPath && normalized[0].Timestamp < normalized[1].Timestamp,
-                    "Processed normalization fallback preserves ordering");
-
-                string sessionTagsPath = Path.Combine(
-                    Path.GetTempPath(),
-                    "HistorySyncSessionTags_" + Guid.NewGuid().ToString("N") + ".txt");
-                try
-                {
-                    File.WriteAllText(sessionTagsPath, "TAG/A\n", Encoding.Default);
-                    Type sessionType = typeof(SyncProgram).GetNestedType(
-                        "ContinuousHistorianSession",
-                        BindingFlags.NonPublic);
-                    object session = Activator.CreateInstance(sessionType, true);
-                    SetPrivateField(session, "_client", fakeClient);
-                    SetPrivateField(session, "_tags", fakeTags);
-                    SetPrivateField(session, "_server", "APP");
-                    SetPrivateField(session, "_singleTag", null);
-                    SetPrivateField(session, "_tagsPath", sessionTagsPath);
-                    FileInfo sessionTagsFile = new FileInfo(sessionTagsPath);
-                    SetPrivateField(session, "_tagsLastWriteTimeUtc", sessionTagsFile.LastWriteTimeUtc);
-                    SetPrivateField(session, "_tagsLength", sessionTagsFile.Length);
-                    SetPrivateField(session, "_hasTagsFileSignature", true);
-                    SyncOptions sessionOptions = new SyncOptions();
-                    sessionOptions.Server = "APP";
-                    sessionOptions.SingleTag = null;
-                    sessionOptions.TagsFile = sessionTagsPath;
-                    bool sessionReused = (bool)InvokeInstance(
-                        session,
-                        "RequiresResolve",
-                        new object[] { sessionOptions });
-                    File.AppendAllText(sessionTagsPath, "TAG/B\n", Encoding.Default);
-                    bool sessionReResolve = (bool)InvokeInstance(
-                        session,
-                        "RequiresResolve",
-                        new object[] { sessionOptions });
-                    Assert(!sessionReused && sessionReResolve,
-                        "Continuous session detects tags file changes");
-                    InvokeInstance(session, "Dispose", new object[0]);
-                }
-                finally
-                {
-                    try { File.Delete(sessionTagsPath); }
-                    catch { }
-                }
-                fakeClient.Dispose();
-
-                int[] streamingSizes = new int[] { 150000, 5 * 1024 * 1024 };
-                int streamingSizeIndex;
-                for (streamingSizeIndex = 0; streamingSizeIndex < streamingSizes.Length; streamingSizeIndex++)
-                {
-                    byte[] streamingInput = new byte[streamingSizes[streamingSizeIndex]];
-                    int streamingIndex;
-                    for (streamingIndex = 0; streamingIndex < streamingInput.Length; streamingIndex++)
-                        streamingInput[streamingIndex] = (byte)(streamingIndex % 251);
-                    string expectedStreamingHash = BatchEncoder.ComputeSha256(streamingInput);
-                    MemoryStream streamingSource = new MemoryStream(streamingInput, false);
-                    MemoryStream streamingDestination = new MemoryStream();
-                    string actualStreamingHash = (string)InvokePrivate(
-                        typeof(BatchSender),
-                        "CopyPayloadAndHash",
-                        new object[] {
-                            streamingSource,
-                            streamingDestination,
-                            (long)streamingInput.Length,
-                            expectedStreamingHash
-                        });
-                    byte[] streamingOutput = streamingDestination.ToArray();
-                    Assert(streamingOutput.Length == streamingInput.Length &&
-                        actualStreamingHash == expectedStreamingHash,
-                        "streaming sender payload length and SHA");
-                    for (streamingIndex = 0; streamingIndex < streamingInput.Length; streamingIndex++)
-                        Assert(streamingOutput[streamingIndex] == streamingInput[streamingIndex],
-                            "streaming sender payload copy");
-                }
-
-                byte[] tamperedInput = new byte[150000];
-                int tamperedIndex;
-                for (tamperedIndex = 0; tamperedIndex < tamperedInput.Length; tamperedIndex++)
-                    tamperedInput[tamperedIndex] = (byte)(tamperedIndex % 251);
-                string tamperedExpectedHash = BatchEncoder.ComputeSha256(tamperedInput);
-                tamperedInput[tamperedInput.Length / 2] ^= 1;
-                bool localHashRejected = false;
-                try
-                {
-                    InvokePrivate(
-                        typeof(BatchSender),
-                        "CopyPayloadAndHash",
-                        new object[] {
-                            new MemoryStream(tamperedInput, false),
-                            new MemoryStream(),
-                            (long)tamperedInput.Length,
-                            tamperedExpectedHash
-                        });
-                }
-                catch (TargetInvocationException ex)
-                {
-                    localHashRejected = ex.InnerException is InvalidDataException;
-                }
-                Assert(localHashRejected,
-                    "same-length local payload corruption is rejected by SHA");
-
-                HistoryBatch encodedBatch = new HistoryBatch();
-                encodedBatch.Samples.Add(new HistorySample {
-                    Tag = "TAG/PAYLOAD",
-                    Timestamp = new DateTime(2026, 8, 28, 10, 0, 0),
-                    Value = "1.25",
-                    DataType = "Float",
-                    Flags = "",
-                    SequenceNo = "P:InterpolatedValue:10",
-                    ArchiveStatus = "Current"
-                });
-                BatchPayload encodedPayload = BatchEncoder.EncodePayload(encodedBatch, 4096);
-                Assert(encodedPayload.Length > 0 &&
-                    encodedPayload.Length <= encodedPayload.Buffer.Length &&
-                    encodedPayload.Sha256 == BatchEncoder.ComputeSha256(
-                        encodedPayload.Buffer,
-                        encodedPayload.Length),
-                    "bounded batch payload buffer and SHA");
-
-                RunPendingDrainSelfTest();
-
-                string temporaryRoot = Path.Combine(
-                    Path.GetTempPath(),
-                    "HistorySyncSelfTest_" + Guid.NewGuid().ToString("N"));
-                Directory.CreateDirectory(temporaryRoot);
-                try
-                {
-                    string statePath = Path.Combine(temporaryRoot, "state.ini");
-                    SyncState initial = new SyncState();
-                    initial.LastCollectedEnd = new DateTime(2026, 8, 28, 10, 0, 0);
-                    initial.LastAcceptedEnd = initial.LastCollectedEnd;
-                    initial.LastCommittedEnd = initial.LastCollectedEnd;
-                    initial.CollectionPaused = true;
-                    initial.PauseReason = "pending capacity reached";
-                    SyncStateStore stateStore = new SyncStateStore(statePath);
-                    stateStore.Save(initial);
-                    SyncState loaded = stateStore.LoadOrCreate(initial);
-                    Assert(loaded.CollectionPaused &&
-                        loaded.PauseReason == initial.PauseReason,
-                        "persisted CollectionPaused state");
-
-                    HistoryBatch batch = new HistoryBatch();
-                    batch.BatchId = "selftest_pending";
-                    batch.CollectorId = "DCS-SELFTEST";
-                    batch.Mode = "sync";
-                    batch.Sampling = "InterpolatedValue";
-                    batch.SamplingIntervalSeconds = 10;
-                    batch.Server = "APP";
-                    batch.RangeStart = initial.LastCollectedEnd;
-                    batch.RangeEnd = initial.LastCollectedEnd.AddMinutes(5);
-                    byte[] payload = Encoding.UTF8.GetBytes("payload");
-                    batch.Sha256 = BatchEncoder.ComputeSha256(payload);
-                    SpoolStore spool = new SpoolStore(Path.Combine(temporaryRoot, "spool"));
-                    spool.SavePending(batch, payload);
-                    PendingStats stats = spool.GetPendingStats();
-                    Assert(stats.Batches == 1 && stats.Bytes == payload.Length,
-                        "pending spool statistics");
-                    bool capacityRejected = false;
-                    try
-                    {
-                        spool.EnsurePendingCapacity(2, payload.Length);
-                    }
-                    catch (PendingCapacityException)
-                    {
-                        capacityRejected = true;
-                    }
-                    Assert(capacityRejected,
-                        "pending byte capacity stops at the exact limit");
-                    bool incomingRejected = false;
-                    try
-                    {
-                        spool.EnsurePendingCapacity(2, payload.Length + 1, 2);
-                    }
-                    catch (PendingCapacityException)
-                    {
-                        incomingRejected = true;
-                    }
-                    Assert(incomingRejected,
-                        "pending capacity includes incoming batch");
-                }
-                finally
-                {
-                    if (Directory.Exists(temporaryRoot))
-                        Directory.Delete(temporaryRoot, true);
-                }
+                RunPureFunctionSelfTest();
+                RunHistorianCoreSelfTest();
+                RunStateSelfTest();
+                RunBatchBackpressureSelfTest();
+                RunAckLossSelfTest();
+                RunPermanentStatusSelfTest(400, false);
+                RunPermanentStatusSelfTest(401, true);
+                RunPermanentStatusSelfTest(413, false);
+                RunStopSelfTest();
 
                 Console.WriteLine("PROCESSED SYNC SELF TEST OK");
                 return 0;
@@ -432,27 +63,721 @@ namespace DeltaVHistoryCLI
             }
         }
 
-        private static object InvokePrivate(Type type, string name, object[] args)
+        private static void RunPureFunctionSelfTest()
+        {
+            DateTime input = new DateTime(2026, 8, 28, 10, 5, 27);
+            DateTime aligned = (DateTime)InvokePrivate(
+                typeof(SyncProgram),
+                "AlignDown",
+                new object[] { input, 10 });
+            Assert(
+                aligned == new DateTime(2026, 8, 28, 10, 5, 20),
+                "10-second grid alignment");
+
+            int futureWait = (int)InvokePrivate(
+                typeof(SyncProgram),
+                "CalculateWaitMilliseconds",
+                new object[]
+                {
+                    new DateTime(2026, 8, 28, 10, 5, 0),
+                    new DateTime(2026, 8, 28, 10, 0, 0)
+                });
+            int overdueWait = (int)InvokePrivate(
+                typeof(SyncProgram),
+                "CalculateWaitMilliseconds",
+                new object[]
+                {
+                    new DateTime(2026, 8, 28, 10, 0, 0),
+                    new DateTime(2026, 8, 28, 10, 5, 0)
+                });
+            Assert(
+                futureWait == 300000 && overdueWait == 0,
+                "continuous schedule catches up with zero overdue wait");
+
+            TimeSpan rowSlice = (TimeSpan)InvokePrivate(
+                typeof(SyncProgram),
+                "CalculateByteAwareSlice",
+                new object[]
+                {
+                    827,
+                    50000,
+                    25000,
+                    20971520L,
+                    10485760L,
+                    256.0,
+                    10,
+                    TimeSpan.FromMinutes(30)
+                });
+            Assert(
+                rowSlice == TimeSpan.FromMinutes(5),
+                "row/byte-aware normal window capacity");
+
+            TimeSpan byteLimitedSlice = (TimeSpan)InvokePrivate(
+                typeof(SyncProgram),
+                "CalculateByteAwareSlice",
+                new object[]
+                {
+                    100,
+                    50000,
+                    25000,
+                    20971520L,
+                    10240L,
+                    100.0,
+                    10,
+                    TimeSpan.FromMinutes(30)
+                });
+            Assert(
+                byteLimitedSlice == TimeSpan.FromSeconds(10),
+                "byte-aware pre-split");
+
+            HistoryBatch batch = BuildBatch(
+                "selftest_encoder",
+                new DateTime(2026, 8, 28, 10, 0, 0),
+                new DateTime(2026, 8, 28, 10, 5, 0));
+            BatchPayload payload = BatchEncoder.EncodePayload(batch, 4096);
+            Assert(
+                payload.Length > 0 &&
+                payload.Length <= payload.Buffer.Length &&
+                payload.Sha256 == BatchEncoder.ComputeSha256(
+                    payload.Buffer,
+                    payload.Length),
+                "bounded batch payload buffer and SHA");
+
+            byte[] inputBytes = new byte[150000];
+            int index;
+            for (index = 0; index < inputBytes.Length; index++)
+                inputBytes[index] = (byte)(index % 251);
+            string expectedHash = BatchEncoder.ComputeSha256(inputBytes);
+            MemoryStream destination = new MemoryStream();
+            string actualHash = (string)InvokePrivate(
+                typeof(BatchSender),
+                "CopyPayloadAndHash",
+                new object[]
+                {
+                    new MemoryStream(inputBytes, false),
+                    destination,
+                    (long)inputBytes.Length,
+                    expectedHash
+                });
+            Assert(
+                actualHash == expectedHash &&
+                ByteArraysEqual(destination.ToArray(), inputBytes),
+                "streaming payload copy and SHA");
+        }
+
+        private static void RunHistorianCoreSelfTest()
+        {
+            DateTime utc = new DateTime(
+                2026,
+                8,
+                27,
+                2,
+                0,
+                0,
+                DateTimeKind.Utc);
+            DateTime local = (DateTime)InvokePrivate(
+                typeof(HistorianClient),
+                "ToCollectorLocalTime",
+                new object[] { utc });
+            Assert(
+                local == utc.ToLocalTime(),
+                "UTC Historian timestamp conversion");
+
+            string sequence = (string)InvokePrivate(
+                typeof(HistorianClient),
+                "BuildProcessedSequence",
+                new object[] { 10 });
+            Assert(
+                sequence == "P:InterpolatedValue:10",
+                "stable Processed identity");
+
+            FakeHistorianReadInterface fakeRead =
+                new FakeHistorianReadInterface();
+            FakeHistorianConnection fakeConnection =
+                new FakeHistorianConnection();
+            HistorianClient fakeClient = CreateFakeClient(
+                fakeRead,
+                fakeConnection);
+            fakeConnection.PointsPerRead = 1000;
+            List<TagResult> fakeTags = new List<TagResult>();
+            fakeTags.Add(new TagResult { Name = "TAG/A", Handle = 101, Status = 1 });
+            fakeTags.Add(new TagResult { Name = "TAG/B", Handle = 102, Status = 1 });
+            fakeTags.Add(new TagResult {
+                Name = "TAG/INVALID",
+                Handle = -1,
+                Status = 0
+            });
+            List<ProcessedTagResult> fakeResults =
+                fakeClient.ReadProcessedBatch(
+                    fakeTags,
+                    new DateTime(2026, 8, 28, 10, 0, 0),
+                    new DateTime(2026, 8, 28, 10, 5, 0),
+                    10);
+            Assert(
+                fakeRead.CreateCount == 1 &&
+                fakeRead.ReleaseCount == 1,
+                "one shared Historian TimeSpan per window");
+            Assert(
+                fakeConnection.ReadCount == 2 &&
+                fakeResults.Count == 3 &&
+                fakeResults[0].Result != null &&
+                fakeResults[1].Result != null &&
+                fakeResults[2].Error != null,
+                "serial Processed reads preserve per-tag results");
+            Assert(
+                fakeClient.ProcessedPointAccessorBuildCount == 1 &&
+                fakeResults[0].Result.Samples.Count == 1000 &&
+                fakeResults[1].Result.Samples.Count == 1000,
+                "Processed point accessors are reused for one point type");
+            Assert(
+                fakeClient.LastPerformance.ReturnedSamples == 2000 &&
+                fakeClient.LastPerformance.InvalidSamples == 0 &&
+                fakeClient.LastPerformance.NormalizeFastPathTags == 2 &&
+                fakeClient.LastPerformance.NormalizeFallbackTags == 0,
+                "Processed hot-path performance counters");
+
+            fakeConnection.UseAlternatePointType = true;
+            List<TagResult> alternateTags = new List<TagResult>();
+            alternateTags.Add(new TagResult {
+                Name = "TAG/ALTERNATE",
+                Handle = 103,
+                Status = 1
+            });
+            List<ProcessedTagResult> alternateResults =
+                fakeClient.ReadProcessedBatch(
+                    alternateTags,
+                    new DateTime(2026, 8, 28, 10, 0, 0),
+                    new DateTime(2026, 8, 28, 10, 5, 0),
+                    10);
+            Assert(
+                fakeClient.ProcessedPointAccessorBuildCount == 2 &&
+                alternateResults[0].Result != null &&
+                alternateResults[0].Result.Samples.Count == 1000 &&
+                alternateResults[0].Result.Samples[0].Tag == "TAG/ALTERNATE",
+                "Processed point accessors rebuild for a different point type");
+
+            fakeConnection.UseAlternatePointType = false;
+            List<TagResult> repeatedTags = new List<TagResult>();
+            repeatedTags.Add(new TagResult {
+                Name = "TAG/REPEATED",
+                Handle = 104,
+                Status = 1
+            });
+            List<ProcessedTagResult> repeatedResults =
+                fakeClient.ReadProcessedBatch(
+                    repeatedTags,
+                    new DateTime(2026, 8, 28, 10, 0, 0),
+                    new DateTime(2026, 8, 28, 10, 5, 0),
+                    10);
+            Assert(
+                fakeClient.ProcessedPointAccessorBuildCount == 2 &&
+                repeatedResults[0].Result != null &&
+                repeatedResults[0].Result.Samples.Count == 1000,
+                "Processed point accessors reuse an earlier runtime point type");
+
+            List<HistorySample> unordered = new List<HistorySample>();
+            unordered.Add(new HistorySample {
+                Timestamp = new DateTime(2026, 8, 28, 10, 0, 20)
+            });
+            unordered.Add(new HistorySample {
+                Timestamp = new DateTime(2026, 8, 28, 10, 0, 10)
+            });
+            bool normalizeFastPath;
+            List<HistorySample> normalized =
+                HistorySampleSet.NormalizeProcessed(
+                    unordered,
+                    out normalizeFastPath);
+            Assert(
+                !normalizeFastPath &&
+                normalized[0].Timestamp < normalized[1].Timestamp,
+                "Processed normalization fallback preserves ordering");
+            fakeClient.Dispose();
+        }
+
+        private static void RunStateSelfTest()
+        {
+            string root = CreateTempRoot("HistorySyncStateSelfTest");
+            try
+            {
+                string path = Path.Combine(root, "state.ini");
+                DateTime checkpoint = new DateTime(2026, 8, 29, 7, 30, 0);
+                SyncStateStore store = new SyncStateStore(path);
+                SyncState initial = new SyncState();
+                initial.CheckpointEnd = checkpoint;
+                store.Save(initial);
+                string text = File.ReadAllText(path, Encoding.UTF8);
+                Assert(
+                    text.IndexOf("[ContinuousSync]", StringComparison.Ordinal) >= 0 &&
+                    text.IndexOf("CheckpointEnd=", StringComparison.Ordinal) >= 0 &&
+                    text.IndexOf("LastCollectedEnd=", StringComparison.Ordinal) < 0,
+                    "state.ini contains only CheckpointEnd");
+                SyncState loaded = store.LoadOrCreate(initial);
+                Assert(
+                    loaded.CheckpointEnd == checkpoint,
+                    "CheckpointEnd round trip");
+
+                File.WriteAllText(
+                    path,
+                    "[ContinuousSync]\n" +
+                    "LastCommittedEnd=2026-08-29 07:30:00.0000000\n",
+                    Encoding.UTF8);
+                bool legacyRejected = false;
+                try
+                {
+                    store.LoadOrCreate(initial);
+                }
+                catch (InvalidDataException)
+                {
+                    legacyRejected = true;
+                }
+                Assert(legacyRejected, "legacy state is not compatibility-read");
+            }
+            finally
+            {
+                DeleteTempRoot(root);
+            }
+        }
+
+        private static void RunBatchBackpressureSelfTest()
+        {
+            string root = CreateTempRoot("HistorySyncBackpressureSelfTest");
+            ScriptedReceiver receiver = new ScriptedReceiver(
+                new int[] { 503, 503, 503, 200, 200 },
+                false);
+            receiver.Start();
+            ManualResetEvent pipelineDone = new ManualResetEvent(false);
+            ManualResetEvent releaseAck = receiver.ReleaseResponse;
+            Exception pipelineError = null;
+            int firstResult = -1;
+            int secondResult = -1;
+            DateTime firstStart = new DateTime(2026, 8, 29, 10, 0, 0);
+            DateTime firstEnd = firstStart.AddMinutes(5);
+            DateTime secondEnd = firstEnd.AddMinutes(5);
+            try
+            {
+                IniConfig config = LoadReceiverConfig(
+                    root,
+                    receiver.Port,
+                    1);
+                string logs = Path.Combine(root, "logs");
+                Directory.CreateDirectory(logs);
+                SyncOptions options = BuildTestOptions(
+                    root,
+                    "sync",
+                    firstStart,
+                    secondEnd);
+                SyncState state = new SyncState();
+                state.CheckpointEnd = firstStart;
+                SyncStateStore stateStore = new SyncStateStore(
+                    Path.Combine(root, "state.ini"));
+                stateStore.Save(state);
+                FakeHistorianReadInterface fakeRead =
+                    new FakeHistorianReadInterface();
+                FakeHistorianConnection fakeConnection =
+                    new FakeHistorianConnection();
+                HistorianClient fakeClient = CreateFakeClient(
+                    fakeRead,
+                    fakeConnection);
+                List<TagResult> tags = new List<TagResult>();
+                tags.Add(new TagResult {
+                    Name = "TAG/BACKPRESSURE",
+                    Handle = 101,
+                    Status = 1
+                });
+
+                Thread pipeline = new Thread(delegate()
+                {
+                    try
+                    {
+                        using (SyncLogger log = new SyncLogger(logs))
+                        {
+                            BatchSender sender = new BatchSender(config, log);
+                            int firstCreated = 0;
+                            double estimate = 256.0;
+                            object[] firstArgs = new object[]
+                            {
+                                options,
+                                firstStart,
+                                firstEnd,
+                                log,
+                                fakeClient,
+                                tags,
+                                sender,
+                                state,
+                                stateStore,
+                                firstCreated,
+                                estimate,
+                                null
+                            };
+                            firstResult = (int)InvokePrivate(
+                                typeof(SyncProgram),
+                                "CollectWindow",
+                                firstArgs);
+                            int secondCreated = 0;
+                            object[] secondArgs = new object[]
+                            {
+                                options,
+                                firstEnd,
+                                secondEnd,
+                                log,
+                                fakeClient,
+                                tags,
+                                sender,
+                                state,
+                                stateStore,
+                                secondCreated,
+                                firstArgs[10],
+                                null
+                            };
+                            secondResult = (int)InvokePrivate(
+                                typeof(SyncProgram),
+                                "CollectWindow",
+                                secondArgs);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        pipelineError = ex;
+                    }
+                    finally
+                    {
+                        fakeClient.Dispose();
+                        pipelineDone.Set();
+                    }
+                });
+                pipeline.IsBackground = true;
+                pipeline.Start();
+
+                Assert(
+                    receiver.ThirdTransientObserved.WaitOne(10000, false),
+                    "Batch 1 reaches repeated transient failures");
+                Assert(
+                    fakeConnection.ReadCount == 1 &&
+                    state.CheckpointEnd == firstStart,
+                    "no next Historian read or checkpoint before Batch 1 ACK");
+                releaseAck.Set();
+                Assert(
+                    pipelineDone.WaitOne(15000, false),
+                    "strict backpressure pipeline completes");
+                Assert(
+                    pipelineError == null,
+                    "strict backpressure pipeline has no error");
+                Assert(
+                    firstResult == 0 && secondResult == 0,
+                    "ACKed batches return success");
+                Assert(
+                    fakeConnection.ReadCount == 2 &&
+                    state.CheckpointEnd == secondEnd,
+                    "Batch 2 starts only after Batch 1 checkpoint");
+                Assert(
+                    receiver.Requests == 5,
+                    "three transient retries then two acknowledged batches");
+                Assert(
+                    ByteArraysEqual(receiver.Bodies[0], receiver.Bodies[1]) &&
+                    ByteArraysEqual(receiver.Bodies[0], receiver.Bodies[2]) &&
+                    ByteArraysEqual(receiver.Bodies[0], receiver.Bodies[3]),
+                    "Batch 1 retries use identical payload bytes");
+                Assert(
+                    StringEqualsAll(receiver.BatchIds, 0, 3) &&
+                    StringEqualsAll(receiver.Hashes, 0, 3),
+                    "Batch 1 retries use identical BatchId and SHA");
+                Assert(
+                    !Directory.Exists(Path.Combine(root, "spool")),
+                    "backpressure run creates no spool directory");
+            }
+            finally
+            {
+                releaseAck.Set();
+                receiver.StopAndJoin();
+                DeleteTempRoot(root);
+            }
+        }
+
+        private static void RunAckLossSelfTest()
+        {
+            string root = CreateTempRoot("HistorySyncAckLossSelfTest");
+            ScriptedReceiver receiver = new ScriptedReceiver(
+                new int[] { 200, 200 },
+                true);
+            receiver.Start();
+            try
+            {
+                IniConfig config = LoadReceiverConfig(root, receiver.Port, 1);
+                using (SyncLogger log =
+                    new SyncLogger(Path.Combine(root, "logs")))
+                {
+                    BatchSender sender = new BatchSender(config, log);
+                    HistoryBatch batch = BuildBatch(
+                        "selftest_ack_loss",
+                        new DateTime(2026, 8, 29, 11, 0, 0),
+                        new DateTime(2026, 8, 29, 11, 5, 0));
+                    BatchPayload payload = BatchEncoder.EncodePayload(batch, 4096);
+                    batch.Sha256 = payload.Sha256;
+                    BatchReceipt receipt = sender.SendWithRetry(
+                        batch,
+                        payload,
+                        null);
+                    Assert(
+                        receipt.CommitLevel == "database" &&
+                        receipt.Timings.Attempts == 2,
+                        "ACK loss retries until database ACK");
+                }
+                Assert(
+                    receiver.Requests == 2 &&
+                    ByteArraysEqual(receiver.Bodies[0], receiver.Bodies[1]) &&
+                    receiver.BatchIds[0] == receiver.BatchIds[1] &&
+                    receiver.Hashes[0] == receiver.Hashes[1],
+                    "ACK loss resends the exact in-memory batch");
+            }
+            finally
+            {
+                receiver.StopAndJoin();
+                DeleteTempRoot(root);
+            }
+        }
+
+        private static void RunPermanentStatusSelfTest(
+            int statusCode,
+            bool authentication)
+        {
+            string root = CreateTempRoot(
+                "HistorySyncHttp" + statusCode.ToString(
+                    CultureInfo.InvariantCulture) + "SelfTest");
+            ScriptedReceiver receiver = new ScriptedReceiver(
+                new int[] { statusCode },
+                false);
+            receiver.Start();
+            try
+            {
+                IniConfig config = LoadReceiverConfig(root, receiver.Port, 1);
+                bool rejected = false;
+                using (SyncLogger log =
+                    new SyncLogger(Path.Combine(root, "logs")))
+                {
+                    BatchSender sender = new BatchSender(config, log);
+                    HistoryBatch batch = BuildBatch(
+                        "selftest_http_" + statusCode.ToString(
+                            CultureInfo.InvariantCulture),
+                        new DateTime(2026, 8, 29, 12, 0, 0),
+                        new DateTime(2026, 8, 29, 12, 5, 0));
+                    BatchPayload payload = BatchEncoder.EncodePayload(batch, 4096);
+                    try
+                    {
+                        sender.SendWithRetry(batch, payload, null);
+                    }
+                    catch (BatchSendException ex)
+                    {
+                        rejected = ex.Permanent &&
+                            ex.AuthenticationFailure == authentication &&
+                            ex.StatusCode == statusCode;
+                    }
+                }
+                Assert(
+                    rejected && receiver.Requests == 1,
+                    statusCode.ToString(CultureInfo.InvariantCulture) +
+                    " is an immediate permanent/authentication stop");
+            }
+            finally
+            {
+                receiver.StopAndJoin();
+                DeleteTempRoot(root);
+            }
+        }
+
+        private static void RunStopSelfTest()
+        {
+            string root = CreateTempRoot("HistorySyncStopSelfTest");
+            ScriptedReceiver receiver = new ScriptedReceiver(
+                new int[] { 503 },
+                false);
+            receiver.Start();
+            ManualResetEvent stop = new ManualResetEvent(false);
+            ManualResetEvent done = new ManualResetEvent(false);
+            Exception sendError = null;
+            try
+            {
+                IniConfig config = LoadReceiverConfig(root, receiver.Port, 30);
+                Thread worker = new Thread(delegate()
+                {
+                    try
+                    {
+                        using (SyncLogger log =
+                            new SyncLogger(Path.Combine(root, "logs")))
+                        {
+                            BatchSender sender = new BatchSender(config, log);
+                            HistoryBatch batch = BuildBatch(
+                                "selftest_stop",
+                                new DateTime(2026, 8, 29, 13, 0, 0),
+                                new DateTime(2026, 8, 29, 13, 5, 0));
+                            BatchPayload payload =
+                                BatchEncoder.EncodePayload(batch, 4096);
+                            sender.SendWithRetry(batch, payload, stop);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        sendError = ex;
+                    }
+                    finally
+                    {
+                        done.Set();
+                    }
+                });
+                worker.IsBackground = true;
+                worker.Start();
+                Assert(
+                    receiver.RequestObserved.WaitOne(5000, false),
+                    "stop test sends the first transient request");
+                stop.Set();
+                Assert(
+                    done.WaitOne(2000, false),
+                    "stop interrupts fixed retry wait");
+                Assert(
+                    sendError is SyncStopRequestedException,
+                    "stop returns a stop-requested result");
+            }
+            finally
+            {
+                stop.Set();
+                receiver.StopAndJoin();
+                DeleteTempRoot(root);
+            }
+        }
+
+        private static SyncOptions BuildTestOptions(
+            string root,
+            string command,
+            DateTime start,
+            DateTime end)
+        {
+            SyncOptions options = new SyncOptions();
+            options.Command = command;
+            options.Server = "APP";
+            options.CollectorId = "DCS-SELFTEST";
+            options.Start = start;
+            options.End = end;
+            options.Slice = TimeSpan.FromMinutes(5);
+            options.SamplingIntervalSeconds = 10;
+            options.MaxFailedTagsPerBatch = 5;
+            options.MaxRows = 50000;
+            options.TargetRows = 25000;
+            options.MaxBytes = 20971520;
+            options.TargetBytes = 10485760;
+            options.MinWindowSeconds = 10;
+            options.OverlapSeconds = 60;
+            options.StatePath = Path.Combine(root, "state.ini");
+            options.LogsDirectory = Path.Combine(root, "logs");
+            return options;
+        }
+
+        private static IniConfig LoadReceiverConfig(
+            string root,
+            int port,
+            int retrySeconds)
+        {
+            string path = Path.Combine(root, "receiver.ini");
+            File.WriteAllText(
+                path,
+                "[Receiver]\n" +
+                "Url=http://127.0.0.1:" +
+                port.ToString(CultureInfo.InvariantCulture) +
+                "/api/history/batch\n" +
+                "ApiKey=selftest\n" +
+                "TimeoutSeconds=5\n" +
+                "SendRetrySeconds=" +
+                retrySeconds.ToString(CultureInfo.InvariantCulture) +
+                "\nAckMode=database\n",
+                Encoding.UTF8);
+            return IniConfig.Load(path);
+        }
+
+        private static HistoryBatch BuildBatch(
+            string batchId,
+            DateTime start,
+            DateTime end)
+        {
+            HistoryBatch batch = new HistoryBatch();
+            batch.BatchId = batchId;
+            batch.CollectorId = "DCS-SELFTEST";
+            batch.Mode = "sync";
+            batch.Sampling = "InterpolatedValue";
+            batch.SamplingIntervalSeconds = 10;
+            batch.Server = "APP";
+            batch.RangeStart = start;
+            batch.RangeEnd = end;
+            batch.Samples.Add(new HistorySample {
+                Tag = "TAG/SELFTEST",
+                Timestamp = start,
+                Value = "1",
+                DataType = "Float",
+                Flags = "",
+                SequenceNo = "P:InterpolatedValue:10",
+                ArchiveStatus = "Current"
+            });
+            return batch;
+        }
+
+        private static HistorianClient CreateFakeClient(
+            FakeHistorianReadInterface read,
+            FakeHistorianConnection connection)
+        {
+            HistorianClient client = new HistorianClient("", null);
+            SetPrivateField(client, "_readInterface", read);
+            SetPrivateField(client, "_connection", connection);
+            SetPrivateField(
+                client,
+                "_readProcessed",
+                typeof(FakeHistorianConnection).GetMethod("readProcessed"));
+            SetPrivateField(client, "_processedSampleType", typeof(object));
+            SetPrivateField(client, "_interpolatedAggregate", "InterpolatedValue");
+            SetPrivateField(client, "_connectionHandle", 1);
+            return client;
+        }
+
+        private static object InvokePrivate(
+            Type type,
+            string name,
+            object[] args)
         {
             MethodInfo method = type.GetMethod(
                 name,
                 BindingFlags.NonPublic | BindingFlags.Static);
             if (method == null)
-                throw new Exception("Method not found: " + type.FullName + "." + name);
-            return method.Invoke(null, args);
+                throw new Exception(
+                    "Method not found: " + type.FullName + "." + name);
+            try
+            {
+                return method.Invoke(null, args);
+            }
+            catch (TargetInvocationException ex)
+            {
+                if (ex.InnerException != null)
+                    throw ex.InnerException;
+                throw;
+            }
         }
 
-        private static object InvokeInstance(object instance, string name, object[] args)
+        private static bool HasMethod(Type type, string name)
         {
-            MethodInfo method = instance.GetType().GetMethod(
-                name,
-                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            if (method == null)
-                throw new Exception("Instance method not found: " + name);
-            return method.Invoke(instance, args);
+            MethodInfo[] methods = type.GetMethods(
+                BindingFlags.Public |
+                BindingFlags.NonPublic |
+                BindingFlags.Instance |
+                BindingFlags.Static);
+            int i;
+            for (i = 0; i < methods.Length; i++)
+                if (String.Equals(
+                    methods[i].Name,
+                    name,
+                    StringComparison.Ordinal))
+                    return true;
+            return false;
         }
 
-        private static void SetPrivateField(object instance, string name, object value)
+        private static void SetPrivateField(
+            object instance,
+            string name,
+            object value)
         {
             FieldInfo field = instance.GetType().GetField(
                 name,
@@ -462,87 +787,47 @@ namespace DeltaVHistoryCLI
             field.SetValue(instance, value);
         }
 
-        private static void RunPendingDrainSelfTest()
+        private static string CreateTempRoot(string prefix)
         {
             string root = Path.Combine(
                 Path.GetTempPath(),
-                "HistorySyncDrainSelfTest_" + Guid.NewGuid().ToString("N"));
+                prefix + "_" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(root);
-            string spool = Path.Combine(root, "spool");
-            string logs = Path.Combine(root, "logs");
-            Directory.CreateDirectory(spool);
-            Directory.CreateDirectory(logs);
+            return root;
+        }
 
-            TcpListener listener = new TcpListener(IPAddress.Loopback, 0);
-            listener.Start();
-            FakePendingReceiverResult receiverResult = new FakePendingReceiverResult();
-            Thread receiverThread = new Thread(delegate()
+        private static void DeleteTempRoot(string root)
+        {
+            if (String.IsNullOrEmpty(root))
+                return;
+            if (Directory.Exists(root))
             {
-                FakePendingReceiver.Run(listener, receiverResult);
-            });
-            receiverThread.IsBackground = true;
-            receiverThread.Start();
-            try
-            {
-                int port = ((IPEndPoint)listener.LocalEndpoint).Port;
-                string configPath = Path.Combine(root, "config.ini");
-                File.WriteAllText(
-                    configPath,
-                    "[Receiver]\n" +
-                    "Url=http://127.0.0.1:" + port.ToString() + "/api/history/batch\n" +
-                    "ApiKey=selftest\n" +
-                    "TimeoutSeconds=5\n" +
-                    "BacklogDrainSeconds=60\n" +
-                    "AckMode=inbox\n",
-                    Encoding.UTF8);
-                IniConfig config = IniConfig.Load(configPath);
-                SpoolStore store = new SpoolStore(spool);
-                int batchIndex;
-                for (batchIndex = 0; batchIndex < 2; batchIndex++)
-                {
-                    HistoryBatch batch = new HistoryBatch();
-                    batch.BatchId = "selftest_drain_" + batchIndex.ToString();
-                    batch.CollectorId = "DCS-SELFTEST";
-                    batch.Mode = "sync";
-                    batch.Sampling = "InterpolatedValue";
-                    batch.SamplingIntervalSeconds = 10;
-                    batch.Server = "APP";
-                    batch.RangeStart = new DateTime(2026, 8, 28, 10, batchIndex, 0);
-                    batch.RangeEnd = batch.RangeStart.AddMinutes(1);
-                    batch.Samples.Add(new HistorySample {
-                        Tag = "TAG/SELFTEST",
-                        Timestamp = batch.RangeStart,
-                        Value = batchIndex.ToString(),
-                        DataType = "Float",
-                        Flags = "",
-                        SequenceNo = "P:InterpolatedValue:10",
-                        ArchiveStatus = "Current"
-                    });
-                    BatchPayload payload = BatchEncoder.EncodePayload(batch, 4096);
-                    batch.Sha256 = payload.Sha256;
-                    store.SavePending(batch, payload);
-                }
+                try { Directory.Delete(root, true); }
+                catch { }
+            }
+        }
 
-                using (SyncLogger log = new SyncLogger(logs))
-                {
-                    BatchSender sender = new BatchSender(config, spool, log);
-                    int code = sender.SendPending();
-                    PendingStats remaining = store.GetPendingStats();
-                    Assert(code == 0 && remaining.Batches == 0 &&
-                        receiverResult.Requests == 2 && receiverResult.Error == null,
-                        "pending drain sends all batches over one streaming path");
-                }
-            }
-            finally
-            {
-                listener.Stop();
-                if (receiverResult.Client != null)
-                    receiverResult.Client.Close();
-                if (!receiverThread.Join(5000))
-                    throw new Exception("Fake pending Receiver did not stop.");
-                if (Directory.Exists(root))
-                    Directory.Delete(root, true);
-            }
+        private static bool StringEqualsAll(
+            List<string> values,
+            int first,
+            int last)
+        {
+            int i;
+            for (i = first + 1; i <= last; i++)
+                if (values[i] != values[first])
+                    return false;
+            return true;
+        }
+
+        private static bool ByteArraysEqual(byte[] left, byte[] right)
+        {
+            if (left == null || right == null || left.Length != right.Length)
+                return false;
+            int i;
+            for (i = 0; i < left.Length; i++)
+                if (left[i] != right[i])
+                    return false;
+            return true;
         }
 
         private static void Assert(bool condition, string name)
@@ -556,7 +841,8 @@ namespace DeltaVHistoryCLI
     {
         public int CreateCount;
         public int ReleaseCount;
-        private readonly FakeHistorianTimeSpan _timeSpan = new FakeHistorianTimeSpan();
+        private readonly FakeHistorianTimeSpan _timeSpan =
+            new FakeHistorianTimeSpan();
 
         public int createTimeSpan()
         {
@@ -604,8 +890,11 @@ namespace DeltaVHistoryCLI
             object sampleType,
             ArrayList aggregates)
         {
-            if (timeSpanHandle != 7 || sampleType == null || aggregates.Count != 1)
-                throw new Exception("shared Processed read arguments were not configured");
+            if (timeSpanHandle != 7 ||
+                sampleType == null ||
+                aggregates.Count != 1)
+                throw new Exception(
+                    "shared Processed read arguments were not configured");
             ReadCount++;
             FakeHistorianProcessed processed = new FakeHistorianProcessed();
             processed.nSamples = PointsPerRead;
@@ -613,8 +902,14 @@ namespace DeltaVHistoryCLI
             int pointIndex;
             for (pointIndex = 0; pointIndex < PointsPerRead; pointIndex++)
             {
-                DateTime timestamp = new DateTime(2026, 8, 28, 10, 0, 0).AddMilliseconds(
-                    (ReadCount - 1) * PointsPerRead + pointIndex);
+                DateTime timestamp = new DateTime(
+                    2026,
+                    8,
+                    29,
+                    10,
+                    0,
+                    0).AddMilliseconds(
+                        (ReadCount - 1) * PointsPerRead + pointIndex);
                 if (UseAlternatePointType)
                     samples.Add(new FakeHistorianPointAlternate {
                         timestamp = timestamp,
@@ -657,59 +952,146 @@ namespace DeltaVHistoryCLI
         public int archiveStatus;
     }
 
-    class FakePendingReceiverResult
+    class ScriptedReceiver
     {
+        private readonly int[] _statuses;
+        private readonly bool _closeFirst;
+        private readonly TcpListener _listener;
+        private Thread _thread;
+        private readonly object _sync = new object();
+
+        public readonly ManualResetEvent ThirdTransientObserved =
+            new ManualResetEvent(false);
+        public readonly ManualResetEvent ReleaseResponse =
+            new ManualResetEvent(false);
+        public readonly ManualResetEvent RequestObserved =
+            new ManualResetEvent(false);
+        public readonly List<byte[]> Bodies = new List<byte[]>();
+        public readonly List<string> BatchIds = new List<string>();
+        public readonly List<string> Hashes = new List<string>();
         public int Requests;
         public Exception Error;
-        public TcpClient Client;
-    }
 
-    class FakePendingReceiver
-    {
-        public static void Run(TcpListener listener, FakePendingReceiverResult result)
+        public ScriptedReceiver(int[] statuses, bool closeFirst)
+        {
+            _statuses = statuses;
+            _closeFirst = closeFirst;
+            _listener = new TcpListener(IPAddress.Loopback, 0);
+            _listener.Start();
+        }
+
+        public int Port
+        {
+            get { return ((IPEndPoint)_listener.LocalEndpoint).Port; }
+        }
+
+        public void Start()
+        {
+            _thread = new Thread(Run);
+            _thread.IsBackground = true;
+            _thread.Start();
+        }
+
+        public void StopAndJoin()
+        {
+            ReleaseResponse.Set();
+            try { _listener.Stop(); }
+            catch { }
+            if (_thread != null && !_thread.Join(10000))
+                throw new Exception("Scripted Receiver did not stop.");
+            if (Error != null)
+                throw new Exception("Scripted Receiver failed.", Error);
+        }
+
+        private void Run()
         {
             try
             {
-                using (TcpClient client = listener.AcceptTcpClient())
+                int index;
+                for (index = 0; index < _statuses.Length; index++)
                 {
-                    result.Client = client;
-                    client.ReceiveTimeout = 5000;
-                    client.SendTimeout = 5000;
-                    using (NetworkStream stream = client.GetStream())
+                    using (TcpClient client = _listener.AcceptTcpClient())
                     {
-                        while (result.Requests < 2)
+                        client.ReceiveTimeout = 10000;
+                        client.SendTimeout = 10000;
+                        using (NetworkStream stream = client.GetStream())
                         {
                             string headers = ReadHeaders(stream);
                             if (headers == null)
-                                throw new Exception("Sender closed before all pending requests arrived.");
+                                throw new Exception("request headers ended early");
                             int contentLength = Int32.Parse(
                                 HeaderValue(headers, "Content-Length"),
                                 CultureInfo.InvariantCulture);
                             byte[] body = ReadBody(stream, contentLength);
                             string batchId = HeaderValue(headers, "X-Batch-Id");
-                            string hash = BatchEncoder.ComputeSha256(body);
-                            string rows = HeaderValue(headers, "X-Row-Count");
-                            string responseText =
-                                "{\"ok\":true,\"committed\":true,\"commit_level\":\"inbox\",\"batch_id\":\"" +
-                                batchId + "\",\"sha256\":\"" + hash + "\",\"received_rows\":" + rows + "}";
-                            byte[] responseBody = Encoding.UTF8.GetBytes(responseText);
+                            string hash = HeaderValue(
+                                headers,
+                                "X-Content-SHA256");
+                            lock (_sync)
+                            {
+                                Requests++;
+                                Bodies.Add(body);
+                                BatchIds.Add(batchId);
+                                Hashes.Add(hash);
+                            }
+                            RequestObserved.Set();
+                            if (index == 2)
+                            {
+                                ThirdTransientObserved.Set();
+                                ReleaseResponse.WaitOne(10000, false);
+                            }
+                            if (_closeFirst && index == 0)
+                                continue;
+
+                            int statusCode = _statuses[index];
+                            string responseText;
+                            if (statusCode == 200)
+                            {
+                                responseText =
+                                    "{\"ok\":true,\"committed\":true," +
+                                    "\"commit_level\":\"database\"," +
+                                    "\"batch_id\":\"" + batchId +
+                                    "\",\"sha256\":\"" + hash +
+                                    "\",\"received_rows\":" +
+                                    HeaderValue(
+                                        headers,
+                                        "X-Row-Count") + "}";
+                            }
+                            else
+                                responseText = "temporary";
+                            byte[] responseBody = Encoding.UTF8.GetBytes(
+                                responseText);
+                            string reason = statusCode == 200
+                                ? "OK"
+                                : "Error";
                             string responseHeaders =
-                                "HTTP/1.1 200 OK\r\n" +
+                                "HTTP/1.1 " +
+                                statusCode.ToString(
+                                    CultureInfo.InvariantCulture) +
+                                " " + reason + "\r\n" +
                                 "Content-Type: application/json\r\n" +
-                                "Content-Length: " + responseBody.Length.ToString(CultureInfo.InvariantCulture) + "\r\n" +
-                                "Connection: keep-alive\r\n\r\n";
-                            byte[] response = Encoding.ASCII.GetBytes(responseHeaders);
-                            stream.Write(response, 0, response.Length);
-                            stream.Write(responseBody, 0, responseBody.Length);
+                                "Content-Length: " +
+                                responseBody.Length.ToString(
+                                    CultureInfo.InvariantCulture) +
+                                "\r\nConnection: close\r\n\r\n";
+                            byte[] headerBytes = Encoding.ASCII.GetBytes(
+                                responseHeaders);
+                            stream.Write(
+                                headerBytes,
+                                0,
+                                headerBytes.Length);
+                            stream.Write(
+                                responseBody,
+                                0,
+                                responseBody.Length);
                             stream.Flush();
-                            result.Requests++;
                         }
                     }
                 }
             }
             catch (Exception ex)
             {
-                result.Error = ex;
+                Error = ex;
             }
         }
 
@@ -723,8 +1105,11 @@ namespace DeltaVHistoryCLI
                     return null;
                 text.Append((char)value);
                 int length = text.Length;
-                if (length >= 4 && text[length - 4] == '\r' && text[length - 3] == '\n' &&
-                    text[length - 2] == '\r' && text[length - 1] == '\n')
+                if (length >= 4 &&
+                    text[length - 4] == '\r' &&
+                    text[length - 3] == '\n' &&
+                    text[length - 2] == '\r' &&
+                    text[length - 1] == '\n')
                     return text.ToString();
             }
             throw new Exception("HTTP request headers are too large.");
@@ -756,7 +1141,10 @@ namespace DeltaVHistoryCLI
                 if (separator <= 0)
                     continue;
                 string key = lines[i].Substring(0, separator).Trim();
-                if (String.Equals(key, name, StringComparison.OrdinalIgnoreCase))
+                if (String.Equals(
+                    key,
+                    name,
+                    StringComparison.OrdinalIgnoreCase))
                     return lines[i].Substring(separator + 1).Trim();
             }
             throw new Exception("Missing HTTP header: " + name);

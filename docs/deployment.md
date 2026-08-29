@@ -1,84 +1,108 @@
-# DCS collector build and deployment
+# DCS processed collector deployment
 
 ## Build
 
-The supported DCS baseline is Windows 7 32-bit with the .NET Framework 3.5
-compiler/runtime and an x86 process; no .NET 2.0 fallback is maintained:
+The supported build command is:
 
-```bat
-scripts\package-dcs.bat
-```
+    scripts\package-dcs.bat
 
-The package is created at `artifacts\dcs_data` with this layout:
+The package at artifacts\dcs_data contains only:
 
-```text
-bin\
-config\
-scripts\
-state\
-spool\
-logs\
-```
+    bin\
+    config\
+    scripts\
+    state\
+    logs\
 
-It contains no source, test, Probe, compatibility, Receiver, database, service,
-scheduled-task, or startup files.
+There is no local batch-file directory and no send command.
 
-## DCS setup
+## Setup
 
-1. Copy `artifacts\dcs_data` to a normal-user writable local directory.
-2. Copy `config\config.example.ini` to `config\config.ini`.
-3. Copy `config\tags.example.txt` to `config\tags.txt`.
-4. Remove status/event and invalid tags from `tags.txt`.
-5. Set Collector Id, Receiver URL, and API key.
-6. Run `scripts\status.cmd` and then root-level `start-historysync.cmd`.
-   Use root-level `stop-historysync.cmd` to stop it.
+1. Copy the package to a normal-user writable local directory.
+2. Copy config\config.example.ini to config\config.ini.
+3. Copy config\tags.example.txt to config\tags.txt.
+4. Remove status, alarm, interlock, pulse, digital-event and invalid tags.
+5. Set the Collector Id, Receiver URL and API key.
+6. Run scripts\status.cmd.
+7. Start with start-historysync.cmd or scripts\start-historysync.cmd.
 
-`start-historysync.cmd` launches a hidden normal-user host. It executes every
-`[Sync] IntervalMinutes`; `stop-historysync.cmd` requests a graceful stop after
-the current cycle. `run.cmd` provides the same host in the foreground for
-diagnostics. None of these scripts installs a system component.
+run.cmd is the foreground diagnostic host. stop-historysync.cmd sends the
+named-event stop request. Stop interrupts the fixed retry wait and exits after
+the active operation observes the stop event.
 
-`MaxWindowMinutes` remains 30. All retained tags are read with
-`InterpolatedValue` at `[Sampling] IntervalSeconds=10`.
-Normal windows target `TargetBatchRows=25000` and
-`TargetBatchBytes=10485760`; `MaxBatchRows=50000` and
-`MaxBatchBytes=20971520` remain hard limits.
+## Configuration
 
-The reliability defaults are `OverlapSeconds=60`, `MaxPendingBatches=50`,
-`MaxPendingBytes=104857600`, `BacklogDrainSeconds=60`,
-`PendingRetrySeconds=30`, and a 105-second DCS sender timeout. On a transient
-Receiver failure, pending data is retained in oldest-first order. If the
-pending safety limit is reached, the state records `CollectionPaused=true`;
-the continuous host stays running and retries the pending drain on the short
-cycle instead of waiting for the normal five-minute collection slot. Once
-enough pending data drains to leave the safety limit, collection resumes.
+The DCS configuration must define:
 
-For synchronous PostgreSQL ACK, keep the timeout hierarchy aligned:
-`ImportTimeoutSeconds=45`, `WriteTimeoutSeconds=90`, and DCS
-`TimeoutSeconds=105`.
+    [Historian]
+    Server=APP
+    ConnectRetries=3
+    RetrySeconds=10
 
-The current sender/receiver path also reuses one Historian TimeSpan per window,
-parses the incoming CSV during HTTP staging, skips no-op PostgreSQL overlap
-updates, and streams pending files over KeepAlive connections without a second
-local CSV hash pass. In synchronous
-mode, database COMMIT returns the database ACK even when the auxiliary archive
-move fails; the payload is retained under `archive_pending` for maintenance.
-Retries with an already committed BatchId verify only the body hash and do not
-create duplicate archive directories. The durable staging/inbox files remain
-available for restart recovery. Receiver maintenance retries valid
-`archive_pending` entries hourly, up to 100 batches per pass, and leaves failed
-moves in place for the next pass.
+    [Sampling]
+    IntervalSeconds=10
+    MaxFailedTagsPerBatch=5
 
-Receiver staging uses `StagingDurability=full` by default: the received CSV and
-metadata are flushed to stable storage before the batch is committed to the
-inbox or database. `StagingDurability=buffered` may be used for a controlled
-performance test when losing an uncommitted staging file after power loss is
-acceptable; PostgreSQL COMMIT remains the synchronous ACK boundary.
+    [Sync]
+    IntervalMinutes=5
+    EndDelaySeconds=30
+    OverlapSeconds=60
+    MaxWindowMinutes=30
+    MinWindowSeconds=10
 
-## Upgrade
+    [Batch]
+    TargetRows=25000
+    MaxRows=50000
+    TargetBytes=10485760
+    MaxBytes=20971520
 
-Preserve `config`, `state`, `spool`, and `logs`, then replace only `bin` and
-`scripts`. Check pending batches before and after the replacement.
+    [Files]
+    Tags=..\config\tags.txt
+    Logs=..\logs
+    State=..\state\state.ini
 
-Because the processed-only collector intentionally has no Raw compatibility
-mode, rollback requires restoring a complete earlier binary/config package.
+    [Receiver]
+    Enabled=true
+    Url=http://192.168.1.10:8080/api/history/batch
+    TimeoutSeconds=105
+    SendRetrySeconds=30
+    AckMode=database
+    ApiKey=CHANGE_ME_BEFORE_USE
+
+No legacy queue, pause, drain or asynchronous ACK settings are read.
+
+## Runtime behavior
+
+At first start, if state.ini does not exist, the collector initializes
+CheckpointEnd to a 15-minute bootstrap point before the current completed time.
+Each subsequent run reads from CheckpointEnd - OverlapSeconds.
+
+For each window the order is fixed:
+
+    Historian read
+      -> encode in memory
+      -> send
+      -> wait for PostgreSQL database ACK
+      -> save CheckpointEnd
+      -> next window
+
+Transient Receiver failure blocks the active Batch and retries it every
+SendRetrySeconds. No later Historian window is read while that retry loop is
+active. Permanent data or authentication errors stop the current command and
+leave the checkpoint unchanged. After the cause is corrected, rerun the
+command; the Receiver sample-key idempotency handles any re-read.
+
+status.cmd reports the configured Historian, Receiver reachability,
+CheckpointEnd, sync lag, AckMode=database, and the last logged error.
+
+## 现场验收
+
+1. Start normal synchronization and note CheckpointEnd.
+2. Disconnect the Receiver network.
+3. Confirm logs show retries of one Batch every 30 seconds.
+4. Confirm no new local CSV files are created, the Historian read count does
+   not advance to the next window, and CheckpointEnd is unchanged.
+5. Restore the network.
+6. Confirm the same Batch receives database ACK, checkpoint advances, and the
+   collector catches up.
+7. Check PostgreSQL for no time gap and no duplicate sample keys.

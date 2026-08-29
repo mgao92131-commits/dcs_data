@@ -2,70 +2,59 @@
 
 ## Endpoint
 
-```text
-POST /api/history/batch
-Content-Type: text/csv; charset=utf-8
-Authorization: Bearer <API key>
-```
+    POST /api/history/batch
+    Content-Type: text/csv; charset=utf-8
+    Authorization: Bearer <API key>
 
-The current Receiver endpoint is:
-
-```text
-http://192.168.1.10:8080/api/history/batch
-```
-
-Required headers:
+## Required headers
 
 | Header | Meaning |
 | --- | --- |
-| `X-Collector-Id` | Stable DCS collector identity |
-| `X-Batch-Id` | Idempotency identity for the batch |
-| `X-Batch-Mode` | `sync`, `init`, or `backfill` |
-| `X-Historian-Server` | DeltaV Historian node, normally `APP` |
-| `X-Range-Start` | Inclusive logical range start |
-| `X-Range-End` | Logical range end |
-| `X-Row-Count` | Number of CSV data rows |
-| `X-Content-SHA256` | SHA-256 of the exact request body |
+| X-Collector-Id | Stable DCS collector identity |
+| X-Batch-Id | Identity of the in-memory batch |
+| X-Batch-Mode | sync, init, or backfill |
+| X-Historian-Server | DeltaV Historian node |
+| X-Range-Start | Inclusive logical range start |
+| X-Range-End | Logical range end |
+| X-Row-Count | Number of CSV data rows |
+| X-Content-SHA256 | SHA-256 of the exact request body |
 
 ## CSV body
 
 The first row is:
 
-```text
-Tag,Timestamp,Value,DataType,Flags,SequenceNo,ArchiveStatus
-```
+    Tag,Timestamp,Value,DataType,Flags,SequenceNo,ArchiveStatus
 
-Values are quoted CSV fields. `Value` remains raw text; numeric values are
-also stored as `value_double` when PostgreSQL can parse them.
+All fields are quoted. Value remains raw text; numeric values may also be
+stored as value_double by PostgreSQL.
 
-## ACK
+## Database ACK
 
-After PostgreSQL transaction commit, the Receiver returns HTTP 200:
+The Receiver returns HTTP 200 only after the PostgreSQL transaction commits:
 
-```json
-{
-  "ok": true,
-  "committed": true,
-  "commit_level": "database",
-  "batch_id": "...",
-  "sha256": "...",
-  "received_rows": 123
-}
-```
+    {
+      "ok": true,
+      "committed": true,
+      "commit_level": "database",
+      "batch_id": "...",
+      "sha256": "...",
+      "received_rows": 123
+    }
 
-`commit_level=database` is required before the DCS collector advances
-`LastCommittedEnd`. An asynchronous/inbox-only Receiver may return
-`commit_level=inbox`; that can advance `LastAcceptedEnd` but never proves a
-PostgreSQL commit. An ACK without `commit_level` is rejected by the DCS
-sender.
+DCS validates every field. commit_level=database is the only ACK that can
+advance CheckpointEnd.
 
-## Response handling
+## Failure handling
 
-| HTTP status | DCS behavior |
+| Response/failure | DCS behavior |
 | --- | --- |
-| `200` | Validate ACK fields, then remove the pending batch |
-| `400` | Permanent invalid batch; quarantine/fail and stop the continuous gap |
-| `401`, `403` | Authentication failure; pause collection |
-| `409` | Batch conflict/permanent ordering failure |
-| `413` | Batch too large; fail/quarantine for operator review |
-| `5xx`, timeout, connection error | Keep pending and retry later |
+| HTTP 200 with a valid database ACK | Save CheckpointEnd, then read the next Batch |
+| connection/TCP error or timeout | Wait SendRetrySeconds, resend the same Batch |
+| HTTP 408/429 or 5xx | Wait SendRetrySeconds, resend the same Batch |
+| HTTP 401/403 | Stop with authentication error |
+| HTTP 400/409/413 or other permanent 4xx | Stop with permanent batch error |
+| malformed ACK or non-database commit level | Stop with permanent protocol error |
+
+The retry request keeps the same BatchId, SHA-256 and body while the process is
+alive. If the process restarts before saving the checkpoint, it re-reads the
+old range; Receiver/database idempotency makes that safe.

@@ -1,113 +1,108 @@
-# DCS processed collector architecture
+# DCS collector architecture
 
-## DCS constraints
+## Runtime baseline
 
 - Windows 7 32-bit
-- .NET Framework 3.5 compiler and runtime
-- x86 process architecture
+- .NET Framework 3.5
+- x86 process
 - DeltaV Historian 10.3 assemblies
-- normal user execution
+- normal-user execution
 
-## Historian data flow
+## Data flow
 
-```text
-DeltaV Historian readProcessed(InterpolatedValue, 10s)
-    -> HistorianClient
-    -> HistorySync serial tag collection on one shared TimeSpan
-    -> in-memory CSV batch
-    -> Receiver
-    -> PostgreSQL commit ACK
-```
+    DeltaV readProcessed(InterpolatedValue, 10s)
+            |
+            v
+    HistorySync reads one ordered window
+            |
+            v
+    HistoryBatch + BatchPayload in memory
+            |
+            v
+    BatchSender sends and waits for database ACK
+            |
+            v
+    SyncStateStore saves CheckpointEnd atomically
+            |
+            v
+    next window
 
-Every tag in `tags.txt` uses `InterpolatedValue`. Status, alarm, interlock,
-pulse, digital event, and invalid tags must be removed from that file.
+The collector never creates a local batch queue. During a retry, the same
+HistoryBatch and BatchPayload remain in memory. A process restart discards that
+memory and reads again from the last durable checkpoint.
 
-Collection boundaries and dynamic split points are aligned to the configured
-sampling interval. The logical maximum window remains 30 minutes. Before a
-Historian read, the collector limits each physical batch by the expected row
-capacity; the existing byte-limit dynamic split remains as a final safeguard.
+## Ordering invariant
 
-A failed tag read is logged and collection continues for the remaining tags.
-If failures exceed `[Sampling] MaxFailedTagsPerBatch`, no batch is persisted and
-the checkpoint does not advance. A 60-second overlap retries the tail of the
-previous cycle while stable Processed identities keep retries idempotent.
+For every continuous batch:
 
-Historian Processed timestamps are converted from UTC to DCS local time before
-the existing timezone-less CSV protocol is encoded.
+    read N
+      -> encode N
+      -> send N
+      -> database ACK N
+      -> save CheckpointEnd=N.End
+      -> read N+1
 
-The Historian client creates and configures one TimeSpan per physical window,
-then calls `readProcessed` serially for each valid tag and releases the handle
-after the window completes. The per-tag normalization protection remains in
-the Core; the Sync layer does not build a second timestamp de-duplication map.
+CollectWindow only returns after the current batch has either completed, been
+rejected permanently, or the process received stop. A transient send failure
+remains inside BatchSender.SendWithRetry; it cannot return control to
+collection and therefore cannot cause the next Historian read.
 
-## State invariants
+The first window begins at:
 
-1. `LastCollectedEnd` advances only after the batch is committed remotely or
-   durably stored in the local outbox.
-2. `LastCommittedEnd` advances only after a PostgreSQL database-level ACK.
-3. Initial-load and backfill commands do not modify continuous checkpoints.
-4. State updates use flush and atomic rename.
-5. A global named mutex prevents concurrent collector executions.
+    state.CheckpointEnd.AddSeconds(-options.OverlapSeconds)
 
-## Send and pending state machine
+Within one run, subsequent windows start exactly at the previous window end.
+The Receiver sample key and idempotent database write make overlap and restart
+re-reads safe.
 
-The sender drains the oldest pending batches continuously until the configured
-`BacklogDrainSeconds` budget expires or the Receiver fails. New collection is
-allowed while a transient failure leaves pending space available. Once the
-pending batch/byte safety limit is reached, or a healthy Receiver cannot drain
-the backlog within its budget, the state records `CollectionPaused=true` and
-the cycle does not read more Historian data. The continuous host remains alive
-and retries the pending drain on the shorter `PendingRetrySeconds` cycle. Once
-a paused cycle drains enough pending data for the state to recover, collection
-may resume immediately; reaching the safety limit pauses it again.
+## State
 
-After a successful drain, the state clears `CollectionPaused` and collection
-resumes from the durable Historian checkpoint. The default pending limits are
-50 batches and 100 MiB.
+state.ini contains exactly one value:
 
-The timeout relationship for synchronous database ACK is:
+    [ContinuousSync]
+    CheckpointEnd=2026-08-29 07:30:00.0000000
 
-```text
-PostgreSQL import 45s < Receiver HTTP request 90s < DCS sender wait 105s
-```
+The value advances only after a validated Receiver ACK with
+commit_level=database. State writes use a flushed temporary file and atomic
+replacement with a recovery rename fallback. If saving fails, the current
+Batch remains complete in memory but the collector retries the state save and
+does not read another Batch.
 
-Normal collection windows target 25,000 rows / 10 MiB while
-`MaxBatchRows=50000` and `MaxBatchBytes=20971520` remain hard limits. Each DCS
-batch also emits a `Performance` line with Historian RPC, conversion,
-normalization, encoding, send, ACK wait, working-set, and managed-memory
-measurements.
+init and backfill send their data but do not modify the continuous checkpoint.
 
-Each collection cycle emits one `CycleMetrics` record containing
-`ConnectMs`, `ResolveTagsMs`, tag counts, the estimated bytes per row, and the
-effective window. Each completed batch emits `HistorianReadMs`, `EncodeMs`,
-`SendMs`, `AckWaitMs`, `TotalMs`, `PendingBatches`, `PendingBytes`, and
-`SyncLagSeconds`; its `Performance` record contains only batch-local Historian
-RPC, conversion, normalization, throughput, and memory timings. The Receiver
-emits the corresponding receive, validation, parse, COPY, upsert, commit, and
-total timings.
+## Retry and error policy
 
-The Receiver hashes, stages, validates, and converts the incoming CSV while
-reading the HTTP body. Synchronous database ACK reuses those parsed rows
-instead of reopening the CSV; a synchronous retry first checks
-`imported_batches`, hashes the body only, and returns a database ACK without
-parsing or creating a duplicate archive. Durable inbox recovery reparses the
-staged CSV when needed. PostgreSQL uses conditional `IS DISTINCT FROM` updates
-so an overlap retry with identical values does not create an UPDATE/WAL record.
+BatchSender classifies failures as follows:
 
-In synchronous mode, PostgreSQL COMMIT is the ACK boundary. Archive movement
-is auxiliary: if it fails after COMMIT, the Receiver logs a warning, moves the
-payload to `archive_pending` when possible, and still returns
-`commit_level=database`.
+- connection failures, TCP errors, request/ACK timeout, HTTP 408/429 and
+  HTTP 5xx: wait SendRetrySeconds, then resend the identical Batch;
+- HTTP 401/403: authentication failure, stop immediately;
+- HTTP 4xx other than retryable statuses, including 400/409/413: permanent
+  batch/protocol failure, stop immediately;
+- HTTP 200 with an invalid or non-database ACK: permanent protocol failure,
+  stop immediately.
 
-Receiver maintenance retries `archive_pending` entries hourly, up to 100
-batches per pass. Entries with valid persisted metadata are moved back to
-`archive`; entries that still fail remain in place and continue to generate a
-warning. Receiver staging defaults to `StagingDurability=full`; `buffered` is
-available as an explicit performance-test tradeoff, while PostgreSQL COMMIT
-remains the synchronous ACK boundary.
+The default receiver timeout is 105 seconds and the default retry interval is
+30 seconds. A stop event interrupts the retry wait.
 
-Pending files record their hash when spooled and are then sent once from a
-FileStream with HTTP KeepAlive enabled. The Receiver still validates the body
-hash. The wire CSV, Receiver, PostgreSQL, spool, and ACK formats
-remain compatible; the continuous checkpoint file adds the pause status and
-reason fields.
+## Component responsibilities
+
+    HistorianCore.cs
+        DeltaV connection, tag resolution, readProcessed and normalization
+
+    HistoryBatch.cs
+        in-memory batch model, CSV encoding and SHA-256
+
+    BatchSender.cs
+        one HTTP request, ACK validation and fixed-interval retry
+
+    HistorySync.cs
+        windows, batch ordering, continuous schedule and checkpoint progression
+
+    SyncState.cs
+        one CheckpointEnd and reliable atomic persistence
+
+    HistoryReceiver
+        HTTP intake, PostgreSQL transaction, idempotency and database ACK
+
+The Receiver is not changed by this DCS refactor.

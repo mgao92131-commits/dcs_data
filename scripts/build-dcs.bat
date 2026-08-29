@@ -17,10 +17,10 @@ echo Compiler: "%CSC%"
 "%CSC%" /nologo /target:library /platform:x86 /optimize+ /out:"%OUT%\DcsData.Historian.dll" "%ROOT%\src\DcsData.Historian\HistorianCore.cs"
 if errorlevel 1 exit /b 1
 
-"%CSC%" /nologo /target:exe /platform:x86 /optimize+ /reference:"%OUT%\DcsData.Historian.dll" /main:DeltaVHistoryCLI.SyncProgram /out:"%OUT%\HistorySync.exe" "%ROOT%\src\HistorySync\HistoryBatch.cs" "%ROOT%\src\HistorySync\SyncState.cs" "%ROOT%\src\HistorySync\HistorySync.cs" "%ROOT%\src\HistorySync\BatchSender.cs" "%ROOT%\src\HistorySync\SpoolMaintenance.cs"
+"%CSC%" /nologo /target:exe /platform:x86 /optimize+ /reference:"%OUT%\DcsData.Historian.dll" /main:DeltaVHistoryCLI.SyncProgram /out:"%OUT%\HistorySync.exe" "%ROOT%\src\HistorySync\HistoryBatch.cs" "%ROOT%\src\HistorySync\SyncState.cs" "%ROOT%\src\HistorySync\HistorySync.cs" "%ROOT%\src\HistorySync\BatchSender.cs"
 if errorlevel 1 exit /b 1
 
-"%CSC%" /nologo /target:exe /platform:x86 /optimize+ /reference:"%OUT%\DcsData.Historian.dll" /main:DeltaVHistoryCLI.ProcessedSyncSelfTest /out:"%OUT%\ProcessedSyncSelfTest.build.exe" "%ROOT%\src\HistorySync\HistoryBatch.cs" "%ROOT%\src\HistorySync\SyncState.cs" "%ROOT%\src\HistorySync\HistorySync.cs" "%ROOT%\src\HistorySync\BatchSender.cs" "%ROOT%\src\HistorySync\SpoolMaintenance.cs" "%ROOT%\tests\DcsCollector\ProcessedSyncSelfTest.cs"
+"%CSC%" /nologo /target:exe /platform:x86 /optimize+ /reference:"%OUT%\DcsData.Historian.dll" /main:DeltaVHistoryCLI.ProcessedSyncSelfTest /out:"%OUT%\ProcessedSyncSelfTest.build.exe" "%ROOT%\src\HistorySync\HistoryBatch.cs" "%ROOT%\src\HistorySync\SyncState.cs" "%ROOT%\src\HistorySync\HistorySync.cs" "%ROOT%\src\HistorySync\BatchSender.cs" "%ROOT%\tests\DcsCollector\ProcessedSyncSelfTest.cs"
 if errorlevel 1 exit /b 1
 "%OUT%\ProcessedSyncSelfTest.build.exe"
 if errorlevel 1 exit /b 1

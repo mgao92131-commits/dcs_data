@@ -7,20 +7,12 @@ namespace DeltaVHistoryCLI
 {
     class SyncState
     {
-        public DateTime LastCollectedEnd;
-        public DateTime LastAcceptedEnd;
-        public DateTime LastCommittedEnd;
-        public bool CollectionPaused;
-        public string PauseReason;
+        public DateTime CheckpointEnd;
 
         public SyncState Copy()
         {
             SyncState copy = new SyncState();
-            copy.LastCollectedEnd = LastCollectedEnd;
-            copy.LastAcceptedEnd = LastAcceptedEnd;
-            copy.LastCommittedEnd = LastCommittedEnd;
-            copy.CollectionPaused = CollectionPaused;
-            copy.PauseReason = PauseReason;
+            copy.CheckpointEnd = CheckpointEnd;
             return copy;
         }
     }
@@ -37,9 +29,7 @@ namespace DeltaVHistoryCLI
         public SyncState LoadOrCreate(DateTime initialPosition)
         {
             SyncState initial = new SyncState();
-            initial.LastCollectedEnd = initialPosition;
-            initial.LastAcceptedEnd = initialPosition;
-            initial.LastCommittedEnd = initialPosition;
+            initial.CheckpointEnd = initialPosition;
             return LoadOrCreate(initial);
         }
 
@@ -54,18 +44,9 @@ namespace DeltaVHistoryCLI
 
             IniConfig config = IniConfig.Load(_path);
             SyncState state = new SyncState();
-            state.LastCollectedEnd = Parse(
-                config.Get("ContinuousSync", "LastCollectedEnd", ""),
-                "LastCollectedEnd");
-            state.LastAcceptedEnd = Parse(
-                config.Get("ContinuousSync", "LastAcceptedEnd", ""),
-                "LastAcceptedEnd");
-            state.LastCommittedEnd = Parse(
-                config.Get("ContinuousSync", "LastCommittedEnd", ""),
-                "LastCommittedEnd");
-            state.CollectionPaused = config.GetBool(
-                "ContinuousSync", "CollectionPaused", false);
-            state.PauseReason = config.Get("ContinuousSync", "PauseReason", "");
+            state.CheckpointEnd = Parse(
+                config.Get("ContinuousSync", "CheckpointEnd", ""),
+                "CheckpointEnd");
             Validate(state);
             return state;
         }
@@ -89,12 +70,7 @@ namespace DeltaVHistoryCLI
                 using (StreamWriter writer = new StreamWriter(stream, new UTF8Encoding(true)))
                 {
                     writer.WriteLine("[ContinuousSync]");
-                    writer.WriteLine("LastCollectedEnd=" + Format(state.LastCollectedEnd));
-                    writer.WriteLine("LastAcceptedEnd=" + Format(state.LastAcceptedEnd));
-                    writer.WriteLine("LastCommittedEnd=" + Format(state.LastCommittedEnd));
-                    writer.WriteLine("CollectionPaused=" +
-                        (state.CollectionPaused ? "true" : "false"));
-                    writer.WriteLine("PauseReason=" + SafeReason(state.PauseReason));
+                    writer.WriteLine("CheckpointEnd=" + Format(state.CheckpointEnd));
                     writer.Flush();
                     stream.Flush();
                 }
@@ -107,22 +83,11 @@ namespace DeltaVHistoryCLI
                     }
                     catch (UnauthorizedAccessException)
                     {
-                        // Some restricted Windows volumes do not allow ReplaceFile.
-                        // Keep recovery protection while completing the rename.
-                        string oldPath = _path + ".old." + Guid.NewGuid().ToString("N");
-                        File.Move(_path, oldPath);
-                        try
-                        {
-                            File.Move(temporary, _path);
-                        }
-                        catch
-                        {
-                            if (!File.Exists(_path) && File.Exists(oldPath))
-                                File.Move(oldPath, _path);
-                            throw;
-                        }
-                        if (File.Exists(oldPath))
-                            File.Delete(oldPath);
+                        MoveIntoPlace(temporary);
+                    }
+                    catch (IOException)
+                    {
+                        MoveIntoPlace(temporary);
                     }
                 }
                 else
@@ -138,14 +103,31 @@ namespace DeltaVHistoryCLI
             }
         }
 
+        private void MoveIntoPlace(string temporary)
+        {
+            string oldPath = _path + ".old." + Guid.NewGuid().ToString("N");
+            File.Move(_path, oldPath);
+            try
+            {
+                File.Move(temporary, _path);
+            }
+            catch
+            {
+                if (!File.Exists(_path) && File.Exists(oldPath))
+                    File.Move(oldPath, _path);
+                throw;
+            }
+            if (File.Exists(oldPath))
+                File.Delete(oldPath);
+        }
+
         private static void Validate(SyncState state)
         {
             if (state == null)
                 throw new ArgumentNullException("state");
-            if (state.LastCommittedEnd > state.LastAcceptedEnd)
-                throw new InvalidDataException("LastCommittedEnd cannot exceed LastAcceptedEnd.");
-            if (state.LastAcceptedEnd > state.LastCollectedEnd)
-                throw new InvalidDataException("LastAcceptedEnd cannot exceed LastCollectedEnd.");
+            if (state.CheckpointEnd == DateTime.MinValue ||
+                state.CheckpointEnd == DateTime.MaxValue)
+                throw new InvalidDataException("CheckpointEnd is outside the supported sync range.");
         }
 
         private static DateTime Parse(string text, string name)
@@ -158,19 +140,13 @@ namespace DeltaVHistoryCLI
                 DateTimeStyles.None,
                 out value))
                 throw new InvalidDataException("Invalid state value " + name + ": " + text);
+            Validate(new SyncState { CheckpointEnd = value });
             return value;
         }
 
         private static string Format(DateTime value)
         {
             return value.ToString("yyyy-MM-dd HH:mm:ss.fffffff", CultureInfo.InvariantCulture);
-        }
-
-        private static string SafeReason(string value)
-        {
-            if (String.IsNullOrEmpty(value))
-                return "";
-            return value.Replace('\r', ' ').Replace('\n', ' ');
         }
     }
 }
